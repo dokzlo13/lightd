@@ -19,6 +19,8 @@ type Config struct {
 	Reconciler      ReconcilerConfig  `yaml:"reconciler"`
 	Ledger          LedgerConfig      `yaml:"ledger"`
 	Healthcheck     HealthcheckConfig `yaml:"healthcheck"`
+	Webhook         WebhookConfig     `yaml:"webhook"`
+	SSE             SSEConfig         `yaml:"sse"`
 	EventBus        EventBusConfig    `yaml:"eventbus"`
 	Script          string            `yaml:"script"`
 	ShutdownTimeout Duration          `yaml:"shutdown_timeout"` // General shutdown timeout for graceful stops
@@ -81,6 +83,26 @@ type HealthcheckConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Host    string `yaml:"host"`
 	Port    int    `yaml:"port"`
+}
+
+// WebhookConfig contains webhook server settings
+type WebhookConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Host    string `yaml:"host"`
+	Port    int    `yaml:"port"`
+}
+
+// SSEConfig contains SSE (Hue event stream) settings
+type SSEConfig struct {
+	Enabled *bool `yaml:"enabled"` // Pointer to distinguish unset from false (default: true)
+}
+
+// IsEnabled returns whether SSE is enabled (defaults to true if not set)
+func (c *SSEConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true // Default to enabled for backward compatibility
+	}
+	return *c.Enabled
 }
 
 // EventBusConfig contains event bus settings
@@ -203,6 +225,14 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Healthcheck.Host == "" {
 		cfg.Healthcheck.Host = "0.0.0.0"
+	}
+
+	// Webhook defaults
+	if cfg.Webhook.Port == 0 {
+		cfg.Webhook.Port = 8081
+	}
+	if cfg.Webhook.Host == "" {
+		cfg.Webhook.Host = "0.0.0.0"
 	}
 
 	// General shutdown timeout

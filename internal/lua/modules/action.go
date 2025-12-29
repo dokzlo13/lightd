@@ -1,7 +1,10 @@
 package modules
 
 import (
+	"context"
+
 	"github.com/amimof/huego"
+	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
@@ -52,7 +55,8 @@ func NewActionModule(
 	builder := luactx.NewBuilder().
 		Register(luactx.NewActualModule(bridge, groupCache)).
 		Register(luactx.NewDesiredModule(desired)).
-		Register(luactx.NewReconcilerModule(reconciler))
+		Register(luactx.NewReconcilerModule(reconciler)).
+		Register(luactx.NewRequestModule())
 
 	return &ActionModule{
 		registry:       registry,
@@ -66,9 +70,52 @@ func (m *ActionModule) Loader(L *lua.LState) int {
 
 	L.SetField(mod, "define", L.NewFunction(m.define))
 	L.SetField(mod, "define_stateful", L.NewFunction(m.defineStateful))
+	L.SetField(mod, "run", L.NewFunction(m.run))
 
 	L.Push(mod)
 	return 1
+}
+
+// run(name, args) - Run an action immediately (useful for startup)
+// Note: This bypasses the ledger/deduplication, use for initialization only
+func (m *ActionModule) run(L *lua.LState) int {
+	name := L.CheckString(1)
+	argsTable := L.OptTable(2, L.NewTable())
+	args := LuaTableToMap(argsTable)
+
+	action, exists := m.registry.Get(name)
+	if !exists {
+		L.RaiseError("action %q not found", name)
+		return 0
+	}
+
+	// Ensure L has a valid context (may be nil during script loading)
+	ctx := L.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Set the context on L so modules can access it
+	L.SetContext(ctx)
+
+	// Create a minimal action context
+	actx := actions.NewContext(ctx, nil, nil, nil, nil)
+
+	log.Debug().Str("action", name).Msg("Running action from Lua")
+
+	// Capture and execute
+	captured, err := action.CaptureDecision(actx, args)
+	if err != nil {
+		L.RaiseError("action %q capture failed: %s", name, err.Error())
+		return 0
+	}
+
+	if err := action.Execute(actx, args, captured); err != nil {
+		L.RaiseError("action %q failed: %s", name, err.Error())
+		return 0
+	}
+
+	return 0
 }
 
 // define(name, function) - Define a simple action
@@ -139,6 +186,9 @@ func (a *luaSimpleAction) CaptureDecision(ctx *actions.Context, args map[string]
 }
 
 func (a *luaSimpleAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
+	// Update LState context to include request data from webhook triggers
+	a.L.SetContext(ctx.Ctx())
+
 	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 
@@ -165,6 +215,9 @@ func (a *luaStatefulAction) Name() string     { return a.name }
 func (a *luaStatefulAction) IsStateful() bool { return true }
 
 func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[string]any) (map[string]any, error) {
+	// Update LState context to include request data from webhook triggers
+	a.L.SetContext(ctx.Ctx())
+
 	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 
@@ -187,6 +240,9 @@ func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[strin
 }
 
 func (a *luaStatefulAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
+	// Update LState context to include request data from webhook triggers
+	a.L.SetContext(ctx.Ctx())
+
 	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 	capturedTable := MapToLuaTable(a.L, captured)

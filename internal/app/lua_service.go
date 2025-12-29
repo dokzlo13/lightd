@@ -4,14 +4,14 @@ import (
 	"context"
 
 	"github.com/amimof/huego"
-	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
+	"github.com/dokzlo13/lightd/internal/events/sse"
+	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
 	"github.com/dokzlo13/lightd/internal/hue"
-	luart "github.com/dokzlo13/lightd/internal/lua"
-	"github.com/dokzlo13/lightd/internal/lua/modules"
+	"github.com/dokzlo13/lightd/internal/lua"
 	"github.com/dokzlo13/lightd/internal/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
 	"github.com/dokzlo13/lightd/internal/state"
@@ -20,7 +20,7 @@ import (
 // LuaService wraps the Lua runtime and provides thread-safe execution.
 type LuaService struct {
 	cfg     *config.Config
-	Runtime *luart.Runtime
+	Runtime *lua.Runtime
 	invoker *actions.Invoker
 }
 
@@ -37,7 +37,7 @@ func NewLuaService(
 	reconciler *reconcile.Reconciler,
 	geoCalc *geo.Calculator,
 ) (*LuaService, error) {
-	runtime := luart.NewRuntime(cfg, registry, invoker, sched, bridge, groupCache, sceneCache, desired, reconciler, geoCalc)
+	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, groupCache, sceneCache, desired, reconciler, geoCalc)
 
 	return &LuaService{
 		cfg:     cfg,
@@ -55,28 +55,20 @@ func (s *LuaService) LoadScript() error {
 	return nil
 }
 
-// Start begins the Lua worker goroutine and runs startup actions.
+// Start begins the Lua worker goroutine.
 func (s *LuaService) Start(ctx context.Context) {
 	// Start Lua worker goroutine - this is the ONLY goroutine that touches Lua
 	go s.Runtime.Run(ctx)
-
-	// Run startup actions immediately (all services are ready by now)
-	go s.runStartupActions(ctx)
 }
 
-// runStartupActions runs initialization actions.
-func (s *LuaService) runStartupActions(ctx context.Context) {
-	log.Info().Msg("Running startup actions")
-	s.Runtime.Do(ctx, func(workCtx context.Context) {
-		if err := s.invoker.Invoke(workCtx, "ensure_banks_set", map[string]any{}, ""); err != nil {
-			log.Error().Err(err).Msg("Failed to run ensure_banks_set")
-		}
-	})
+// GetSSEModule returns the SSE module for handler registration.
+func (s *LuaService) GetSSEModule() *sse.Module {
+	return s.Runtime.GetSSEModule()
 }
 
-// GetInputModule returns the input module for handler registration.
-func (s *LuaService) GetInputModule() *modules.InputModule {
-	return s.Runtime.GetInputModule()
+// GetWebhookModule returns the webhook module for handler registration.
+func (s *LuaService) GetWebhookModule() *webhook.Module {
+	return s.Runtime.GetWebhookModule()
 }
 
 // InvokeThroughLua invokes an action through the Lua worker for thread safety.
@@ -88,7 +80,8 @@ func (s *LuaService) InvokeThroughLua(ctx context.Context, actionName string, ar
 }
 
 // Do queues work to be executed on the Lua VM.
-func (s *LuaService) Do(ctx context.Context, work luart.LuaWork) bool {
+// This method satisfies the sse.LuaExecutor and webhook.LuaExecutor interfaces.
+func (s *LuaService) Do(ctx context.Context, work func(ctx context.Context)) bool {
 	return s.Runtime.Do(ctx, work)
 }
 

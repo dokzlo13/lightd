@@ -90,19 +90,23 @@ func (s *HueService) Start(ctx context.Context) error {
 // StartBackground starts all background goroutines (event stream, reconciler).
 // The optional onFatalError callback is called when a fatal error occurs (e.g., max reconnects exceeded).
 func (s *HueService) StartBackground(ctx context.Context, onFatalError func(error)) {
-	// Start event stream listener
-	go func() {
-		if err := s.EventStream.Run(ctx, s.Bus); err != nil {
-			if err == v2.ErrMaxReconnectsExceeded {
-				log.Error().Msg("Event stream: max reconnects exceeded, triggering shutdown")
-				if onFatalError != nil {
-					onFatalError(err)
+	// Start event stream listener only if SSE is enabled
+	if s.cfg.SSE.IsEnabled() {
+		go func() {
+			if err := s.EventStream.Run(ctx, s.Bus); err != nil {
+				if err == v2.ErrMaxReconnectsExceeded {
+					log.Error().Msg("Event stream: max reconnects exceeded, triggering shutdown")
+					if onFatalError != nil {
+						onFatalError(err)
+					}
+				} else {
+					log.Error().Err(err).Msg("Event stream error")
 				}
-			} else {
-				log.Error().Err(err).Msg("Event stream error")
 			}
-		}
-	}()
+		}()
+	} else {
+		log.Info().Msg("SSE event stream disabled")
+	}
 
 	// Start reconciler
 	go func() {

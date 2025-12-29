@@ -1,4 +1,4 @@
-package app
+package sse
 
 import (
 	"context"
@@ -8,9 +8,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/eventbus"
-	"github.com/dokzlo13/lightd/internal/lua/modules"
 	"github.com/dokzlo13/lightd/internal/state"
 )
 
@@ -20,54 +18,38 @@ const (
 	RotaryDirectionCounterClockwise = "counter_clock_wise"
 )
 
-// EventService handles event bus subscriptions and dispatches events to handlers.
-type EventService struct {
-	cfg          *config.Config
-	luaSvc       *LuaService
-	invoker      *actions.Invoker
-	desiredStore *state.DesiredStore
-	bus          *eventbus.Bus
+// LuaExecutor provides thread-safe Lua execution
+type LuaExecutor interface {
+	Do(ctx context.Context, work func(ctx context.Context)) bool
 }
 
-// NewEventService creates a new EventService.
-func NewEventService(
-	cfg *config.Config,
-	luaSvc *LuaService,
-	invoker *actions.Invoker,
-	desiredStore *state.DesiredStore,
+// RegisterHandlers subscribes to SSE events on the event bus and dispatches to handlers
+func (m *Module) RegisterHandlers(
+	ctx context.Context,
 	bus *eventbus.Bus,
-) (*EventService, error) {
-	return &EventService{
-		cfg:          cfg,
-		luaSvc:       luaSvc,
-		invoker:      invoker,
-		desiredStore: desiredStore,
-		bus:          bus,
-	}, nil
+	invoker *actions.Invoker,
+	luaExec LuaExecutor,
+	desiredStore *state.DesiredStore,
+) {
+	m.registerButtonHandler(ctx, bus, invoker, luaExec, desiredStore)
+	m.registerConnectivityHandler(ctx, bus, invoker, luaExec)
+	m.registerRotaryHandler(ctx, bus, invoker, luaExec)
 }
 
-// Start sets up all event handlers.
-func (s *EventService) Start(ctx context.Context) {
-	inputModule := s.luaSvc.GetInputModule()
-
-	s.setupButtonHandler(ctx, inputModule)
-	s.setupConnectivityHandler(ctx, inputModule)
-	s.setupRotaryHandler(ctx, inputModule)
-}
-
-// Close releases resources.
-func (s *EventService) Close() {
-	// Bus is closed by HueService which owns it
-}
-
-// setupButtonHandler sets up button event handling via the event bus.
-func (s *EventService) setupButtonHandler(ctx context.Context, inputModule *modules.InputModule) {
-	s.bus.Subscribe(eventbus.EventTypeButton, func(event eventbus.Event) {
+// registerButtonHandler sets up button event handling via the event bus.
+func (m *Module) registerButtonHandler(
+	ctx context.Context,
+	bus *eventbus.Bus,
+	invoker *actions.Invoker,
+	luaExec LuaExecutor,
+	desiredStore *state.DesiredStore,
+) {
+	bus.Subscribe(eventbus.EventTypeButton, func(event eventbus.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		buttonAction, _ := event.Data["action"].(string)
 		eventID, _ := event.Data["event_id"].(string)
 
-		handler := inputModule.FindButtonHandler(resourceID, buttonAction)
+		handler := m.FindButtonHandler(resourceID, buttonAction)
 		if handler == nil {
 			return
 		}
@@ -83,29 +65,34 @@ func (s *EventService) setupButtonHandler(ctx context.Context, inputModule *modu
 		eid := eventID
 
 		// Queue work to Lua worker (single-threaded execution)
-		s.luaSvc.Do(ctx, func(workCtx context.Context) {
+		luaExec.Do(ctx, func(workCtx context.Context) {
 			if h.IsToggle {
 				// Special handling for toggle buttons:
 				// 1. Run init_bank first (no dedupe)
 				// 2. Then run toggle_group (with dedupe)
 				groupID, _ := h.ActionArgs["group"].(string)
-				if groupID != "" && !s.desiredStore.HasBank(groupID) {
-					s.invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
+				if groupID != "" && !desiredStore.HasBank(groupID) {
+					invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
 				}
 			}
 			// Invoke action with button event ID as idempotency key
-			s.invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, eid)
+			invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, eid)
 		})
 	})
 }
 
-// setupConnectivityHandler sets up connectivity event handling via the event bus.
-func (s *EventService) setupConnectivityHandler(ctx context.Context, inputModule *modules.InputModule) {
-	s.bus.Subscribe(eventbus.EventTypeConnectivity, func(event eventbus.Event) {
+// registerConnectivityHandler sets up connectivity event handling via the event bus.
+func (m *Module) registerConnectivityHandler(
+	ctx context.Context,
+	bus *eventbus.Bus,
+	invoker *actions.Invoker,
+	luaExec LuaExecutor,
+) {
+	bus.Subscribe(eventbus.EventTypeConnectivity, func(event eventbus.Event) {
 		deviceID, _ := event.Data["device_id"].(string)
 		status, _ := event.Data["status"].(string)
 
-		handler := inputModule.FindConnectivityHandler(deviceID, status)
+		handler := m.FindConnectivityHandler(deviceID, status)
 		if handler == nil {
 			return
 		}
@@ -120,26 +107,31 @@ func (s *EventService) setupConnectivityHandler(ctx context.Context, inputModule
 		h := handler
 
 		// Queue work to Lua worker (single-threaded execution)
-		s.luaSvc.Do(ctx, func(workCtx context.Context) {
-			if err := s.invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, ""); err != nil {
+		luaExec.Do(ctx, func(workCtx context.Context) {
+			if err := invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, ""); err != nil {
 				log.Error().Err(err).Str("action", h.ActionName).Msg("Failed to invoke connectivity action")
 			}
 		})
 	})
 }
 
-// setupRotaryHandler sets up rotary event handling via the event bus with debouncing.
-func (s *EventService) setupRotaryHandler(ctx context.Context, inputModule *modules.InputModule) {
+// registerRotaryHandler sets up rotary event handling via the event bus with debouncing.
+func (m *Module) registerRotaryHandler(
+	ctx context.Context,
+	bus *eventbus.Bus,
+	invoker *actions.Invoker,
+	luaExec LuaExecutor,
+) {
 	// Create a debouncer per resource ID
 	debouncers := make(map[string]*rotaryDebouncer)
 	var mu sync.Mutex
 
-	s.bus.Subscribe(eventbus.EventTypeRotary, func(event eventbus.Event) {
+	bus.Subscribe(eventbus.EventTypeRotary, func(event eventbus.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		direction, _ := event.Data["direction"].(string)
 		steps, _ := event.Data["steps"].(int)
 
-		handler := inputModule.FindRotaryHandler(resourceID)
+		handler := m.FindRotaryHandler(resourceID)
 		if handler == nil {
 			return
 		}
@@ -154,8 +146,8 @@ func (s *EventService) setupRotaryHandler(ctx context.Context, inputModule *modu
 			}
 			debouncer = &rotaryDebouncer{
 				handler:      handler,
-				invoker:      s.invoker,
-				luaSvc:       s.luaSvc,
+				invoker:      invoker,
+				luaExec:      luaExec,
 				ctx:          ctx,
 				debounceTime: time.Duration(debounceMs) * time.Millisecond,
 			}
@@ -178,9 +170,9 @@ type rotaryDebouncer struct {
 	accumulatedSteps int
 	timer            *time.Timer
 	debounceTime     time.Duration
-	handler          *modules.RotaryHandler
+	handler          *RotaryHandler
 	invoker          *actions.Invoker
-	luaSvc           *LuaService
+	luaExec          LuaExecutor
 	ctx              context.Context
 }
 
@@ -234,7 +226,7 @@ func (d *rotaryDebouncer) apply() {
 
 	// Queue work to Lua worker
 	actionName := d.handler.ActionName
-	d.luaSvc.Do(d.ctx, func(workCtx context.Context) {
+	d.luaExec.Do(d.ctx, func(workCtx context.Context) {
 		if err := d.invoker.Invoke(workCtx, actionName, args, ""); err != nil {
 			log.Error().Err(err).Str("action", actionName).Msg("Failed to invoke rotary action")
 		}

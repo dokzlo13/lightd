@@ -38,6 +38,12 @@ func (i *Invoker) InvokeWithSource(ctx context.Context, actionName string, args 
 	return i.invoke(ctx, actionName, args, idempotencyKey, source, defID)
 }
 
+// HasAction checks if an action is registered
+func (i *Invoker) HasAction(actionName string) bool {
+	_, exists := i.registry.Get(actionName)
+	return exists
+}
+
 // invoke is the shared implementation for Invoke and InvokeWithSource
 func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error {
 	// Check if already completed (dedupe)

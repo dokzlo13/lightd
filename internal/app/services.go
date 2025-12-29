@@ -34,8 +34,8 @@ type Services struct {
 	Hue       *HueService
 	Lua       *LuaService
 	Scheduler *SchedulerService
-	Events    *EventService
 	Health    *HealthService
+	Webhook   *WebhookService
 }
 
 // NewServices creates all services with proper dependency injection.
@@ -112,15 +112,11 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	// Wire scheduler to use Lua invoker for thread safety
 	s.Scheduler.SetLuaInvoker(s.Lua)
 
-	// Initialize event service
-	s.Events, err = NewEventService(cfg, s.Lua, s.Invoker, s.DesiredStore, s.Hue.Bus)
-	if err != nil {
-		s.Close()
-		return nil, err
-	}
-
 	// Initialize health service
 	s.Health = NewHealthService(cfg)
+
+	// Initialize webhook service
+	s.Webhook = NewWebhookService(cfg, s.Hue.Bus)
 
 	return s, nil
 }
@@ -143,12 +139,22 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 		log.Warn().Err(err).Msg("Failed to recover orphaned actions")
 	}
 
+	// Register event handlers from modules (after Lua script is loaded)
+	// SSE handlers (button, rotary, connectivity from Hue event stream)
+	if s.cfg.SSE.IsEnabled() {
+		s.Lua.GetSSEModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua, s.DesiredStore)
+	}
+	// Webhook handlers (HTTP webhook events)
+	if s.cfg.Webhook.Enabled {
+		s.Lua.GetWebhookModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua)
+	}
+
 	// Start all background services
 	s.Lua.Start(ctx)
 	s.Hue.StartBackground(ctx, onFatalError)
 	s.Scheduler.Start(ctx)
-	s.Events.Start(ctx)
 	s.Health.Start(ctx)
+	s.Webhook.Start(ctx)
 
 	return nil
 }
@@ -161,9 +167,6 @@ func (s *Services) Stop() error {
 
 // Close releases all resources.
 func (s *Services) Close() {
-	if s.Events != nil {
-		s.Events.Close()
-	}
 	if s.Lua != nil {
 		s.Lua.Close()
 	}

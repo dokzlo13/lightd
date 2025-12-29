@@ -13,6 +13,8 @@ import (
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
+	"github.com/dokzlo13/lightd/internal/events/sse"
+	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
 	"github.com/dokzlo13/lightd/internal/hue"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
@@ -43,10 +45,11 @@ type Runtime struct {
 	geoCalc    *geo.Calculator
 
 	// Modules
-	actionModule *modules.ActionModule
-	inputModule  *modules.InputModule
-	schedModule  *modules.SchedModule
-	hueModule    *modules.HueModule
+	actionModule  *modules.ActionModule
+	schedModule   *modules.SchedModule
+	hueModule     *modules.HueModule
+	sseModule     *sse.Module
+	webhookModule *webhook.Module
 
 	// Work queue for thread-safe Lua execution
 	workQueue chan LuaWork
@@ -182,10 +185,6 @@ func (r *Runtime) registerModules() {
 	r.actionModule = modules.NewActionModule(r.registry, r.bridge, r.groupCache, r.desired, r.reconciler)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
-	// Input module
-	r.inputModule = modules.NewInputModule()
-	r.L.PreloadModule("input", r.inputModule.Loader)
-
 	// Sched module
 	r.schedModule = modules.NewSchedModule(r.scheduler)
 	r.L.PreloadModule("sched", r.schedModule.Loader)
@@ -193,6 +192,15 @@ func (r *Runtime) registerModules() {
 	// Hue module (now with userdata support)
 	r.hueModule = modules.NewHueModule(r.bridge, r.groupCache, r.sceneCache)
 	r.L.PreloadModule("hue", r.hueModule.Loader)
+
+	// Event source modules with dotted namespace
+	// SSE module (Hue event stream events: button, rotary, connectivity)
+	r.sseModule = sse.NewModule(r.config.SSE.IsEnabled())
+	r.L.PreloadModule("events.sse", r.sseModule.Loader)
+
+	// Webhook module (HTTP webhook events)
+	r.webhookModule = webhook.NewModule(r.config.Webhook.Enabled)
+	r.L.PreloadModule("events.webhook", r.webhookModule.Loader)
 }
 
 // Run starts the Lua worker goroutine - this is the ONLY goroutine that touches Lua
@@ -259,9 +267,14 @@ func (r *Runtime) LoadScript(path string) error {
 	return nil
 }
 
-// GetInputModule returns the input module for handler registration
-func (r *Runtime) GetInputModule() *modules.InputModule {
-	return r.inputModule
+// GetSSEModule returns the SSE module for handler registration
+func (r *Runtime) GetSSEModule() *sse.Module {
+	return r.sseModule
+}
+
+// GetWebhookModule returns the webhook module for handler registration
+func (r *Runtime) GetWebhookModule() *webhook.Module {
+	return r.webhookModule
 }
 
 // Invoker returns the action invoker

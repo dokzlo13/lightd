@@ -1,7 +1,11 @@
-package modules
+// Package sse provides Lua bindings for Hue SSE (Server-Sent Events) event handlers.
+// This includes button, rotary, and connectivity events from Hue devices.
+package sse
 
 import (
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/dokzlo13/lightd/internal/lua/modules"
 )
 
 // ButtonHandler is called when a button event occurs
@@ -29,20 +33,28 @@ type RotaryHandler struct {
 	DebounceMs int // Debounce time in milliseconds (default: 50)
 }
 
-// InputModule provides Input.button(), Input.connectivity(), and Input.rotary() to Lua
-type InputModule struct {
+// Module provides events.sse Lua module for SSE event handlers
+type Module struct {
+	enabled              bool
 	buttonHandlers       []ButtonHandler
 	connectivityHandlers []ConnectivityHandler
 	rotaryHandlers       []RotaryHandler
 }
 
-// NewInputModule creates a new input module
-func NewInputModule() *InputModule {
-	return &InputModule{}
+// NewModule creates a new SSE module
+func NewModule(enabled bool) *Module {
+	return &Module{
+		enabled: enabled,
+	}
 }
 
 // Loader is the module loader for Lua
-func (m *InputModule) Loader(L *lua.LState) int {
+func (m *Module) Loader(L *lua.LState) int {
+	if !m.enabled {
+		L.RaiseError("events.sse module is disabled (sse.enabled: false in config)")
+		return 0
+	}
+
 	mod := L.NewTable()
 
 	L.SetField(mod, "button", L.NewFunction(m.button))
@@ -55,13 +67,13 @@ func (m *InputModule) Loader(L *lua.LState) int {
 }
 
 // button(resource_id, button_action, action_name, args) - Register a button handler
-func (m *InputModule) button(L *lua.LState) int {
+func (m *Module) button(L *lua.LState) int {
 	resourceID := L.CheckString(1)
 	buttonAction := L.CheckString(2)
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := LuaTableToMap(argsTable)
+	args := modules.LuaTableToMap(argsTable)
 
 	m.buttonHandlers = append(m.buttonHandlers, ButtonHandler{
 		ResourceID:   resourceID,
@@ -76,12 +88,12 @@ func (m *InputModule) button(L *lua.LState) int {
 
 // button_toggle(resource_id, button_action, args) - Register a toggle button handler
 // This automatically handles bank initialization before toggle
-func (m *InputModule) buttonToggle(L *lua.LState) int {
+func (m *Module) buttonToggle(L *lua.LState) int {
 	resourceID := L.CheckString(1)
 	buttonAction := L.CheckString(2)
 	argsTable := L.OptTable(3, L.NewTable())
 
-	args := LuaTableToMap(argsTable)
+	args := modules.LuaTableToMap(argsTable)
 
 	m.buttonHandlers = append(m.buttonHandlers, ButtonHandler{
 		ResourceID:   resourceID,
@@ -95,13 +107,13 @@ func (m *InputModule) buttonToggle(L *lua.LState) int {
 }
 
 // connectivity(device_id, status, action_name, args) - Register a connectivity handler
-func (m *InputModule) connectivity(L *lua.LState) int {
+func (m *Module) connectivity(L *lua.LState) int {
 	deviceID := L.CheckString(1)
 	status := L.CheckString(2)
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := LuaTableToMap(argsTable)
+	args := modules.LuaTableToMap(argsTable)
 
 	m.connectivityHandlers = append(m.connectivityHandlers, ConnectivityHandler{
 		DeviceID:   deviceID,
@@ -116,12 +128,12 @@ func (m *InputModule) connectivity(L *lua.LState) int {
 // rotary(resource_id, action_name, args) - Register a rotary handler
 // The action will receive direction, steps, and duration in args
 // Optional args.debounce_ms sets the debounce time (default: 50ms)
-func (m *InputModule) rotary(L *lua.LState) int {
+func (m *Module) rotary(L *lua.LState) int {
 	resourceID := L.CheckString(1)
 	actionName := L.CheckString(2)
 	argsTable := L.OptTable(3, L.NewTable())
 
-	args := LuaTableToMap(argsTable)
+	args := modules.LuaTableToMap(argsTable)
 
 	// Extract debounce_ms from args (default: 50)
 	debounceMs := 50
@@ -143,17 +155,22 @@ func (m *InputModule) rotary(L *lua.LState) int {
 }
 
 // GetButtonHandlers returns all registered button handlers
-func (m *InputModule) GetButtonHandlers() []ButtonHandler {
+func (m *Module) GetButtonHandlers() []ButtonHandler {
 	return m.buttonHandlers
 }
 
 // GetConnectivityHandlers returns all registered connectivity handlers
-func (m *InputModule) GetConnectivityHandlers() []ConnectivityHandler {
+func (m *Module) GetConnectivityHandlers() []ConnectivityHandler {
 	return m.connectivityHandlers
 }
 
+// GetRotaryHandlers returns all registered rotary handlers
+func (m *Module) GetRotaryHandlers() []RotaryHandler {
+	return m.rotaryHandlers
+}
+
 // FindButtonHandler finds a handler for a button event
-func (m *InputModule) FindButtonHandler(resourceID, buttonAction string) *ButtonHandler {
+func (m *Module) FindButtonHandler(resourceID, buttonAction string) *ButtonHandler {
 	for i := range m.buttonHandlers {
 		h := &m.buttonHandlers[i]
 		if h.ResourceID == resourceID && h.ButtonAction == buttonAction {
@@ -164,7 +181,7 @@ func (m *InputModule) FindButtonHandler(resourceID, buttonAction string) *Button
 }
 
 // FindConnectivityHandler finds a handler for a connectivity event
-func (m *InputModule) FindConnectivityHandler(deviceID, status string) *ConnectivityHandler {
+func (m *Module) FindConnectivityHandler(deviceID, status string) *ConnectivityHandler {
 	for i := range m.connectivityHandlers {
 		h := &m.connectivityHandlers[i]
 		if h.DeviceID == deviceID && h.Status == status {
@@ -174,13 +191,8 @@ func (m *InputModule) FindConnectivityHandler(deviceID, status string) *Connecti
 	return nil
 }
 
-// GetRotaryHandlers returns all registered rotary handlers
-func (m *InputModule) GetRotaryHandlers() []RotaryHandler {
-	return m.rotaryHandlers
-}
-
 // FindRotaryHandler finds a handler for a rotary event
-func (m *InputModule) FindRotaryHandler(resourceID string) *RotaryHandler {
+func (m *Module) FindRotaryHandler(resourceID string) *RotaryHandler {
 	for i := range m.rotaryHandlers {
 		h := &m.rotaryHandlers[i]
 		if h.ResourceID == resourceID {
