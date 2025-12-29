@@ -1,8 +1,6 @@
 package context
 
 import (
-	"context"
-
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -35,7 +33,7 @@ func (m *DesiredModule) Name() string {
 }
 
 // Install adds ctx.desired to the context table.
-func (m *DesiredModule) Install(L *lua.LState, ctx *lua.LTable, goCtx context.Context) {
+func (m *DesiredModule) Install(L *lua.LState, ctx *lua.LTable) {
 	desired := L.NewTable()
 
 	// desired:set_bank(group_id, scene_name)

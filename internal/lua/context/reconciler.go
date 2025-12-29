@@ -1,8 +1,6 @@
 package context
 
 import (
-	"context"
-
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/reconcile"
@@ -33,7 +31,7 @@ func (m *ReconcilerModule) Name() string {
 }
 
 // Install adds ctx:reconcile() to the context table.
-func (m *ReconcilerModule) Install(L *lua.LState, ctx *lua.LTable, goCtx context.Context) {
+func (m *ReconcilerModule) Install(L *lua.LState, ctx *lua.LTable) {
 	// reconcile() - method syntax, arg 1 is self (ctx table itself)
 	L.SetField(ctx, "reconcile", L.NewFunction(m.reconcile()))
 }
@@ -48,4 +46,3 @@ func (m *ReconcilerModule) reconcile() lua.LGFunction {
 		return 0
 	}
 }
-

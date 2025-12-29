@@ -83,18 +83,18 @@ func (s *EventService) setupButtonHandler(ctx context.Context, inputModule *modu
 		eid := eventID
 
 		// Queue work to Lua worker (single-threaded execution)
-		s.luaSvc.Do(ctx, func(_ context.Context) {
+		s.luaSvc.Do(ctx, func(workCtx context.Context) {
 			if h.IsToggle {
 				// Special handling for toggle buttons:
 				// 1. Run init_bank first (no dedupe)
 				// 2. Then run toggle_group (with dedupe)
 				groupID, _ := h.ActionArgs["group"].(string)
 				if groupID != "" && !s.desiredStore.HasBank(groupID) {
-					s.invoker.Invoke(ctx, "init_bank", map[string]any{"group": groupID}, "")
+					s.invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
 				}
 			}
 			// Invoke action with button event ID as idempotency key
-			s.invoker.Invoke(ctx, h.ActionName, h.ActionArgs, eid)
+			s.invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, eid)
 		})
 	})
 }
@@ -120,8 +120,8 @@ func (s *EventService) setupConnectivityHandler(ctx context.Context, inputModule
 		h := handler
 
 		// Queue work to Lua worker (single-threaded execution)
-		s.luaSvc.Do(ctx, func(_ context.Context) {
-			if err := s.invoker.Invoke(ctx, h.ActionName, h.ActionArgs, ""); err != nil {
+		s.luaSvc.Do(ctx, func(workCtx context.Context) {
+			if err := s.invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, ""); err != nil {
 				log.Error().Err(err).Str("action", h.ActionName).Msg("Failed to invoke connectivity action")
 			}
 		})
@@ -234,8 +234,8 @@ func (d *rotaryDebouncer) apply() {
 
 	// Queue work to Lua worker
 	actionName := d.handler.ActionName
-	d.luaSvc.Do(d.ctx, func(_ context.Context) {
-		if err := d.invoker.Invoke(d.ctx, actionName, args, ""); err != nil {
+	d.luaSvc.Do(d.ctx, func(workCtx context.Context) {
+		if err := d.invoker.Invoke(workCtx, actionName, args, ""); err != nil {
 			log.Error().Err(err).Str("action", actionName).Msg("Failed to invoke rotary action")
 		}
 	})

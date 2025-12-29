@@ -1,8 +1,6 @@
 package modules
 
 import (
-	"context"
-
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -79,7 +77,7 @@ func (m *HueModule) cacheGroup(L *lua.LState) int {
 	}
 
 	// Cache miss or stale - fetch from bridge
-	ctx := context.Background()
+	ctx := L.Context()
 	group, err := m.client.GetGroup(ctx, groupID)
 	if err != nil {
 		log.Error().Err(err).Str("group", groupID).Msg("Failed to get group state")
@@ -114,7 +112,7 @@ func (m *HueModule) setGroupBrightness(L *lua.LState) int {
 		brightness = 254
 	}
 
-	ctx := context.Background()
+	ctx := L.Context()
 
 	err := m.client.SetGroupAction(ctx, groupID, map[string]interface{}{
 		"bri": brightness,
@@ -138,7 +136,7 @@ func (m *HueModule) adjustGroupBrightness(L *lua.LState) int {
 	groupID := L.CheckString(1)
 	delta := L.CheckInt(2)
 
-	ctx := context.Background()
+	ctx := L.Context()
 
 	// Fetch current brightness
 	group, err := m.client.GetGroup(ctx, groupID)
@@ -181,7 +179,7 @@ func (m *HueModule) adjustGroupBrightness(L *lua.LState) int {
 func (m *HueModule) getGroupBrightness(L *lua.LState) int {
 	groupID := L.CheckString(1)
 
-	ctx := context.Background()
+	ctx := L.Context()
 
 	group, err := m.client.GetGroup(ctx, groupID)
 	if err != nil {
@@ -202,7 +200,7 @@ func (m *HueModule) recallScene(L *lua.LState) int {
 	groupID := L.CheckString(1)
 	sceneName := L.CheckString(2)
 
-	ctx := context.Background()
+	ctx := L.Context()
 
 	// Find scene by name first (ActivateScene expects scene ID, not name)
 	scene, err := m.client.FindSceneByName(ctx, sceneName, groupID)

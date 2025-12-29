@@ -8,8 +8,6 @@
 package context
 
 import (
-	"context"
-
 	lua "github.com/yuin/gopher-lua"
 )
 
@@ -21,9 +19,9 @@ type ContextModule interface {
 	Name() string
 
 	// Install adds this module's functionality to the context table.
-	// L is the Lua state, ctx is the context table being built,
-	// goCtx is the Go context for cancellation/timeouts.
-	Install(L *lua.LState, ctx *lua.LTable, goCtx context.Context)
+	// L is the Lua state, ctx is the context table being built.
+	// Modules should use L.Context() to get the Go context for cancellation.
+	Install(L *lua.LState, ctx *lua.LTable)
 }
 
 // Builder collects context modules and builds the final ctx table.
@@ -47,10 +45,11 @@ func (b *Builder) Register(m ContextModule) *Builder {
 
 // Build creates the ctx table for a Lua action invocation.
 // Each registered module installs its functionality into the table.
-func (b *Builder) Build(L *lua.LState, goCtx context.Context) *lua.LTable {
+// Modules use L.Context() to access the Go context for cancellation.
+func (b *Builder) Build(L *lua.LState) *lua.LTable {
 	ctx := L.NewTable()
 	for _, m := range b.modules {
-		m.Install(L, ctx, goCtx)
+		m.Install(L, ctx)
 	}
 	return ctx
 }

@@ -1,8 +1,6 @@
 package context
 
 import (
-	"context"
-
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -41,39 +39,41 @@ func (m *ActualModule) Name() string {
 }
 
 // Install adds ctx.actual to the context table.
-func (m *ActualModule) Install(L *lua.LState, ctx *lua.LTable, goCtx context.Context) {
+func (m *ActualModule) Install(L *lua.LState, ctx *lua.LTable) {
 	actual := L.NewTable()
 
 	// actual:group(group_id) -> (state_table, err)
-	L.SetField(actual, "group", L.NewFunction(m.group(goCtx)))
+	L.SetField(actual, "group", L.NewFunction(m.group))
 
 	L.SetField(ctx, m.Name(), actual)
 }
 
-// group returns a Lua function that fetches fresh group state.
+// group is a Lua function that fetches fresh group state.
 // Always fetches from bridge (not cache) to ensure fresh data for decisions.
-func (m *ActualModule) group(goCtx context.Context) lua.LGFunction {
-	return func(L *lua.LState) int {
-		L.CheckTable(1) // self
-		groupID := L.CheckString(2)
+// Uses L.Context() for cancellation support.
+func (m *ActualModule) group(L *lua.LState) int {
+	L.CheckTable(1) // self
+	groupID := L.CheckString(2)
 
-		// Always fetch FRESH state from bridge (not stale cache)
-		group, err := m.client.GetGroup(goCtx, groupID)
-		if err != nil {
-			log.Error().Err(err).Str("group", groupID).Msg("Failed to get group state")
-			L.Push(lua.LNil)
-			L.Push(lua.LString(err.Error()))
-			return 2
-		}
+	// Get context from LState for proper cancellation
+	ctx := L.Context()
 
-		// Cache the fresh result for other consumers
-		m.cache.Set(groupID, group.State)
-
-		tbl := L.NewTable()
-		L.SetField(tbl, "all_on", lua.LBool(group.State.AllOn))
-		L.SetField(tbl, "any_on", lua.LBool(group.State.AnyOn))
-		L.Push(tbl)
-		L.Push(lua.LNil) // no error
+	// Always fetch FRESH state from bridge (not stale cache)
+	group, err := m.client.GetGroup(ctx, groupID)
+	if err != nil {
+		log.Error().Err(err).Str("group", groupID).Msg("Failed to get group state")
+		L.Push(lua.LNil)
+		L.Push(lua.LString(err.Error()))
 		return 2
 	}
+
+	// Cache the fresh result for other consumers
+	m.cache.Set(groupID, group.State)
+
+	tbl := L.NewTable()
+	L.SetField(tbl, "all_on", lua.LBool(group.State.AllOn))
+	L.SetField(tbl, "any_on", lua.LBool(group.State.AnyOn))
+	L.Push(tbl)
+	L.Push(lua.LNil) // no error
+	return 2
 }

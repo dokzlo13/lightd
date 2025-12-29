@@ -1,8 +1,6 @@
 package modules
 
 import (
-	"context"
-
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -92,7 +90,7 @@ func (m *SchedModule) runClosest(L *lua.LState) int {
 		strategy = scheduler.Strategy(s.String())
 	}
 
-	ctx := context.Background()
+	ctx := L.Context()
 	if err := m.scheduler.RunClosest(ctx, tags, strategy); err != nil {
 		log.Error().Err(err).
 			Strs("tags", tags).

@@ -65,8 +65,8 @@ func (s *LuaService) Start(ctx context.Context) {
 // runStartupActions runs initialization actions.
 func (s *LuaService) runStartupActions(ctx context.Context) {
 	log.Info().Msg("Running startup actions")
-	s.Runtime.Do(ctx, func(_ context.Context) {
-		if err := s.invoker.Invoke(ctx, "ensure_banks_set", map[string]any{}, ""); err != nil {
+	s.Runtime.Do(ctx, func(workCtx context.Context) {
+		if err := s.invoker.Invoke(workCtx, "ensure_banks_set", map[string]any{}, ""); err != nil {
 			log.Error().Err(err).Msg("Failed to run ensure_banks_set")
 		}
 	})
@@ -80,8 +80,8 @@ func (s *LuaService) GetInputModule() *modules.InputModule {
 // InvokeThroughLua invokes an action through the Lua worker for thread safety.
 // This is used by the scheduler to ensure Lua actions run in the Lua worker goroutine.
 func (s *LuaService) InvokeThroughLua(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error {
-	return s.Runtime.DoSyncWithResult(ctx, func(_ context.Context) error {
-		return s.invoker.InvokeWithSource(ctx, actionName, args, idempotencyKey, source, defID)
+	return s.Runtime.DoSyncWithResult(ctx, func(workCtx context.Context) error {
+		return s.invoker.InvokeWithSource(workCtx, actionName, args, idempotencyKey, source, defID)
 	})
 }
 

@@ -1,8 +1,6 @@
 package modules
 
 import (
-	"context"
-
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
@@ -14,12 +12,11 @@ import (
 
 // actionContext holds common dependencies for Lua actions.
 //
-// ARCHITECTURE NOTE: The *lua.LState (L) is stored at action registration time,
-// while the Go context (goCtx) passed to Build comes from invocation time.
+// ARCHITECTURE NOTE: The *lua.LState (L) is stored at action registration time.
 // This works because:
 //  1. All Lua execution is single-threaded through the Runtime worker goroutine
 //  2. The LState is never recreated during the Runtime's lifetime
-//  3. The goCtx is only used for cancellation/timeouts in Go callbacks, not stored
+//  3. Context modules use L.Context() to get the Go context for cancellation
 //
 // If the architecture changes to support multiple LStates (e.g., for testing),
 // this coupling would need to be revisited.
@@ -30,8 +27,9 @@ type actionContext struct {
 
 // createContextTable creates the ctx table passed to Lua action functions.
 // Uses the context builder pattern for modular context construction.
-func (a *actionContext) createContextTable(goCtx context.Context) *lua.LTable {
-	return a.contextBuilder.Build(a.L, goCtx)
+// Context modules use L.Context() internally for cancellation support.
+func (a *actionContext) createContextTable() *lua.LTable {
+	return a.contextBuilder.Build(a.L)
 }
 
 // ActionModule provides Action.define() to Lua
@@ -140,7 +138,7 @@ func (a *luaSimpleAction) CaptureDecision(ctx *actions.Context, args map[string]
 }
 
 func (a *luaSimpleAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
-	ctxTable := a.createContextTable(ctx.Ctx())
+	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 
 	a.L.Push(a.fn)
@@ -166,7 +164,7 @@ func (a *luaStatefulAction) Name() string     { return a.name }
 func (a *luaStatefulAction) IsStateful() bool { return true }
 
 func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[string]any) (map[string]any, error) {
-	ctxTable := a.createContextTable(ctx.Ctx())
+	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 
 	a.L.Push(a.captureFn)
@@ -188,7 +186,7 @@ func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[strin
 }
 
 func (a *luaStatefulAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
-	ctxTable := a.createContextTable(ctx.Ctx())
+	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 	capturedTable := MapToLuaTable(a.L, captured)
 

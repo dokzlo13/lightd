@@ -230,6 +230,8 @@ func (r *Runtime) executeWork(ctx context.Context, work LuaWork) {
 				Msg("Lua work panicked - worker continuing")
 		}
 	}()
+	// Set context on LState so modules can access it via L.Context()
+	r.L.SetContext(ctx)
 	work(ctx)
 }
 
