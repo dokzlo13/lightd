@@ -4,13 +4,14 @@ package actions
 import (
 	"context"
 
-	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/amimof/huego"
+
 	"github.com/dokzlo13/lightd/internal/state"
 )
 
 // ActualState provides read-only access to the actual Hue state
 type ActualState interface {
-	Group(ctx context.Context, id string) (*hue.GroupState, error)
+	Group(ctx context.Context, id string) (*huego.GroupState, error)
 }
 
 // DesiredState provides access to the desired state store

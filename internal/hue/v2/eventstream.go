@@ -1,4 +1,4 @@
-package hue
+package v2
 
 import (
 	"bufio"
@@ -37,26 +37,28 @@ func DefaultEventStreamConfig() EventStreamConfig {
 	}
 }
 
-// EventStream listens to the Hue event stream (SSE)
+// EventStream listens to the Hue event stream (SSE) via V2 API.
+// This is the primary reason for this custom V2 client - no Go library
+// currently supports Hue V2 SSE events.
 type EventStream struct {
-	client     *Client
+	v2Client   *Client
 	httpClient *http.Client
 	config     EventStreamConfig
 }
 
 // NewEventStream creates a new event stream listener
-func NewEventStream(client *Client) *EventStream {
-	return NewEventStreamWithConfig(client, DefaultEventStreamConfig())
+func NewEventStream(v2Client *Client) *EventStream {
+	return NewEventStreamWithConfig(v2Client, DefaultEventStreamConfig())
 }
 
 // NewEventStreamWithConfig creates a new event stream listener with custom configuration
-func NewEventStreamWithConfig(client *Client, config EventStreamConfig) *EventStream {
+func NewEventStreamWithConfig(v2Client *Client, config EventStreamConfig) *EventStream {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 
 	return &EventStream{
-		client: client,
+		v2Client: v2Client,
 		httpClient: &http.Client{
 			Transport: transport,
 			// No timeout for SSE - it's a long-lived connection
@@ -124,14 +126,14 @@ func (e *EventStream) Run(ctx context.Context, bus *eventbus.Bus) error {
 }
 
 func (e *EventStream) connect(ctx context.Context, bus *eventbus.Bus) error {
-	url := fmt.Sprintf("https://%s/eventstream/clip/v2", e.client.Address())
+	url := fmt.Sprintf("https://%s/eventstream/clip/v2", e.v2Client.Address())
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("hue-application-key", e.client.token)
+	req.Header.Set("hue-application-key", e.v2Client.Token())
 	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := e.httpClient.Do(req)
@@ -321,3 +323,4 @@ func (e *EventStream) handleConnectivityEvent(id string, data map[string]interfa
 		},
 	})
 }
+

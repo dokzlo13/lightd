@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"github.com/amimof/huego"
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
@@ -42,14 +43,14 @@ type ActionModule struct {
 // It registers all context modules that will be available to Lua actions.
 func NewActionModule(
 	registry *actions.Registry,
-	hueClient *hue.Client,
+	bridge *huego.Bridge,
 	groupCache *hue.GroupCache,
 	desired *state.DesiredStore,
 	reconciler *reconcile.Reconciler,
 ) *ActionModule {
 	// Build the context builder with all modules
 	builder := luactx.NewBuilder().
-		Register(luactx.NewActualModule(hueClient, groupCache)).
+		Register(luactx.NewActualModule(bridge, groupCache)).
 		Register(luactx.NewDesiredModule(desired)).
 		Register(luactx.NewReconcilerModule(reconciler))
 

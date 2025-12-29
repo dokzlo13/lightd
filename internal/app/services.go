@@ -102,8 +102,8 @@ func NewServices(cfg *config.Config) (*Services, error) {
 		return nil, err
 	}
 
-	// Initialize Lua service (pass client and cache separately for SRP)
-	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client, s.Hue.GroupCache, s.DesiredStore, s.Hue.Reconciler, s.GeoCalc)
+	// Initialize Lua service (pass V1 bridge, caches, etc. separately for SRP)
+	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.GroupCache, s.Hue.SceneCache, s.DesiredStore, s.Hue.Reconciler, s.GeoCalc)
 	if err != nil {
 		s.Close()
 		return nil, err

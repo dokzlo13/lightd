@@ -3,9 +3,11 @@ package reconcile
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/time/rate"
 
@@ -15,14 +17,15 @@ import (
 
 // ActualState provides access to current Hue state (cached with fetch-on-stale).
 type ActualState interface {
-	Group(ctx context.Context, id string) (*hue.GroupState, error)
-	FetchAndCache(ctx context.Context, id string) (*hue.GroupState, error)
-	UpdateGroupState(id string, state hue.GroupState)
+	Group(ctx context.Context, id string) (*huego.GroupState, error)
+	FetchAndCache(ctx context.Context, id string) (*huego.GroupState, error)
+	UpdateGroupState(id string, state huego.GroupState)
 }
 
 // Reconciler makes Hue match desired state
 type Reconciler struct {
-	hueClient    *hue.Client
+	bridge       *huego.Bridge
+	sceneCache   *hue.SceneCache
 	actualState  ActualState
 	desiredStore *state.DesiredStore
 
@@ -42,7 +45,14 @@ type Reconciler struct {
 }
 
 // New creates a new Reconciler
-func New(hueClient *hue.Client, actualState ActualState, desiredStore *state.DesiredStore, periodicInterval time.Duration, rateLimitRPS float64) *Reconciler {
+func New(
+	bridge *huego.Bridge,
+	sceneCache *hue.SceneCache,
+	actualState ActualState,
+	desiredStore *state.DesiredStore,
+	periodicInterval time.Duration,
+	rateLimitRPS float64,
+) *Reconciler {
 	if periodicInterval == 0 {
 		periodicInterval = 5 * time.Minute
 	}
@@ -54,7 +64,8 @@ func New(hueClient *hue.Client, actualState ActualState, desiredStore *state.Des
 	limiter := rate.NewLimiter(rate.Limit(rateLimitRPS), int(rateLimitRPS))
 
 	return &Reconciler{
-		hueClient:        hueClient,
+		bridge:           bridge,
+		sceneCache:       sceneCache,
 		actualState:      actualState,
 		desiredStore:     desiredStore,
 		periodicInterval: periodicInterval,
@@ -166,7 +177,7 @@ func (r *Reconciler) reconcileGroup(ctx context.Context, groupID string) error {
 	}
 }
 
-func (r *Reconciler) applyDiff(ctx context.Context, groupID string, desired *state.DesiredState, actual *hue.GroupState) error {
+func (r *Reconciler) applyDiff(ctx context.Context, groupID string, desired *state.DesiredState, actual *huego.GroupState) error {
 	power := desired.Power()
 	bank := desired.Bank()
 
@@ -213,19 +224,30 @@ func (r *Reconciler) turnOnWithScene(ctx context.Context, groupID, sceneName str
 		Str("scene", sceneName).
 		Msg("Turning on with scene")
 
-	// Find scene by name
-	scene, err := r.hueClient.FindSceneByName(ctx, sceneName, groupID)
+	// Find scene by name using scene cache
+	scene, err := r.sceneCache.FindByName(sceneName, groupID)
+	if err != nil {
+		return err
+	}
+
+	// Get group and activate scene
+	id, err := strconv.Atoi(groupID)
+	if err != nil {
+		return err
+	}
+
+	group, err := r.bridge.GetGroup(id)
 	if err != nil {
 		return err
 	}
 
 	// Activate scene (which also turns on the lights)
-	if err := r.hueClient.ActivateScene(ctx, groupID, scene.ID); err != nil {
+	if err := group.Scene(scene.ID); err != nil {
 		return err
 	}
 
 	// Update cache to reflect the change immediately
-	r.actualState.UpdateGroupState(groupID, hue.GroupState{AllOn: true, AnyOn: true})
+	r.actualState.UpdateGroupState(groupID, huego.GroupState{AllOn: true, AnyOn: true})
 	return nil
 }
 
@@ -239,17 +261,27 @@ func (r *Reconciler) applyScene(ctx context.Context, groupID, sceneName string) 
 		Str("scene", sceneName).
 		Msg("Applying scene")
 
-	scene, err := r.hueClient.FindSceneByName(ctx, sceneName, groupID)
+	scene, err := r.sceneCache.FindByName(sceneName, groupID)
 	if err != nil {
 		return err
 	}
 
-	if err := r.hueClient.ActivateScene(ctx, groupID, scene.ID); err != nil {
+	id, err := strconv.Atoi(groupID)
+	if err != nil {
+		return err
+	}
+
+	group, err := r.bridge.GetGroup(id)
+	if err != nil {
+		return err
+	}
+
+	if err := group.Scene(scene.ID); err != nil {
 		return err
 	}
 
 	// Update cache - applying a scene turns lights on
-	r.actualState.UpdateGroupState(groupID, hue.GroupState{AllOn: true, AnyOn: true})
+	r.actualState.UpdateGroupState(groupID, huego.GroupState{AllOn: true, AnyOn: true})
 	return nil
 }
 
@@ -262,11 +294,21 @@ func (r *Reconciler) turnOff(ctx context.Context, groupID string) error {
 		Str("group", groupID).
 		Msg("Turning off")
 
-	if err := r.hueClient.SetGroupAction(ctx, groupID, map[string]interface{}{"on": false}); err != nil {
+	id, err := strconv.Atoi(groupID)
+	if err != nil {
+		return err
+	}
+
+	group, err := r.bridge.GetGroup(id)
+	if err != nil {
+		return err
+	}
+
+	if err := group.Off(); err != nil {
 		return err
 	}
 
 	// Update cache to reflect the change immediately
-	r.actualState.UpdateGroupState(groupID, hue.GroupState{AllOn: false, AnyOn: false})
+	r.actualState.UpdateGroupState(groupID, huego.GroupState{AllOn: false, AnyOn: false})
 	return nil
 }

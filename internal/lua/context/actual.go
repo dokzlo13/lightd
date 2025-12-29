@@ -1,6 +1,9 @@
 package context
 
 import (
+	"strconv"
+
+	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -21,14 +24,14 @@ import (
 //	    if state.any_on then ... end
 //	end
 type ActualModule struct {
-	client *hue.Client
+	bridge *huego.Bridge
 	cache  *hue.GroupCache
 }
 
 // NewActualModule creates a new actual state module.
-func NewActualModule(client *hue.Client, cache *hue.GroupCache) *ActualModule {
+func NewActualModule(bridge *huego.Bridge, cache *hue.GroupCache) *ActualModule {
 	return &ActualModule{
-		client: client,
+		bridge: bridge,
 		cache:  cache,
 	}
 }
@@ -55,11 +58,15 @@ func (m *ActualModule) group(L *lua.LState) int {
 	L.CheckTable(1) // self
 	groupID := L.CheckString(2)
 
-	// Get context from LState for proper cancellation
-	ctx := L.Context()
+	id, err := strconv.Atoi(groupID)
+	if err != nil {
+		L.Push(lua.LNil)
+		L.Push(lua.LString("invalid group ID"))
+		return 2
+	}
 
 	// Always fetch FRESH state from bridge (not stale cache)
-	group, err := m.client.GetGroup(ctx, groupID)
+	group, err := m.bridge.GetGroup(id)
 	if err != nil {
 		log.Error().Err(err).Str("group", groupID).Msg("Failed to get group state")
 		L.Push(lua.LNil)
@@ -68,11 +75,19 @@ func (m *ActualModule) group(L *lua.LState) int {
 	}
 
 	// Cache the fresh result for other consumers
-	m.cache.Set(groupID, group.State)
+	if group.GroupState != nil {
+		m.cache.Set(groupID, *group.GroupState)
+	}
 
 	tbl := L.NewTable()
-	L.SetField(tbl, "all_on", lua.LBool(group.State.AllOn))
-	L.SetField(tbl, "any_on", lua.LBool(group.State.AnyOn))
+	allOn := false
+	anyOn := false
+	if group.GroupState != nil {
+		allOn = group.GroupState.AllOn
+		anyOn = group.GroupState.AnyOn
+	}
+	L.SetField(tbl, "all_on", lua.LBool(allOn))
+	L.SetField(tbl, "any_on", lua.LBool(anyOn))
 	L.Push(tbl)
 	L.Push(lua.LNil) // no error
 	return 2

@@ -4,12 +4,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 )
 
 // CachedGroup holds cached group state with timestamp.
 type CachedGroup struct {
-	State     GroupState
+	State     huego.GroupState
 	FetchedAt time.Time
 }
 
@@ -39,7 +40,7 @@ func NewGroupCache(ttl time.Duration) *GroupCache {
 }
 
 // Get returns cached group state, or nil if not cached or stale.
-func (c *GroupCache) Get(id string) *GroupState {
+func (c *GroupCache) Get(id string) *huego.GroupState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -57,7 +58,7 @@ func (c *GroupCache) Get(id string) *GroupState {
 }
 
 // Set stores group state in the cache.
-func (c *GroupCache) Set(id string, state GroupState) {
+func (c *GroupCache) Set(id string, state huego.GroupState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

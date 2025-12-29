@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 
+	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
@@ -29,13 +30,14 @@ func NewLuaService(
 	registry *actions.Registry,
 	invoker *actions.Invoker,
 	sched *scheduler.Scheduler,
-	hueClient *hue.Client,
+	bridge *huego.Bridge,
 	groupCache *hue.GroupCache,
+	sceneCache *hue.SceneCache,
 	desired *state.DesiredStore,
 	reconciler *reconcile.Reconciler,
 	geoCalc *geo.Calculator,
 ) (*LuaService, error) {
-	runtime := luart.NewRuntime(cfg, registry, invoker, sched, hueClient, groupCache, desired, reconciler, geoCalc)
+	runtime := luart.NewRuntime(cfg, registry, invoker, sched, bridge, groupCache, sceneCache, desired, reconciler, geoCalc)
 
 	return &LuaService{
 		cfg:     cfg,

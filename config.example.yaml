@@ -1,0 +1,50 @@
+hue:
+  bridge: "192.168.10.12"
+  token: "${HUE_TOKEN:replace-me}"
+  timeout: "30s"              # HTTP timeout for Hue API requests
+  # Event stream reconnect settings
+  min_retry_backoff: "1s"     # Minimum backoff between reconnects (default: 1s)
+  max_retry_backoff: "2m"     # Maximum backoff between reconnects (default: 2m)
+  retry_multiplier: 2.0       # Backoff multiplier (default: 2.0)
+  max_reconnects: 0           # Max reconnect attempts, 0 = infinite (default: 0)
+
+geo:
+  name: "Espoo, Finland"
+  timezone: "Europe/Helsinki"
+  http_timeout: "10s"         # Timeout for geocoding HTTP requests
+  # lat: 60.2055              # Pre-configured coordinates (avoids Nominatim calls)
+  # lon: 24.6559              # If not set, will geocode 'name' at startup
+
+database:
+  path: "./hueplanner.sqlite"
+
+log:
+  level: "${LOG_LEVEL:debug}"
+  colors: ${LOG_COLORS:true}
+  print_schedule: "30m"       # How often to print schedule (0 = disabled)
+
+cache:
+  enabled: false              # If false (default), always fetch fresh state from bridge
+  refresh_interval: "5m"      # Cache TTL / how often to refresh cached Hue state
+
+reconciler:
+  periodic_interval: "5m"     # Periodic reconciliation interval
+  rate_limit_rps: 10.0        # Hue API rate limit (requests per second)
+
+ledger:
+  cleanup_interval: "24h"     # How often to clean up old ledger entries
+  retention_days: 3           # How many days to retain ledger entries
+
+healthcheck:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+
+eventbus:
+  workers: 4                  # Number of worker goroutines for event processing
+  queue_size: 100             # Event queue size (events dropped if full)
+
+shutdown_timeout: "5s"        # Timeout for graceful shutdown of all services
+
+script: "main.lua"
+

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -34,8 +35,9 @@ type Runtime struct {
 	registry   *actions.Registry
 	invoker    *actions.Invoker
 	scheduler  *scheduler.Scheduler
-	hueClient  *hue.Client
+	bridge     *huego.Bridge
 	groupCache *hue.GroupCache
+	sceneCache *hue.SceneCache
 	desired    *state.DesiredStore
 	reconciler *reconcile.Reconciler
 	geoCalc    *geo.Calculator
@@ -61,8 +63,9 @@ func NewRuntime(
 	registry *actions.Registry,
 	invoker *actions.Invoker,
 	sched *scheduler.Scheduler,
-	hueClient *hue.Client,
+	bridge *huego.Bridge,
 	groupCache *hue.GroupCache,
+	sceneCache *hue.SceneCache,
 	desired *state.DesiredStore,
 	reconciler *reconcile.Reconciler,
 	geoCalc *geo.Calculator,
@@ -75,8 +78,9 @@ func NewRuntime(
 		registry:   registry,
 		invoker:    invoker,
 		scheduler:  sched,
-		hueClient:  hueClient,
+		bridge:     bridge,
 		groupCache: groupCache,
+		sceneCache: sceneCache,
 		desired:    desired,
 		reconciler: reconciler,
 		geoCalc:    geoCalc,
@@ -175,7 +179,7 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("geo", geoModule.Loader)
 
 	// Action module
-	r.actionModule = modules.NewActionModule(r.registry, r.hueClient, r.groupCache, r.desired, r.reconciler)
+	r.actionModule = modules.NewActionModule(r.registry, r.bridge, r.groupCache, r.desired, r.reconciler)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Input module
@@ -186,8 +190,8 @@ func (r *Runtime) registerModules() {
 	r.schedModule = modules.NewSchedModule(r.scheduler)
 	r.L.PreloadModule("sched", r.schedModule.Loader)
 
-	// Hue module
-	r.hueModule = modules.NewHueModule(r.hueClient, r.groupCache)
+	// Hue module (now with userdata support)
+	r.hueModule = modules.NewHueModule(r.bridge, r.groupCache, r.sceneCache)
 	r.L.PreloadModule("hue", r.hueModule.Loader)
 }
 
