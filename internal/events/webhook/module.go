@@ -76,6 +76,12 @@ func (m *Module) GetHandlers() []Handler {
 	return m.handlers
 }
 
+// HasMatch checks if there's a registered handler for the given method and path.
+// Implements the webhook.PathMatcher interface.
+func (m *Module) HasMatch(method, path string) bool {
+	return m.FindHandler(method, path) != nil
+}
+
 // MatchResult contains a matched handler and extracted path parameters
 type MatchResult struct {
 	Handler    *Handler

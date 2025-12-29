@@ -13,11 +13,17 @@ import (
 	"github.com/dokzlo13/lightd/internal/eventbus"
 )
 
+// PathMatcher checks if a request matches a registered handler
+type PathMatcher interface {
+	HasMatch(method, path string) bool
+}
+
 // Server is an HTTP server that receives webhooks and publishes events to the bus.
 type Server struct {
-	addr       string
-	bus        *eventbus.Bus
-	httpServer *http.Server
+	addr        string
+	bus         *eventbus.Bus
+	httpServer  *http.Server
+	pathMatcher PathMatcher
 }
 
 // NewServer creates a new webhook server.
@@ -26,6 +32,12 @@ func NewServer(host string, port int, bus *eventbus.Bus) *Server {
 		addr: fmt.Sprintf("%s:%d", host, port),
 		bus:  bus,
 	}
+}
+
+// SetPathMatcher sets the path matcher for request validation.
+// Must be called before Run() or after Lua handlers are registered.
+func (s *Server) SetPathMatcher(matcher PathMatcher) {
+	s.pathMatcher = matcher
 }
 
 // Run starts the webhook server. It blocks until the context is cancelled.
@@ -61,11 +73,26 @@ func (s *Server) Run(ctx context.Context, shutdownTimeout time.Duration) error {
 
 // handleWebhook processes incoming webhook requests and publishes them to the event bus.
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	// Validate path if matcher is set
+	if s.pathMatcher != nil && !s.pathMatcher.HasMatch(r.Method, r.URL.Path) {
+		log.Debug().
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Msg("No handler registered for webhook path")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"error":"no matching handler for path"}`))
+		return
+	}
+
 	// Read request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to read webhook request body")
-		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"failed to read request body"}`))
 		return
 	}
 	defer r.Body.Close()
@@ -112,8 +139,8 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
-	// Respond with 200 OK
+	// Respond with 200 OK - request accepted
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"ok"}`))
+	w.Write([]byte(`{"status":"accepted"}`))
 }

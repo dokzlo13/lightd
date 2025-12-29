@@ -25,6 +25,12 @@ func NewWebhookService(cfg *config.Config, bus *eventbus.Bus) *WebhookService {
 	}
 }
 
+// SetPathMatcher sets the path matcher for request validation.
+// Should be called after Lua handlers are registered.
+func (s *WebhookService) SetPathMatcher(matcher webhook.PathMatcher) {
+	s.server.SetPathMatcher(matcher)
+}
+
 // Start begins the webhook server if enabled.
 func (s *WebhookService) Start(ctx context.Context) {
 	if !s.cfg.Webhook.Enabled {

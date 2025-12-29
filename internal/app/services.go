@@ -146,7 +146,10 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	}
 	// Webhook handlers (HTTP webhook events)
 	if s.cfg.Webhook.Enabled {
-		s.Lua.GetWebhookModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua)
+		webhookModule := s.Lua.GetWebhookModule()
+		webhookModule.RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua)
+		// Set path matcher for HTTP request validation
+		s.Webhook.SetPathMatcher(webhookModule)
 	}
 
 	// Start all background services
