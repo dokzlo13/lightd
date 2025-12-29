@@ -1,0 +1,61 @@
+# --- OS / editor / IDE ---
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+*.iml
+
+# Cursor IDE workspace metadata
+.cursor/
+
+# --- Local / runtime junk ---
+.trash/
+*.log
+
+# Local env / secrets (keep sample templates committed separately)
+.env
+.env.*
+!.env.example
+
+# Local runtime config (contains secrets; keep it local)
+config.yaml
+
+# Local lua scripts (user-provided)
+main.lua
+
+# --- Databases (SQLite) ---
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+
+# SQLite sidecars
+*.sqlite-*
+*.sqlite3-*
+*.db-*
+*.db3-*
+
+# --- Go ---
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Build artifacts
+*.test
+*.out
+*.a
+*.o
+
+# Coverage / profiling
+*.coverprofile
+coverage/
+cover.out
+*.pprof
+
+# Go workspace / local tooling
+go.work
+go.work.sum
