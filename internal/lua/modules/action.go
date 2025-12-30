@@ -8,10 +8,10 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/hue"
 	luactx "github.com/dokzlo13/lightd/internal/lua/context"
 	"github.com/dokzlo13/lightd/internal/reconcile"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/stores"
 )
 
 // actionContext holds common dependencies for Lua actions.
@@ -47,15 +47,20 @@ type ActionModule struct {
 func NewActionModule(
 	registry *actions.Registry,
 	bridge *huego.Bridge,
-	groupCache *hue.GroupCache,
-	desired *state.DesiredStore,
-	reconciler *reconcile.Reconciler,
+	storeRegistry *stores.Registry,
+	orchestrator *reconcile.Orchestrator,
 ) *ActionModule {
+	// Create the GroupActualProvider for actual state access
+	actualProvider := group.NewActualProvider(bridge)
+
+	// Create the desired module (shared between context and reconciler for flush)
+	desiredModule := luactx.NewDesiredModule(storeRegistry.Groups(), storeRegistry.Lights())
+
 	// Build the context builder with all modules
 	builder := luactx.NewBuilder().
-		Register(luactx.NewActualModule(bridge, groupCache)).
-		Register(luactx.NewDesiredModule(desired)).
-		Register(luactx.NewReconcilerModule(reconciler)).
+		Register(luactx.NewActualModule(actualProvider)).
+		Register(desiredModule).
+		Register(luactx.NewReconcilerModule(orchestrator, desiredModule)).
 		Register(luactx.NewRequestModule())
 
 	return &ActionModule{
@@ -189,6 +194,9 @@ func (a *luaSimpleAction) Execute(ctx *actions.Context, args map[string]any, cap
 	// Update LState context to include request data from webhook triggers
 	a.L.SetContext(ctx.Ctx())
 
+	// Ensure pending state is flushed after action completes (even without ctx:reconcile())
+	defer a.contextBuilder.Cleanup()
+
 	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)
 
@@ -242,6 +250,9 @@ func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[strin
 func (a *luaStatefulAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
 	// Update LState context to include request data from webhook triggers
 	a.L.SetContext(ctx.Ctx())
+
+	// Ensure pending state is flushed after action completes (even without ctx:reconcile())
+	defer a.contextBuilder.Cleanup()
 
 	ctxTable := a.createContextTable()
 	argsTable := MapToLuaTable(a.L, args)

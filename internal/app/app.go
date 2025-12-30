@@ -77,8 +77,8 @@ func (a *App) Wait() {
 // ClearDesiredState clears the stored desired state.
 // This is useful for resetting state on startup with --reset-state flag.
 func (a *App) ClearDesiredState() error {
-	if a.services != nil && a.services.DesiredStore != nil {
-		return a.services.DesiredStore.Clear()
+	if a.services != nil {
+		return a.services.ClearState()
 	}
 	return nil
 }

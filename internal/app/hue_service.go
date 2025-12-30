@@ -2,51 +2,68 @@ package app
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/eventbus"
 	"github.com/dokzlo13/lightd/internal/hue"
 	v2 "github.com/dokzlo13/lightd/internal/hue/v2"
 	"github.com/dokzlo13/lightd/internal/reconcile"
+	"github.com/dokzlo13/lightd/internal/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/reconcile/light"
 	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/stores"
 )
 
-// HueService wraps all Hue-related components: client, cache, event stream, and reconciler.
+// HueService wraps all Hue-related components: client, cache, event stream, and orchestrator.
 type HueService struct {
 	cfg *config.Config
 
-	Client      *hue.Client
-	GroupCache  *hue.GroupCache
-	SceneCache  *hue.SceneCache
-	ActualState *ActualStateAdapter
-	EventStream *v2.EventStream
-	Reconciler  *reconcile.Reconciler
-	Bus         *eventbus.Bus
+	Client       *hue.Client
+	SceneIndex   *cache.SceneIndex
+	EventStream  *v2.EventStream
+	Orchestrator *reconcile.Orchestrator
+	Bus          *eventbus.Bus
+	Stores       *stores.Registry
+
+	// Resource providers
+	GroupProvider *group.Provider
+	LightProvider *light.Provider
 }
 
 // NewHueService creates a new HueService with all components initialized but not connected.
-func NewHueService(cfg *config.Config, desiredStore *state.DesiredStore) (*HueService, error) {
+func NewHueService(cfg *config.Config, db *sql.DB, store *state.Store) (*HueService, error) {
 	// Initialize Hue client (holder for V1/V2 clients with shared HTTP config)
 	client := hue.NewClient(cfg.Hue.Bridge, cfg.Hue.Token, cfg.Hue.Timeout.Duration())
 
-	// Initialize pure caches
-	groupCache := hue.NewGroupCache(cfg.Cache.RefreshInterval.Duration())
-	sceneCache := hue.NewSceneCache(client.V1())
+	// Initialize scene index (pure index, caller loads data)
+	sceneIndex := cache.NewSceneIndex()
 
-	// Initialize actual state adapter (uses huego bridge + cache)
-	actualState := NewActualStateAdapter(client.V1(), groupCache)
+	// Create store registry (centralized typed stores)
+	storeRegistry := stores.NewRegistry(store)
 
-	// Initialize reconciler with huego bridge, scene cache, and actual state adapter
-	reconciler := reconcile.New(
-		client.V1(),
-		sceneCache,
-		actualState,
-		desiredStore,
+	// Create actual state providers (no caching - always fetch from bridge)
+	groupActualProvider := group.NewActualProvider(client.V1())
+	lightActualProvider := light.NewActualProvider(client.V1())
+
+	// Create appliers
+	groupApplier := group.NewHueApplier(client.V1(), sceneIndex)
+	lightApplier := light.NewHueApplier(client.V1())
+
+	// Create resource providers
+	groupProvider := group.NewProvider(storeRegistry.Groups(), groupActualProvider, groupApplier)
+	lightProvider := light.NewProvider(storeRegistry.Lights(), lightActualProvider, lightApplier)
+
+	// Initialize orchestrator
+	orchestrator := reconcile.NewOrchestrator(
 		cfg.Reconciler.PeriodicInterval.Duration(),
 		cfg.Reconciler.RateLimitRPS,
 	)
+	orchestrator.Register(groupProvider)
+	orchestrator.Register(lightProvider)
 
 	// Initialize event bus
 	bus := eventbus.NewWithConfig(cfg.EventBus.GetWorkers(), cfg.EventBus.GetQueueSize())
@@ -61,14 +78,15 @@ func NewHueService(cfg *config.Config, desiredStore *state.DesiredStore) (*HueSe
 	eventStream := v2.NewEventStreamWithConfig(client.V2(), eventStreamConfig)
 
 	return &HueService{
-		cfg:         cfg,
-		Client:      client,
-		GroupCache:  groupCache,
-		SceneCache:  sceneCache,
-		ActualState: actualState,
-		EventStream: eventStream,
-		Reconciler:  reconciler,
-		Bus:         bus,
+		cfg:           cfg,
+		Client:        client,
+		SceneIndex:    sceneIndex,
+		EventStream:   eventStream,
+		Orchestrator:  orchestrator,
+		Bus:           bus,
+		Stores:        storeRegistry,
+		GroupProvider: groupProvider,
+		LightProvider: lightProvider,
 	}, nil
 }
 
@@ -78,16 +96,20 @@ func (s *HueService) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Preload scene cache
-	if _, err := s.SceneCache.Refresh(); err != nil {
-		log.Warn().Err(err).Msg("Failed to preload scene cache")
+	// Fetch and load scenes into index
+	scenes, err := s.Client.V1().GetScenes()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch scenes")
+	} else {
+		s.SceneIndex.Load(scenes)
+		log.Info().Int("count", len(scenes)).Msg("Loaded scenes into index")
 	}
 
 	log.Info().Str("bridge", s.cfg.Hue.Bridge).Msg("Connected to Hue bridge")
 	return nil
 }
 
-// StartBackground starts all background goroutines (event stream, reconciler).
+// StartBackground starts all background goroutines (event stream, orchestrator).
 // The optional onFatalError callback is called when a fatal error occurs (e.g., max reconnects exceeded).
 func (s *HueService) StartBackground(ctx context.Context, onFatalError func(error)) {
 	// Start event stream listener only if SSE is enabled
@@ -108,10 +130,10 @@ func (s *HueService) StartBackground(ctx context.Context, onFatalError func(erro
 		log.Info().Msg("SSE event stream disabled")
 	}
 
-	// Start reconciler
+	// Start orchestrator
 	go func() {
-		if err := s.Reconciler.Run(ctx); err != nil {
-			log.Error().Err(err).Msg("Reconciler error")
+		if err := s.Orchestrator.Run(ctx); err != nil {
+			log.Error().Err(err).Msg("Orchestrator error")
 		}
 	}()
 }

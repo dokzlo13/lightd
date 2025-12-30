@@ -9,6 +9,7 @@ import (
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/reconcile/group"
 	"github.com/dokzlo13/lightd/internal/state"
 )
 
@@ -29,7 +30,7 @@ func (m *Module) RegisterHandlers(
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
 	luaExec LuaExecutor,
-	desiredStore *state.DesiredStore,
+	desiredStore *state.TypedStore[group.Desired],
 ) {
 	m.registerButtonHandler(ctx, bus, invoker, luaExec, desiredStore)
 	m.registerConnectivityHandler(ctx, bus, invoker, luaExec)
@@ -42,7 +43,7 @@ func (m *Module) registerButtonHandler(
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
 	luaExec LuaExecutor,
-	desiredStore *state.DesiredStore,
+	desiredStore *state.TypedStore[group.Desired],
 ) {
 	bus.Subscribe(eventbus.EventTypeButton, func(event eventbus.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
@@ -71,8 +72,12 @@ func (m *Module) registerButtonHandler(
 				// 1. Run init_bank first (no dedupe)
 				// 2. Then run toggle_group (with dedupe)
 				groupID, _ := h.ActionArgs["group"].(string)
-				if groupID != "" && !desiredStore.HasBank(groupID) {
-					invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
+				if groupID != "" {
+					// Check if bank is set
+					desired, _, _ := desiredStore.Get(groupID)
+					if desired.SceneName == "" {
+						invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
+					}
 				}
 			}
 			// Invoke action with button event ID as idempotency key

@@ -106,18 +106,20 @@ func initSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to create idx_ledger_idempotency_completed index: %w", err)
 	}
 
-	// Desired state - per-group state with versioning for dirty tracking
+	// Resource state - generic JSON state store keyed by (kind, id)
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS desired_state (
-			group_id TEXT PRIMARY KEY,
-			bank_scene_name TEXT,
-			desired_power INTEGER,
-			version INTEGER DEFAULT 0,
-			updated_at INTEGER NOT NULL
+		CREATE TABLE IF NOT EXISTS resource_state (
+			kind TEXT NOT NULL,
+			id TEXT NOT NULL,
+			payload TEXT NOT NULL,
+			version INTEGER DEFAULT 1,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (kind, id)
 		);
+		CREATE INDEX IF NOT EXISTS idx_resource_state_kind ON resource_state(kind);
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to create desired_state table: %w", err)
+		return fmt.Errorf("failed to create resource_state table: %w", err)
 	}
 
 	// Geocache - persisted location lookups to avoid repeated Nominatim calls

@@ -24,6 +24,15 @@ type ContextModule interface {
 	Install(L *lua.LState, ctx *lua.LTable)
 }
 
+// CleanupModule is an optional interface for modules that need cleanup after action execution.
+// If a ContextModule implements this, Cleanup() is called after the action completes.
+// This ensures pending state is always persisted.
+type CleanupModule interface {
+	// Cleanup is called after a Lua action completes (success or error).
+	// Use this to flush pending state that wasn't explicitly committed.
+	Cleanup()
+}
+
 // Builder collects context modules and builds the final ctx table.
 // It's similar to how Runtime registers Lua modules.
 type Builder struct {
@@ -52,4 +61,14 @@ func (b *Builder) Build(L *lua.LState) *lua.LTable {
 		m.Install(L, ctx)
 	}
 	return ctx
+}
+
+// Cleanup calls Cleanup() on all modules that implement CleanupModule.
+// This should be called after every action execution to ensure pending state is flushed.
+func (b *Builder) Cleanup() {
+	for _, m := range b.modules {
+		if cm, ok := m.(CleanupModule); ok {
+			cm.Cleanup()
+		}
+	}
 }

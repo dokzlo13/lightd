@@ -9,19 +9,23 @@ import (
 // ReconcilerModule provides ctx:reconcile() for triggering reconciliation.
 //
 // This is installed at the root level (not nested), so it's called as ctx:reconcile().
+// Before triggering, it flushes any pending desired state changes from builders.
 //
 // Example Lua usage:
 //
-//	ctx.desired:set_power("1", true)
-//	ctx:reconcile() -- triggers the reconciler to apply changes
+//	ctx.desired:group("1"):on():set_scene("Relax")
+//	ctx.desired:light("5"):set_bri(254)
+//	ctx:reconcile() -- flushes pending and triggers the orchestrator
 type ReconcilerModule struct {
-	reconciler *reconcile.Reconciler
+	orchestrator  *reconcile.Orchestrator
+	desiredModule *DesiredModule
 }
 
 // NewReconcilerModule creates a new reconciler module.
-func NewReconcilerModule(reconciler *reconcile.Reconciler) *ReconcilerModule {
+func NewReconcilerModule(orchestrator *reconcile.Orchestrator, desiredModule *DesiredModule) *ReconcilerModule {
 	return &ReconcilerModule{
-		reconciler: reconciler,
+		orchestrator:  orchestrator,
+		desiredModule: desiredModule,
 	}
 }
 
@@ -36,12 +40,19 @@ func (m *ReconcilerModule) Install(L *lua.LState, ctx *lua.LTable) {
 	L.SetField(ctx, "reconcile", L.NewFunction(m.reconcile()))
 }
 
-// reconcile returns a Lua function that triggers the reconciler.
+// reconcile returns a Lua function that flushes pending and triggers the orchestrator.
 func (m *ReconcilerModule) reconcile() lua.LGFunction {
 	return func(L *lua.LState) int {
 		// L.CheckTable(1) // self - optional, ctx:reconcile() passes ctx as self
-		if m.reconciler != nil {
-			m.reconciler.Trigger()
+
+		// Flush all pending desired state changes from builders
+		if m.desiredModule != nil {
+			m.desiredModule.Flush()
+		}
+
+		// Trigger orchestrator
+		if m.orchestrator != nil {
+			m.orchestrator.Trigger()
 		}
 		return 0
 	}

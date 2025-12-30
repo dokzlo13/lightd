@@ -1,13 +1,10 @@
 package context
 
 import (
-	"strconv"
-
-	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/reconcile/group"
 )
 
 // ActualModule provides ctx.actual for accessing current Hue state.
@@ -24,15 +21,13 @@ import (
 //	    if state.any_on then ... end
 //	end
 type ActualModule struct {
-	bridge *huego.Bridge
-	cache  *hue.GroupCache
+	provider *group.ActualProvider
 }
 
 // NewActualModule creates a new actual state module.
-func NewActualModule(bridge *huego.Bridge, cache *hue.GroupCache) *ActualModule {
+func NewActualModule(provider *group.ActualProvider) *ActualModule {
 	return &ActualModule{
-		bridge: bridge,
-		cache:  cache,
+		provider: provider,
 	}
 }
 
@@ -58,15 +53,11 @@ func (m *ActualModule) group(L *lua.LState) int {
 	L.CheckTable(1) // self
 	groupID := L.CheckString(2)
 
-	id, err := strconv.Atoi(groupID)
-	if err != nil {
-		L.Push(lua.LNil)
-		L.Push(lua.LString("invalid group ID"))
-		return 2
-	}
+	// Get the context from LState
+	ctx := L.Context()
 
-	// Always fetch FRESH state from bridge (not stale cache)
-	group, err := m.bridge.GetGroup(id)
+	// Fetch fresh state from bridge
+	state, err := m.provider.Get(ctx, groupID)
 	if err != nil {
 		log.Error().Err(err).Str("group", groupID).Msg("Failed to get group state")
 		L.Push(lua.LNil)
@@ -74,21 +65,13 @@ func (m *ActualModule) group(L *lua.LState) int {
 		return 2
 	}
 
-	// Cache the fresh result for other consumers
-	if group.GroupState != nil {
-		m.cache.Set(groupID, *group.GroupState)
-	}
-
 	tbl := L.NewTable()
-	allOn := false
-	anyOn := false
-	if group.GroupState != nil {
-		allOn = group.GroupState.AllOn
-		anyOn = group.GroupState.AnyOn
-	}
-	L.SetField(tbl, "all_on", lua.LBool(allOn))
-	L.SetField(tbl, "any_on", lua.LBool(anyOn))
+	L.SetField(tbl, "all_on", lua.LBool(state.AllOn))
+	L.SetField(tbl, "any_on", lua.LBool(state.AnyOn))
+	L.SetField(tbl, "last_applied_scene", lua.LString(state.LastAppliedScene))
 	L.Push(tbl)
 	L.Push(lua.LNil) // no error
 	return 2
 }
+
+// TODO: Add actual:light(light_id) -> (state_table, err)

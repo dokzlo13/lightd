@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/cache"
 )
 
 const groupTypeName = "hue.group"
@@ -15,7 +15,7 @@ const groupTypeName = "hue.group"
 // GroupUserdata wraps a huego.Group for Lua access
 type GroupUserdata struct {
 	group      *huego.Group
-	sceneCache *hue.SceneCache
+	sceneIndex *cache.SceneIndex
 }
 
 // RegisterGroupType registers the hue.group metatable
@@ -47,9 +47,9 @@ var groupMethods = map[string]lua.LGFunction{
 }
 
 // pushGroup creates a new Group userdata and pushes it onto the stack
-func pushGroup(L *lua.LState, group *huego.Group, sceneCache *hue.SceneCache) {
+func pushGroup(L *lua.LState, group *huego.Group, sceneIndex *cache.SceneIndex) {
 	ud := L.NewUserData()
-	ud.Value = &GroupUserdata{group: group, sceneCache: sceneCache}
+	ud.Value = &GroupUserdata{group: group, sceneIndex: sceneIndex}
 	L.SetMetatable(ud, L.GetTypeMetatable(groupTypeName))
 	L.Push(ud)
 }
@@ -224,7 +224,7 @@ func groupSetScene(L *lua.LState) int {
 	groupID := strconv.Itoa(group.group.ID)
 
 	// Find scene by name
-	scene, err := group.sceneCache.FindByName(sceneName, groupID)
+	scene, err := group.sceneIndex.FindByName(sceneName, groupID)
 	if err != nil {
 		log.Error().Err(err).Int("group", group.group.ID).Str("scene", sceneName).Msg("Failed to find scene")
 		L.Push(ud)
@@ -269,7 +269,7 @@ func groupSetState(L *lua.LState) int {
 	if v := tbl.RawGetString("scene"); v != lua.LNil {
 		if sceneName, ok := v.(lua.LString); ok {
 			groupID := strconv.Itoa(group.group.ID)
-			scene, err := group.sceneCache.FindByName(string(sceneName), groupID)
+			scene, err := group.sceneIndex.FindByName(string(sceneName), groupID)
 			if err != nil {
 				log.Error().Err(err).Int("group", group.group.ID).Str("scene", string(sceneName)).Msg("Failed to find scene")
 			} else {

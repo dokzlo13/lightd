@@ -12,15 +12,15 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
+	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/hue"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
 	"github.com/dokzlo13/lightd/internal/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/stores"
 )
 
 // ErrRuntimeClosed is returned when the Lua runtime is closed
@@ -32,17 +32,16 @@ type LuaWork func(ctx context.Context)
 
 // Runtime manages the Lua VM with single-threaded execution
 type Runtime struct {
-	L          *lua.LState
-	config     *config.Config
-	registry   *actions.Registry
-	invoker    *actions.Invoker
-	scheduler  *scheduler.Scheduler
-	bridge     *huego.Bridge
-	groupCache *hue.GroupCache
-	sceneCache *hue.SceneCache
-	desired    *state.DesiredStore
-	reconciler *reconcile.Reconciler
-	geoCalc    *geo.Calculator
+	L            *lua.LState
+	config       *config.Config
+	registry     *actions.Registry
+	invoker      *actions.Invoker
+	scheduler    *scheduler.Scheduler
+	bridge       *huego.Bridge
+	sceneIndex   *cache.SceneIndex
+	stores       *stores.Registry
+	orchestrator *reconcile.Orchestrator
+	geoCalc      *geo.Calculator
 
 	// Modules
 	actionModule  *modules.ActionModule
@@ -67,28 +66,26 @@ func NewRuntime(
 	invoker *actions.Invoker,
 	sched *scheduler.Scheduler,
 	bridge *huego.Bridge,
-	groupCache *hue.GroupCache,
-	sceneCache *hue.SceneCache,
-	desired *state.DesiredStore,
-	reconciler *reconcile.Reconciler,
+	sceneIndex *cache.SceneIndex,
+	storeRegistry *stores.Registry,
+	orchestrator *reconcile.Orchestrator,
 	geoCalc *geo.Calculator,
 ) *Runtime {
 	L := lua.NewState()
 
 	r := &Runtime{
-		L:          L,
-		config:     cfg,
-		registry:   registry,
-		invoker:    invoker,
-		scheduler:  sched,
-		bridge:     bridge,
-		groupCache: groupCache,
-		sceneCache: sceneCache,
-		desired:    desired,
-		reconciler: reconciler,
-		geoCalc:    geoCalc,
-		workQueue:  make(chan LuaWork, 100),
-		closing:    make(chan struct{}),
+		L:            L,
+		config:       cfg,
+		registry:     registry,
+		invoker:      invoker,
+		scheduler:    sched,
+		bridge:       bridge,
+		sceneIndex:   sceneIndex,
+		stores:       storeRegistry,
+		orchestrator: orchestrator,
+		geoCalc:      geoCalc,
+		workQueue:    make(chan LuaWork, 100),
+		closing:      make(chan struct{}),
 	}
 
 	r.registerModules()
@@ -182,15 +179,15 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("geo", geoModule.Loader)
 
 	// Action module
-	r.actionModule = modules.NewActionModule(r.registry, r.bridge, r.groupCache, r.desired, r.reconciler)
+	r.actionModule = modules.NewActionModule(r.registry, r.bridge, r.stores, r.orchestrator)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Sched module
 	r.schedModule = modules.NewSchedModule(r.scheduler)
 	r.L.PreloadModule("sched", r.schedModule.Loader)
 
-	// Hue module (now with userdata support)
-	r.hueModule = modules.NewHueModule(r.bridge, r.groupCache, r.sceneCache)
+	// Hue module
+	r.hueModule = modules.NewHueModule(r.bridge, r.sceneIndex)
 	r.L.PreloadModule("hue", r.hueModule.Loader)
 
 	// Event source modules with dotted namespace

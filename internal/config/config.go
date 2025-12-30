@@ -15,7 +15,6 @@ type Config struct {
 	Geo             GeoConfig         `yaml:"geo"`
 	Database        DatabaseConfig    `yaml:"database"`
 	Log             LogConfig         `yaml:"log"`
-	Cache           CacheConfig       `yaml:"cache"`
 	Reconciler      ReconcilerConfig  `yaml:"reconciler"`
 	Ledger          LedgerConfig      `yaml:"ledger"`
 	Healthcheck     HealthcheckConfig `yaml:"healthcheck"`
@@ -58,12 +57,6 @@ type LogConfig struct {
 	Level         string   `yaml:"level"`
 	Colors        bool     `yaml:"colors"`
 	PrintSchedule Duration `yaml:"print_schedule"` // Interval to print schedule (0 = disabled)
-}
-
-// CacheConfig contains cache settings
-type CacheConfig struct {
-	Enabled         bool     `yaml:"enabled"`          // If false, always fetch fresh state (default: false)
-	RefreshInterval Duration `yaml:"refresh_interval"` // Only used if enabled
 }
 
 // ReconcilerConfig contains reconciler settings
@@ -197,11 +190,6 @@ func Load(path string) (*Config, error) {
 		cfg.Hue.RetryMultiplier = 2.0
 	}
 	// MaxReconnects defaults to 0 (infinite), no need to set
-
-	// Cache defaults - caching is OFF by default (always fetch fresh state)
-	if cfg.Cache.RefreshInterval == 0 {
-		cfg.Cache.RefreshInterval = Duration(5 * time.Minute)
-	}
 
 	// Reconciler defaults
 	if cfg.Reconciler.PeriodicInterval == 0 {

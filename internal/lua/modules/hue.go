@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/cache"
 )
 
 // HueModule provides hue.* functions to Lua.
@@ -44,16 +44,14 @@ import (
 //	})
 type HueModule struct {
 	bridge     *huego.Bridge
-	cache      *hue.GroupCache
-	sceneCache *hue.SceneCache
+	sceneIndex *cache.SceneIndex
 }
 
 // NewHueModule creates a new hue module
-func NewHueModule(bridge *huego.Bridge, cache *hue.GroupCache, sceneCache *hue.SceneCache) *HueModule {
+func NewHueModule(bridge *huego.Bridge, sceneIndex *cache.SceneIndex) *HueModule {
 	return &HueModule{
 		bridge:     bridge,
-		cache:      cache,
-		sceneCache: sceneCache,
+		sceneIndex: sceneIndex,
 	}
 }
 
@@ -65,10 +63,8 @@ func (m *HueModule) Loader(L *lua.LState) int {
 
 	mod := L.NewTable()
 
-	// hue.cache - cached state access
-	cache := L.NewTable()
-	L.SetField(cache, "group", L.NewFunction(m.cacheGroup))
-	L.SetField(mod, "cache", cache)
+	// hue.get_group - fetch fresh group state (no caching)
+	L.SetField(mod, "get_group_state", L.NewFunction(m.getGroupState))
 
 	// Legacy functions (keep for backward compatibility)
 	L.SetField(mod, "set_group_brightness", L.NewFunction(m.setGroupBrightness))
@@ -178,7 +174,7 @@ func (m *HueModule) getGroup(L *lua.LState) int {
 		return 2
 	}
 
-	pushGroup(L, group, m.sceneCache)
+	pushGroup(L, group, m.sceneIndex)
 	L.Push(lua.LNil)
 	return 2
 }
@@ -196,7 +192,7 @@ func (m *HueModule) getGroups(L *lua.LState) int {
 
 	tbl := L.NewTable()
 	for i := range groups {
-		pushGroup(L, &groups[i], m.sceneCache)
+		pushGroup(L, &groups[i], m.sceneIndex)
 		tbl.RawSetInt(i+1, L.Get(-1))
 		L.Pop(1)
 	}
@@ -210,22 +206,11 @@ func (m *HueModule) getGroups(L *lua.LState) int {
 // Legacy Functions (kept for backward compatibility)
 // =============================================================================
 
-// cacheGroup(group_id) -> (state_table, err)
-// Returns cached state if fresh, otherwise fetches from bridge and caches.
-func (m *HueModule) cacheGroup(L *lua.LState) int {
+// getGroupState(group_id) -> (state_table, err)
+// Fetches fresh group state from the bridge.
+func (m *HueModule) getGroupState(L *lua.LState) int {
 	groupID := L.CheckString(1)
 
-	// Check cache first
-	if state := m.cache.Get(groupID); state != nil {
-		tbl := L.NewTable()
-		L.SetField(tbl, "all_on", lua.LBool(state.AllOn))
-		L.SetField(tbl, "any_on", lua.LBool(state.AnyOn))
-		L.Push(tbl)
-		L.Push(lua.LNil)
-		return 2
-	}
-
-	// Cache miss or stale - fetch from bridge
 	id, err := strconv.Atoi(groupID)
 	if err != nil {
 		L.Push(lua.LNil)
@@ -239,11 +224,6 @@ func (m *HueModule) cacheGroup(L *lua.LState) int {
 		L.Push(lua.LNil)
 		L.Push(lua.LString(err.Error()))
 		return 2
-	}
-
-	// Cache the result
-	if group.GroupState != nil {
-		m.cache.Set(groupID, *group.GroupState)
 	}
 
 	tbl := L.NewTable()
@@ -398,7 +378,7 @@ func (m *HueModule) recallScene(L *lua.LState) int {
 	}
 
 	// Find scene by name first
-	scene, err := m.sceneCache.FindByName(sceneName, groupID)
+	scene, err := m.sceneIndex.FindByName(sceneName, groupID)
 	if err != nil {
 		log.Error().Err(err).Str("group", groupID).Str("scene", sceneName).Msg("Failed to find scene")
 		L.Push(lua.LBool(false))

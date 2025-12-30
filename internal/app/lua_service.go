@@ -6,15 +6,15 @@ import (
 	"github.com/amimof/huego"
 
 	"github.com/dokzlo13/lightd/internal/actions"
+	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/hue"
 	"github.com/dokzlo13/lightd/internal/lua"
 	"github.com/dokzlo13/lightd/internal/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/stores"
 )
 
 // LuaService wraps the Lua runtime and provides thread-safe execution.
@@ -31,13 +31,12 @@ func NewLuaService(
 	invoker *actions.Invoker,
 	sched *scheduler.Scheduler,
 	bridge *huego.Bridge,
-	groupCache *hue.GroupCache,
-	sceneCache *hue.SceneCache,
-	desired *state.DesiredStore,
-	reconciler *reconcile.Reconciler,
+	sceneIndex *cache.SceneIndex,
+	storeRegistry *stores.Registry,
+	orchestrator *reconcile.Orchestrator,
 	geoCalc *geo.Calculator,
 ) (*LuaService, error) {
-	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, groupCache, sceneCache, desired, reconciler, geoCalc)
+	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, sceneIndex, storeRegistry, orchestrator, geoCalc)
 
 	return &LuaService{
 		cfg:     cfg,

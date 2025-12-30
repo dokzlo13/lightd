@@ -4,22 +4,13 @@ package actions
 import (
 	"context"
 
-	"github.com/amimof/huego"
-
+	"github.com/dokzlo13/lightd/internal/reconcile/group"
 	"github.com/dokzlo13/lightd/internal/state"
 )
 
 // ActualState provides read-only access to the actual Hue state
 type ActualState interface {
-	Group(ctx context.Context, id string) (*huego.GroupState, error)
-}
-
-// DesiredState provides access to the desired state store
-type DesiredState interface {
-	SetBank(groupID string, sceneName string) error
-	SetPower(groupID string, on bool) error
-	GetBank(groupID string) string
-	HasBank(groupID string) bool
+	Get(ctx context.Context, groupID string) (group.Actual, error)
 }
 
 // Reconciler triggers reconciliation
@@ -33,7 +24,7 @@ type Reconciler interface {
 type Context struct {
 	ctx        context.Context // Go context for cancellation/timeout
 	actual     ActualState
-	desired    *state.DesiredStore
+	desired    *state.TypedStore[group.Desired]
 	reconciler Reconciler
 	runAction  func(name string, args map[string]any) error
 }
@@ -42,7 +33,7 @@ type Context struct {
 func NewContext(
 	ctx context.Context,
 	actual ActualState,
-	desired *state.DesiredStore,
+	desired *state.TypedStore[group.Desired],
 	reconciler Reconciler,
 	runAction func(name string, args map[string]any) error,
 ) *Context {
@@ -65,8 +56,8 @@ func (c *Context) Actual() ActualState {
 	return c.actual
 }
 
-// Desired returns the desired state accessor
-func (c *Context) Desired() DesiredState {
+// Desired returns the desired state store
+func (c *Context) Desired() *state.TypedStore[group.Desired] {
 	return c.desired
 }
 
@@ -83,4 +74,51 @@ func (c *Context) RunAction(name string, args map[string]any) error {
 		return c.runAction(name, args)
 	}
 	return nil
+}
+
+// --- Convenience methods for common operations ---
+
+// SetPower sets the desired power state for a group
+func (c *Context) SetPower(groupID string, on bool) error {
+	return c.desired.Update(groupID, func(current group.Desired) group.Desired {
+		current.Power = &on
+		return current
+	})
+}
+
+// SetScene sets the desired scene for a group
+func (c *Context) SetScene(groupID string, sceneName string) error {
+	return c.desired.Update(groupID, func(current group.Desired) group.Desired {
+		current.SceneName = sceneName
+		return current
+	})
+}
+
+// GetDesiredState returns the current desired state for a group
+func (c *Context) GetDesiredState(groupID string) (group.Desired, error) {
+	state, _, err := c.desired.Get(groupID)
+	return state, err
+}
+
+// GetActualState returns the current actual state for a group
+func (c *Context) GetActualState(groupID string) (group.Actual, error) {
+	return c.actual.Get(c.ctx, groupID)
+}
+
+// HasScene returns true if the group has a scene set
+func (c *Context) HasScene(groupID string) bool {
+	state, _, err := c.desired.Get(groupID)
+	if err != nil {
+		return false
+	}
+	return state.SceneName != ""
+}
+
+// GetScene returns the scene name for a group, or empty if not set
+func (c *Context) GetScene(groupID string) string {
+	state, _, err := c.desired.Get(groupID)
+	if err != nil {
+		return ""
+	}
+	return state.SceneName
 }

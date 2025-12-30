@@ -22,9 +22,9 @@ type Services struct {
 	DB     *db.DB
 	Ledger *ledger.Ledger
 
-	// Domain stores
-	DesiredStore *state.DesiredStore
-	GeoCalc      *geo.Calculator
+	// State store (generic JSON store)
+	Store   *state.Store
+	GeoCalc *geo.Calculator
 
 	// Action system
 	Registry *actions.Registry
@@ -52,8 +52,8 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	// Initialize ledger
 	s.Ledger = ledger.New(database.DB)
 
-	// Initialize desired state store
-	s.DesiredStore = state.NewDesiredStore(database.DB)
+	// Initialize generic state store
+	s.Store = state.NewStore(database.DB)
 
 	// Initialize geo calculator
 	geoCache := geo.NewCache(database.DB)
@@ -74,20 +74,20 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	// Initialize action registry
 	s.Registry = actions.NewRegistry()
 
-	// Initialize Hue service
-	s.Hue, err = NewHueService(cfg, s.DesiredStore)
+	// Initialize Hue service (now takes store instead of DesiredStore)
+	s.Hue, err = NewHueService(cfg, database.DB, s.Store)
 	if err != nil {
 		s.Close()
 		return nil, err
 	}
 
-	// Create invoker context factory using ActualStateAdapter
+	// Create invoker context factory
 	ctxFactory := func(ctx context.Context) *actions.Context {
 		return actions.NewContext(
 			ctx,
-			s.Hue.ActualState, // implements actions.ActualState interface
-			s.DesiredStore,
-			s.Hue.Reconciler,
+			s.Hue.GroupProvider.ActualProvider(),
+			s.Hue.Stores.Groups(),
+			s.Hue.Orchestrator,
 			nil,
 		)
 	}
@@ -102,8 +102,8 @@ func NewServices(cfg *config.Config) (*Services, error) {
 		return nil, err
 	}
 
-	// Initialize Lua service (pass V1 bridge, caches, etc. separately for SRP)
-	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.GroupCache, s.Hue.SceneCache, s.DesiredStore, s.Hue.Reconciler, s.GeoCalc)
+	// Initialize Lua service
+	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.SceneIndex, s.Hue.Stores, s.Hue.Orchestrator, s.GeoCalc)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -142,7 +142,7 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	// Register event handlers from modules (after Lua script is loaded)
 	// SSE handlers (button, rotary, connectivity from Hue event stream)
 	if s.cfg.SSE.IsEnabled() {
-		s.Lua.GetSSEModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua, s.DesiredStore)
+		s.Lua.GetSSEModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua, s.Hue.Stores.Groups())
 	}
 	// Webhook handlers (HTTP webhook events)
 	if s.cfg.Webhook.Enabled {
@@ -160,6 +160,11 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	s.Webhook.Start(ctx)
 
 	return nil
+}
+
+// ClearState clears all resource state.
+func (s *Services) ClearState() error {
+	return s.Store.Clear("")
 }
 
 // Stop gracefully stops all services.
