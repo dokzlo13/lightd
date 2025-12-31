@@ -12,39 +12,56 @@ import (
 // Config represents the application configuration
 type Config struct {
 	Hue             HueConfig         `yaml:"hue"`
-	Geo             GeoConfig         `yaml:"geo"`
 	Database        DatabaseConfig    `yaml:"database"`
 	Log             LogConfig         `yaml:"log"`
 	Reconciler      ReconcilerConfig  `yaml:"reconciler"`
 	Ledger          LedgerConfig      `yaml:"ledger"`
 	Healthcheck     HealthcheckConfig `yaml:"healthcheck"`
-	Webhook         WebhookConfig     `yaml:"webhook"`
-	SSE             SSEConfig         `yaml:"sse"`
+	Events          EventsConfig      `yaml:"events"`
 	EventBus        EventBusConfig    `yaml:"eventbus"`
 	Script          string            `yaml:"script"`
-	ShutdownTimeout Duration          `yaml:"shutdown_timeout"` // General shutdown timeout for graceful stops
+	ShutdownTimeout Duration          `yaml:"shutdown_timeout"`
+}
+
+// EventsConfig groups all event source configurations
+type EventsConfig struct {
+	Webhook   WebhookConfig   `yaml:"webhook"`
+	SSE       SSEConfig       `yaml:"sse"`
+	Scheduler SchedulerConfig `yaml:"scheduler"`
 }
 
 // HueConfig contains Hue bridge connection settings
 type HueConfig struct {
 	Bridge  string   `yaml:"bridge"`
 	Token   string   `yaml:"token"`
-	Timeout Duration `yaml:"timeout"` // HTTP timeout for Hue API requests
-
-	// Event stream reconnect settings
-	MinRetryBackoff Duration `yaml:"min_retry_backoff"` // Minimum backoff between reconnects (default: 1s)
-	MaxRetryBackoff Duration `yaml:"max_retry_backoff"` // Maximum backoff between reconnects (default: 2m)
-	RetryMultiplier float64  `yaml:"retry_multiplier"`  // Backoff multiplier (default: 2.0)
-	MaxReconnects   int      `yaml:"max_reconnects"`    // Max reconnect attempts, 0 = infinite (default: 0)
+	Timeout Duration `yaml:"timeout"`
 }
 
 // GeoConfig contains geo/location settings for astronomical calculations
 type GeoConfig struct {
+	Enabled     *bool    `yaml:"enabled"`
+	UseCache    *bool    `yaml:"use_cache"`
 	Name        string   `yaml:"name"`
 	Timezone    string   `yaml:"timezone"`
 	Lat         float64  `yaml:"lat,omitempty"`
 	Lon         float64  `yaml:"lon,omitempty"`
-	HTTPTimeout Duration `yaml:"http_timeout"` // Timeout for geocoding HTTP requests
+	HTTPTimeout Duration `yaml:"http_timeout"`
+}
+
+// IsEnabled returns whether geo is enabled (defaults to true if not set)
+func (c *GeoConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// IsCacheEnabled returns whether geo cache is enabled (defaults to true if not set)
+func (c *GeoConfig) IsCacheEnabled() bool {
+	if c.UseCache == nil {
+		return true
+	}
+	return *c.UseCache
 }
 
 // DatabaseConfig contains database settings
@@ -54,21 +71,38 @@ type DatabaseConfig struct {
 
 // LogConfig contains logging settings
 type LogConfig struct {
-	Level         string   `yaml:"level"`
-	Colors        bool     `yaml:"colors"`
-	PrintSchedule Duration `yaml:"print_schedule"` // Interval to print schedule (0 = disabled)
+	Level  string `yaml:"level"`
+	Colors bool   `yaml:"colors"`
 }
 
 // ReconcilerConfig contains reconciler settings
 type ReconcilerConfig struct {
+	Enabled          *bool    `yaml:"enabled"`
 	PeriodicInterval Duration `yaml:"periodic_interval"`
 	RateLimitRPS     float64  `yaml:"rate_limit_rps"`
 }
 
+// IsEnabled returns whether the reconciler is enabled (defaults to true if not set)
+func (c *ReconcilerConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
 // LedgerConfig contains event ledger settings
 type LedgerConfig struct {
-	CleanupInterval Duration `yaml:"cleanup_interval"`
-	RetentionDays   int      `yaml:"retention_days"`
+	Enabled           *bool    `yaml:"enabled"`
+	RetentionPeriod   Duration `yaml:"retention_period"`
+	RetentionInterval Duration `yaml:"retention_interval"`
+}
+
+// IsEnabled returns whether the ledger is enabled (defaults to true if not set)
+func (c *LedgerConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
 }
 
 // HealthcheckConfig contains health check server settings
@@ -87,21 +121,39 @@ type WebhookConfig struct {
 
 // SSEConfig contains SSE (Hue event stream) settings
 type SSEConfig struct {
-	Enabled *bool `yaml:"enabled"` // Pointer to distinguish unset from false (default: true)
+	Enabled         *bool    `yaml:"enabled"`
+	MinRetryBackoff Duration `yaml:"min_retry_backoff"`
+	MaxRetryBackoff Duration `yaml:"max_retry_backoff"`
+	RetryMultiplier float64  `yaml:"retry_multiplier"`
+	MaxReconnects   int      `yaml:"max_reconnects"`
 }
 
 // IsEnabled returns whether SSE is enabled (defaults to true if not set)
 func (c *SSEConfig) IsEnabled() bool {
 	if c.Enabled == nil {
-		return true // Default to enabled for backward compatibility
+		return true
+	}
+	return *c.Enabled
+}
+
+// SchedulerConfig contains scheduler settings
+type SchedulerConfig struct {
+	Enabled *bool     `yaml:"enabled"`
+	Geo     GeoConfig `yaml:"geo"`
+}
+
+// IsEnabled returns whether the scheduler is enabled (defaults to true if not set)
+func (c *SchedulerConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
 	}
 	return *c.Enabled
 }
 
 // EventBusConfig contains event bus settings
 type EventBusConfig struct {
-	Workers   int `yaml:"workers"`    // Number of worker goroutines (default: 4)
-	QueueSize int `yaml:"queue_size"` // Event queue size (default: 100)
+	Workers   int `yaml:"workers"`
+	QueueSize int `yaml:"queue_size"`
 }
 
 // GetWorkers returns worker count with default
@@ -168,26 +220,28 @@ func Load(path string) (*Config, error) {
 		cfg.Script = "main.lua"
 	}
 
-	// Geo defaults
-	if cfg.Geo.Timezone == "" {
-		cfg.Geo.Timezone = "UTC"
+	// Geo defaults (under events.scheduler.geo)
+	if cfg.Events.Scheduler.Geo.Timezone == "" {
+		cfg.Events.Scheduler.Geo.Timezone = "UTC"
 	}
-	if cfg.Geo.HTTPTimeout == 0 {
-		cfg.Geo.HTTPTimeout = Duration(10 * time.Second)
+	if cfg.Events.Scheduler.Geo.HTTPTimeout == 0 {
+		cfg.Events.Scheduler.Geo.HTTPTimeout = Duration(10 * time.Second)
 	}
 
 	// Hue defaults
 	if cfg.Hue.Timeout == 0 {
 		cfg.Hue.Timeout = Duration(30 * time.Second)
 	}
-	if cfg.Hue.MinRetryBackoff == 0 {
-		cfg.Hue.MinRetryBackoff = Duration(1 * time.Second)
+
+	// SSE reconnect defaults (now under events.sse)
+	if cfg.Events.SSE.MinRetryBackoff == 0 {
+		cfg.Events.SSE.MinRetryBackoff = Duration(1 * time.Second)
 	}
-	if cfg.Hue.MaxRetryBackoff == 0 {
-		cfg.Hue.MaxRetryBackoff = Duration(2 * time.Minute)
+	if cfg.Events.SSE.MaxRetryBackoff == 0 {
+		cfg.Events.SSE.MaxRetryBackoff = Duration(2 * time.Minute)
 	}
-	if cfg.Hue.RetryMultiplier == 0 {
-		cfg.Hue.RetryMultiplier = 2.0
+	if cfg.Events.SSE.RetryMultiplier == 0 {
+		cfg.Events.SSE.RetryMultiplier = 2.0
 	}
 	// MaxReconnects defaults to 0 (infinite), no need to set
 
@@ -196,15 +250,15 @@ func Load(path string) (*Config, error) {
 		cfg.Reconciler.PeriodicInterval = Duration(5 * time.Minute)
 	}
 	if cfg.Reconciler.RateLimitRPS == 0 {
-		cfg.Reconciler.RateLimitRPS = 10.0 // 10 requests per second
+		cfg.Reconciler.RateLimitRPS = 10.0
 	}
 
 	// Ledger defaults
-	if cfg.Ledger.CleanupInterval == 0 {
-		cfg.Ledger.CleanupInterval = Duration(24 * time.Hour)
+	if cfg.Ledger.RetentionInterval == 0 {
+		cfg.Ledger.RetentionInterval = Duration(24 * time.Hour)
 	}
-	if cfg.Ledger.RetentionDays == 0 {
-		cfg.Ledger.RetentionDays = 30
+	if cfg.Ledger.RetentionPeriod == 0 {
+		cfg.Ledger.RetentionPeriod = Duration(30 * 24 * time.Hour) // 30 days
 	}
 
 	// Healthcheck defaults
@@ -216,11 +270,11 @@ func Load(path string) (*Config, error) {
 	}
 
 	// Webhook defaults
-	if cfg.Webhook.Port == 0 {
-		cfg.Webhook.Port = 8081
+	if cfg.Events.Webhook.Port == 0 {
+		cfg.Events.Webhook.Port = 8081
 	}
-	if cfg.Webhook.Host == "" {
-		cfg.Webhook.Host = "0.0.0.0"
+	if cfg.Events.Webhook.Host == "" {
+		cfg.Events.Webhook.Host = "0.0.0.0"
 	}
 
 	// General shutdown timeout

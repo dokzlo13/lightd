@@ -175,7 +175,8 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("log", logModule.Loader)
 
 	// Geo module (uses shared calculator to avoid duplicate geocoding)
-	geoModule := modules.NewGeoModule(r.config.Geo.Name, r.config.Geo.Timezone, r.geoCalc)
+	geoCfg := r.config.Events.Scheduler.Geo
+	geoModule := modules.NewGeoModule(geoCfg.Name, geoCfg.Timezone, r.geoCalc)
 	r.L.PreloadModule("geo", geoModule.Loader)
 
 	// Action module
@@ -183,7 +184,7 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Sched module
-	r.schedModule = modules.NewSchedModule(r.scheduler)
+	r.schedModule = modules.NewSchedModule(r.scheduler, r.config.Events.Scheduler.IsEnabled())
 	r.L.PreloadModule("sched", r.schedModule.Loader)
 
 	// Hue module
@@ -192,11 +193,11 @@ func (r *Runtime) registerModules() {
 
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)
-	r.sseModule = sse.NewModule(r.config.SSE.IsEnabled())
+	r.sseModule = sse.NewModule(r.config.Events.SSE.IsEnabled())
 	r.L.PreloadModule("events.sse", r.sseModule.Loader)
 
 	// Webhook module (HTTP webhook events)
-	r.webhookModule = webhook.NewModule(r.config.Webhook.Enabled)
+	r.webhookModule = webhook.NewModule(r.config.Events.Webhook.Enabled)
 	r.L.PreloadModule("events.webhook", r.webhookModule.Loader)
 }
 

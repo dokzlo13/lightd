@@ -1,5 +1,5 @@
 // Package ledger provides an append-only event history for HuePlanner.
-// It supports action deduplication, misfire detection, and auditing.
+// It supports action deduplication and auditing.
 package ledger
 
 import (
@@ -13,10 +13,8 @@ import (
 type EventType string
 
 const (
-	EventActionStarted   EventType = "action_started"
 	EventActionCompleted EventType = "action_completed"
 	EventActionFailed    EventType = "action_failed"
-	EventButtonProcessed EventType = "button_processed"
 	EventScheduleFired   EventType = "schedule_fired"
 )
 
@@ -89,90 +87,6 @@ func (l *Ledger) HasCompleted(idempotencyKey string) bool {
 	`, idempotencyKey, string(EventActionCompleted)).Scan(&exists)
 
 	return err == nil && exists == 1
-}
-
-// GetStarted returns the action_started entry for a given idempotency_key, if it exists
-// Used for restart recovery of orphaned actions
-func (l *Ledger) GetStarted(idempotencyKey string) (*Entry, error) {
-	if idempotencyKey == "" {
-		return nil, nil
-	}
-
-	var entry Entry
-	var payloadStr sql.NullString
-	var source, defID sql.NullString
-	var timestamp int64
-
-	err := l.db.QueryRow(`
-		SELECT id, event_type, timestamp, payload, source, idempotency_key, def_id
-		FROM event_ledger
-		WHERE idempotency_key = ? AND event_type = ?
-		ORDER BY id DESC LIMIT 1
-	`, idempotencyKey, string(EventActionStarted)).Scan(
-		&entry.ID, &entry.EventType, &timestamp, &payloadStr, &source, &entry.IdempotencyKey, &defID,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	entry.Timestamp = time.Unix(timestamp, 0).UTC()
-	if source.Valid {
-		entry.Source = source.String
-	}
-	if defID.Valid {
-		entry.DefID = defID.String
-	}
-
-	if payloadStr.Valid && payloadStr.String != "" {
-		if err := json.Unmarshal([]byte(payloadStr.String), &entry.Payload); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal payload: %w", err)
-		}
-	}
-
-	return &entry, nil
-}
-
-// GetOrphanedStarts returns all action_started entries without corresponding action_completed
-// Used for startup recovery of crashed actions
-func (l *Ledger) GetOrphanedStarts() ([]*Entry, error) {
-	rows, err := l.db.Query(`
-		SELECT l1.id, l1.event_type, l1.timestamp, l1.payload, l1.source, l1.idempotency_key, l1.def_id
-		FROM event_ledger l1
-		WHERE l1.event_type = ?
-		AND l1.idempotency_key IS NOT NULL
-		AND l1.idempotency_key != ''
-		AND NOT EXISTS (
-			SELECT 1 FROM event_ledger l2 
-			WHERE l2.idempotency_key = l1.idempotency_key 
-			AND l2.event_type = ?
-		)
-		ORDER BY l1.id ASC
-	`, string(EventActionStarted), string(EventActionCompleted))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	return l.scanEntries(rows)
-}
-
-// GetLastCompletedForDef returns the timestamp of the last completed action for a specific definition
-// Used for per-definition misfire detection
-func (l *Ledger) GetLastCompletedForDef(defID string) (time.Time, bool) {
-	var timestamp int64
-	err := l.db.QueryRow(`
-		SELECT MAX(timestamp) FROM event_ledger
-		WHERE def_id = ? AND event_type = ?
-	`, defID, string(EventActionCompleted)).Scan(&timestamp)
-
-	if err != nil || timestamp == 0 {
-		return time.Time{}, false
-	}
-	return time.Unix(timestamp, 0).UTC(), true
 }
 
 // GetByType returns entries filtered by event type

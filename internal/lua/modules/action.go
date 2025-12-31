@@ -36,7 +36,7 @@ func (a *actionContext) createContextTable() *lua.LTable {
 	return a.contextBuilder.Build(a.L)
 }
 
-// ActionModule provides Action.define() to Lua
+// ActionModule provides action.define() to Lua
 type ActionModule struct {
 	registry       *actions.Registry
 	contextBuilder *luactx.Builder
@@ -74,7 +74,6 @@ func (m *ActionModule) Loader(L *lua.LState) int {
 	mod := L.NewTable()
 
 	L.SetField(mod, "define", L.NewFunction(m.define))
-	L.SetField(mod, "define_stateful", L.NewFunction(m.defineStateful))
 	L.SetField(mod, "run", L.NewFunction(m.run))
 
 	L.Push(mod)
@@ -108,14 +107,7 @@ func (m *ActionModule) run(L *lua.LState) int {
 
 	log.Debug().Str("action", name).Msg("Running action from Lua")
 
-	// Capture and execute
-	captured, err := action.CaptureDecision(actx, args)
-	if err != nil {
-		L.RaiseError("action %q capture failed: %s", name, err.Error())
-		return 0
-	}
-
-	if err := action.Execute(actx, args, captured); err != nil {
+	if err := action.Execute(actx, args); err != nil {
 		L.RaiseError("action %q failed: %s", name, err.Error())
 		return 0
 	}
@@ -123,12 +115,12 @@ func (m *ActionModule) run(L *lua.LState) int {
 	return 0
 }
 
-// define(name, function) - Define a simple action
+// define(name, function) - Define an action
 func (m *ActionModule) define(L *lua.LState) int {
 	name := L.CheckString(1)
 	fn := L.CheckFunction(2)
 
-	action := &luaSimpleAction{
+	action := &luaAction{
 		actionContext: actionContext{
 			L:              L,
 			contextBuilder: m.contextBuilder,
@@ -145,52 +137,16 @@ func (m *ActionModule) define(L *lua.LState) int {
 	return 0
 }
 
-// define_stateful(name, {capture=fn, execute=fn}) - Define a stateful action
-func (m *ActionModule) defineStateful(L *lua.LState) int {
-	name := L.CheckString(1)
-	tbl := L.CheckTable(2)
-
-	captureFn := tbl.RawGetString("capture")
-	executeFn := tbl.RawGetString("execute")
-
-	if captureFn == lua.LNil || executeFn == lua.LNil {
-		L.RaiseError("define_stateful requires 'capture' and 'execute' functions")
-		return 0
-	}
-
-	action := &luaStatefulAction{
-		actionContext: actionContext{
-			L:              L,
-			contextBuilder: m.contextBuilder,
-		},
-		name:      name,
-		captureFn: captureFn.(*lua.LFunction),
-		executeFn: executeFn.(*lua.LFunction),
-	}
-
-	if err := m.registry.Register(action); err != nil {
-		L.RaiseError("failed to register action: %s", err.Error())
-		return 0
-	}
-
-	return 0
-}
-
-// luaSimpleAction wraps a Lua function as a simple action
-type luaSimpleAction struct {
+// luaAction wraps a Lua function as an action
+type luaAction struct {
 	actionContext
 	name string
 	fn   *lua.LFunction
 }
 
-func (a *luaSimpleAction) Name() string     { return a.name }
-func (a *luaSimpleAction) IsStateful() bool { return false }
+func (a *luaAction) Name() string { return a.name }
 
-func (a *luaSimpleAction) CaptureDecision(ctx *actions.Context, args map[string]any) (map[string]any, error) {
-	return args, nil
-}
-
-func (a *luaSimpleAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
+func (a *luaAction) Execute(ctx *actions.Context, args map[string]any) error {
 	// Update LState context to include request data from webhook triggers
 	a.L.SetContext(ctx.Ctx())
 
@@ -205,65 +161,6 @@ func (a *luaSimpleAction) Execute(ctx *actions.Context, args map[string]any, cap
 	a.L.Push(argsTable)
 
 	if err := a.L.PCall(2, 0, nil); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// luaStatefulAction wraps Lua capture/execute functions
-type luaStatefulAction struct {
-	actionContext
-	name      string
-	captureFn *lua.LFunction
-	executeFn *lua.LFunction
-}
-
-func (a *luaStatefulAction) Name() string     { return a.name }
-func (a *luaStatefulAction) IsStateful() bool { return true }
-
-func (a *luaStatefulAction) CaptureDecision(ctx *actions.Context, args map[string]any) (map[string]any, error) {
-	// Update LState context to include request data from webhook triggers
-	a.L.SetContext(ctx.Ctx())
-
-	ctxTable := a.createContextTable()
-	argsTable := MapToLuaTable(a.L, args)
-
-	a.L.Push(a.captureFn)
-	a.L.Push(ctxTable)
-	a.L.Push(argsTable)
-
-	if err := a.L.PCall(2, 1, nil); err != nil {
-		return nil, err
-	}
-
-	result := a.L.Get(-1)
-	a.L.Pop(1)
-
-	if tbl, ok := result.(*lua.LTable); ok {
-		return LuaTableToMap(tbl), nil
-	}
-
-	return args, nil
-}
-
-func (a *luaStatefulAction) Execute(ctx *actions.Context, args map[string]any, captured map[string]any) error {
-	// Update LState context to include request data from webhook triggers
-	a.L.SetContext(ctx.Ctx())
-
-	// Ensure pending state is flushed after action completes (even without ctx:reconcile())
-	defer a.contextBuilder.Cleanup()
-
-	ctxTable := a.createContextTable()
-	argsTable := MapToLuaTable(a.L, args)
-	capturedTable := MapToLuaTable(a.L, captured)
-
-	a.L.Push(a.executeFn)
-	a.L.Push(ctxTable)
-	a.L.Push(argsTable)
-	a.L.Push(capturedTable)
-
-	if err := a.L.PCall(3, 0, nil); err != nil {
 		return err
 	}
 

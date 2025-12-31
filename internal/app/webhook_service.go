@@ -18,7 +18,7 @@ type WebhookService struct {
 
 // NewWebhookService creates a new WebhookService.
 func NewWebhookService(cfg *config.Config, bus *eventbus.Bus) *WebhookService {
-	server := webhook.NewServer(cfg.Webhook.Host, cfg.Webhook.Port, bus)
+	server := webhook.NewServer(cfg.Events.Webhook.Host, cfg.Events.Webhook.Port, bus)
 	return &WebhookService{
 		cfg:    cfg,
 		server: server,
@@ -33,7 +33,7 @@ func (s *WebhookService) SetPathMatcher(matcher webhook.PathMatcher) {
 
 // Start begins the webhook server if enabled.
 func (s *WebhookService) Start(ctx context.Context) {
-	if !s.cfg.Webhook.Enabled {
+	if !s.cfg.Events.Webhook.Enabled {
 		log.Debug().Msg("Webhook server disabled")
 		return
 	}

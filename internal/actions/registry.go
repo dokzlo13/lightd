@@ -8,49 +8,19 @@ import (
 // Action represents a named, invokable unit of work
 type Action interface {
 	Name() string
-	IsStateful() bool
-	// CaptureDecision captures the decision for stateful actions
-	// For simple actions, this just returns the args unchanged
-	CaptureDecision(ctx *Context, args map[string]any) (map[string]any, error)
-	// Execute runs the action with the captured decision
-	Execute(ctx *Context, args map[string]any, captured map[string]any) error
+	Execute(ctx *Context, args map[string]any) error
 }
 
-// SimpleAction is a non-stateful action that doesn't need decision capture
+// SimpleAction is the standard action implementation
 type SimpleAction struct {
 	name string
 	fn   func(ctx *Context, args map[string]any) error
 }
 
-func (a *SimpleAction) Name() string     { return a.name }
-func (a *SimpleAction) IsStateful() bool { return false }
+func (a *SimpleAction) Name() string { return a.name }
 
-func (a *SimpleAction) CaptureDecision(ctx *Context, args map[string]any) (map[string]any, error) {
-	// Simple actions don't capture - return args as-is
-	return args, nil
-}
-
-func (a *SimpleAction) Execute(ctx *Context, args map[string]any, captured map[string]any) error {
-	// Simple actions ignore captured and use original args
+func (a *SimpleAction) Execute(ctx *Context, args map[string]any) error {
 	return a.fn(ctx, args)
-}
-
-// StatefulAction captures a decision before executing
-type StatefulAction struct {
-	name    string
-	capture func(ctx *Context, args map[string]any) (map[string]any, error)
-	execute func(ctx *Context, args map[string]any, captured map[string]any) error
-}
-
-func (a *StatefulAction) Name() string     { return a.name }
-func (a *StatefulAction) IsStateful() bool { return true }
-
-func (a *StatefulAction) CaptureDecision(ctx *Context, args map[string]any) (map[string]any, error) {
-	return a.capture(ctx, args)
-}
-
-func (a *StatefulAction) Execute(ctx *Context, args map[string]any, captured map[string]any) error {
-	return a.execute(ctx, args, captured)
 }
 
 // Registry holds all registered actions
@@ -79,22 +49,9 @@ func (r *Registry) Register(action Action) error {
 	return nil
 }
 
-// RegisterSimple adds a simple (non-stateful) action
+// RegisterSimple adds a simple action (convenience method)
 func (r *Registry) RegisterSimple(name string, fn func(ctx *Context, args map[string]any) error) error {
 	return r.Register(&SimpleAction{name: name, fn: fn})
-}
-
-// RegisterStateful adds a stateful action with capture and execute phases
-func (r *Registry) RegisterStateful(
-	name string,
-	capture func(ctx *Context, args map[string]any) (map[string]any, error),
-	execute func(ctx *Context, args map[string]any, captured map[string]any) error,
-) error {
-	return r.Register(&StatefulAction{
-		name:    name,
-		capture: capture,
-		execute: execute,
-	})
 }
 
 // Get retrieves an action by name
@@ -116,4 +73,3 @@ func (r *Registry) Names() []string {
 	}
 	return names
 }
-

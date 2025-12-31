@@ -68,12 +68,12 @@ func NewHueService(cfg *config.Config, db *sql.DB, store *state.Store) (*HueServ
 	// Initialize event bus
 	bus := eventbus.NewWithConfig(cfg.EventBus.GetWorkers(), cfg.EventBus.GetQueueSize())
 
-	// Initialize event stream with V2 client and retry configuration
+	// Initialize event stream with V2 client and retry configuration (from events.sse)
 	eventStreamConfig := v2.EventStreamConfig{
-		MinBackoff:    cfg.Hue.MinRetryBackoff.Duration(),
-		MaxBackoff:    cfg.Hue.MaxRetryBackoff.Duration(),
-		Multiplier:    cfg.Hue.RetryMultiplier,
-		MaxReconnects: cfg.Hue.MaxReconnects,
+		MinBackoff:    cfg.Events.SSE.MinRetryBackoff.Duration(),
+		MaxBackoff:    cfg.Events.SSE.MaxRetryBackoff.Duration(),
+		Multiplier:    cfg.Events.SSE.RetryMultiplier,
+		MaxReconnects: cfg.Events.SSE.MaxReconnects,
 	}
 	eventStream := v2.NewEventStreamWithConfig(client.V2(), eventStreamConfig)
 
@@ -113,7 +113,7 @@ func (s *HueService) Start(ctx context.Context) error {
 // The optional onFatalError callback is called when a fatal error occurs (e.g., max reconnects exceeded).
 func (s *HueService) StartBackground(ctx context.Context, onFatalError func(error)) {
 	// Start event stream listener only if SSE is enabled
-	if s.cfg.SSE.IsEnabled() {
+	if s.cfg.Events.SSE.IsEnabled() {
 		go func() {
 			if err := s.EventStream.Run(ctx, s.Bus); err != nil {
 				if err == v2.ErrMaxReconnectsExceeded {

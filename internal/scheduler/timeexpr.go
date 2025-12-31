@@ -22,36 +22,7 @@ const (
 	BaseTimeDusk
 )
 
-// DSTPolicy defines how to handle DST transitions for fixed times
-// TODO: Not yet implemented - currently no special DST handling is performed.
-// During DST "spring forward" transitions, fixed times in the skipped hour will
-// evaluate to the post-transition time (e.g., 02:30 becomes 03:30).
-// During DST "fall back" transitions, fixed times in the overlap period will
-// occur once (first occurrence), which may cause unexpected behavior.
-type DSTPolicy int
-
-const (
-	DSTFirstOccurrence DSTPolicy = iota // Use first occurrence in overlap (default)
-	DSTSecondOccurrence
-	DSTSkip
-	DSTShiftForward
-)
-
-// PolarPolicy defines how to handle missing sun events in polar regions
-// TODO: Not yet implemented - currently uses implicit PolarSkip behavior.
-// When astronomical events don't occur (e.g., no sunset during Arctic summer),
-// the schedule occurrence is skipped for that day. Future implementations could
-// provide fallback times.
-type PolarPolicy int
-
-const (
-	PolarSkip PolarPolicy = iota // Skip that occurrence (default) - CURRENTLY IMPLEMENTED
-	PolarFallbackNoon
-	PolarFallbackMidnight
-)
-
 // TimeExpr represents a parsed time expression
-// TODO: Add DSTPolicy and PolarPolicy fields when implementing those features
 type TimeExpr struct {
 	Raw       string
 	BaseTime  BaseTimeType
@@ -208,26 +179,49 @@ func (te *TimeExpr) IsFixed() bool {
 	return te.BaseTime == BaseTimeFixed
 }
 
+// IsAstronomical returns true if this is an astronomical time expression
+func (te *TimeExpr) IsAstronomical() bool {
+	return te.BaseTime != BaseTimeFixed
+}
+
 // String returns the original expression string
 func (te *TimeExpr) String() string {
 	return te.Raw
 }
 
-// TimeExprEvaluator evaluates time expressions using astronomical data
-type TimeExprEvaluator struct {
+// TimeEvaluator is the interface for evaluating time expressions
+type TimeEvaluator interface {
+	// Evaluate evaluates a time expression for a given date
+	Evaluate(expr *TimeExpr, date time.Time) (time.Time, bool)
+
+	// ComputeNextOccurrence finds the next occurrence after the given time
+	ComputeNextOccurrence(expr *TimeExpr, after time.Time) (time.Time, bool)
+
+	// ComputePrevOccurrence finds the previous occurrence before the given time
+	ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool)
+
+	// Timezone returns the evaluator's timezone
+	Timezone() *time.Location
+
+	// SupportsAstronomical returns whether this evaluator supports astronomical times
+	SupportsAstronomical() bool
+}
+
+// AstroTimeEvaluator evaluates time expressions with full astronomical support
+type AstroTimeEvaluator struct {
 	geo      *geo.Calculator
 	location string
 	timezone string
 	tz       *time.Location
 }
 
-// NewTimeExprEvaluator creates a new evaluator
-func NewTimeExprEvaluator(geoCalc *geo.Calculator, location, timezone string) *TimeExprEvaluator {
+// NewAstroTimeEvaluator creates a new evaluator with astronomical time support
+func NewAstroTimeEvaluator(geoCalc *geo.Calculator, location, timezone string) *AstroTimeEvaluator {
 	tz, err := time.LoadLocation(timezone)
 	if err != nil {
 		tz = time.UTC
 	}
-	return &TimeExprEvaluator{
+	return &AstroTimeEvaluator{
 		geo:      geoCalc,
 		location: location,
 		timezone: timezone,
@@ -235,8 +229,10 @@ func NewTimeExprEvaluator(geoCalc *geo.Calculator, location, timezone string) *T
 	}
 }
 
-// Evaluate evaluates a time expression for a given date
-func (e *TimeExprEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time, bool) {
+func (e *AstroTimeEvaluator) SupportsAstronomical() bool { return true }
+func (e *AstroTimeEvaluator) Timezone() *time.Location   { return e.tz }
+
+func (e *AstroTimeEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time, bool) {
 	var astro *geo.AstroTimes
 
 	if !expr.IsFixed() {
@@ -250,25 +246,15 @@ func (e *TimeExprEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time,
 	return expr.Evaluate(date, astro, e.tz)
 }
 
-// EvaluateForToday evaluates a time expression for today
-func (e *TimeExprEvaluator) EvaluateForToday(expr *TimeExpr) (time.Time, bool) {
-	today := time.Now().In(e.tz)
-	return e.Evaluate(expr, today)
-}
-
-// ComputeNextOccurrence finds the next occurrence of a time expression after the given time
-func (e *TimeExprEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Time) (time.Time, bool) {
-	// Start from today
+func (e *AstroTimeEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Time) (time.Time, bool) {
 	date := after.In(e.tz)
 
-	// Check up to 366 days ahead (handles leap years)
 	for i := 0; i < 366; i++ {
 		checkDate := date.AddDate(0, 0, i)
 		t, ok := e.Evaluate(expr, checkDate)
 		if !ok {
-			continue // Skip days where expression doesn't evaluate (polar)
+			continue
 		}
-
 		if t.After(after) {
 			return t, true
 		}
@@ -277,19 +263,15 @@ func (e *TimeExprEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Tim
 	return time.Time{}, false
 }
 
-// ComputePrevOccurrence finds the previous occurrence of a time expression before the given time
-func (e *TimeExprEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
-	// Start from today
+func (e *AstroTimeEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
 	date := before.In(e.tz)
 
-	// Check up to 366 days back
 	for i := 0; i < 366; i++ {
 		checkDate := date.AddDate(0, 0, -i)
 		t, ok := e.Evaluate(expr, checkDate)
 		if !ok {
 			continue
 		}
-
 		if t.Before(before) {
 			return t, true
 		}
@@ -298,8 +280,71 @@ func (e *TimeExprEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Ti
 	return time.Time{}, false
 }
 
-// Timezone returns the evaluator's timezone
-func (e *TimeExprEvaluator) Timezone() *time.Location {
-	return e.tz
+// FixedTimeEvaluator evaluates only fixed time expressions (no geo required)
+type FixedTimeEvaluator struct {
+	tz *time.Location
 }
 
+// NewFixedTimeEvaluator creates a new evaluator for fixed times only
+func NewFixedTimeEvaluator(timezone string) *FixedTimeEvaluator {
+	tz, err := time.LoadLocation(timezone)
+	if err != nil {
+		tz = time.UTC
+	}
+	return &FixedTimeEvaluator{tz: tz}
+}
+
+func (e *FixedTimeEvaluator) SupportsAstronomical() bool { return false }
+func (e *FixedTimeEvaluator) Timezone() *time.Location   { return e.tz }
+
+func (e *FixedTimeEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time, bool) {
+	if !expr.IsFixed() {
+		// Cannot evaluate astronomical expressions
+		return time.Time{}, false
+	}
+	return expr.Evaluate(date, nil, e.tz)
+}
+
+func (e *FixedTimeEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Time) (time.Time, bool) {
+	if !expr.IsFixed() {
+		return time.Time{}, false
+	}
+
+	date := after.In(e.tz)
+
+	// For fixed times, just check today and tomorrow
+	for i := 0; i < 2; i++ {
+		checkDate := date.AddDate(0, 0, i)
+		t, ok := e.Evaluate(expr, checkDate)
+		if !ok {
+			continue
+		}
+		if t.After(after) {
+			return t, true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func (e *FixedTimeEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
+	if !expr.IsFixed() {
+		return time.Time{}, false
+	}
+
+	date := before.In(e.tz)
+
+	// For fixed times, just check today and yesterday
+	for i := 0; i < 2; i++ {
+		checkDate := date.AddDate(0, 0, -i)
+		t, ok := e.Evaluate(expr, checkDate)
+		if !ok {
+			continue
+		}
+		if t.Before(before) {
+			return t, true
+		}
+	}
+
+	return time.Time{}, false
+}

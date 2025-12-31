@@ -21,7 +21,6 @@ import (
 type LuaService struct {
 	cfg     *config.Config
 	Runtime *lua.Runtime
-	invoker *actions.Invoker
 }
 
 // NewLuaService creates a new LuaService.
@@ -41,7 +40,6 @@ func NewLuaService(
 	return &LuaService{
 		cfg:     cfg,
 		Runtime: runtime,
-		invoker: invoker,
 	}, nil
 }
 
@@ -68,14 +66,6 @@ func (s *LuaService) GetSSEModule() *sse.Module {
 // GetWebhookModule returns the webhook module for handler registration.
 func (s *LuaService) GetWebhookModule() *webhook.Module {
 	return s.Runtime.GetWebhookModule()
-}
-
-// InvokeThroughLua invokes an action through the Lua worker for thread safety.
-// This is used by the scheduler to ensure Lua actions run in the Lua worker goroutine.
-func (s *LuaService) InvokeThroughLua(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error {
-	return s.Runtime.DoSyncWithResult(ctx, func(workCtx context.Context) error {
-		return s.invoker.InvokeWithSource(workCtx, actionName, args, idempotencyKey, source, defID)
-	})
 }
 
 // Do queues work to be executed on the Lua VM.

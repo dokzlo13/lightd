@@ -30,45 +30,9 @@ func Open(dbPath string) (*DB, error) {
 
 // initSchema creates all required tables
 func initSchema(db *sql.DB) error {
-	// Schedule definitions - stable rules that survive restarts
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS schedule_definitions (
-			id TEXT PRIMARY KEY,
-			time_expr TEXT NOT NULL,
-			action_name TEXT NOT NULL,
-			action_args TEXT,
-			tag TEXT,
-			misfire_policy TEXT DEFAULT 'run_latest',
-			enabled INTEGER DEFAULT 1,
-			created_at INTEGER NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_schedule_definitions_tag ON schedule_definitions(tag);
-		CREATE INDEX IF NOT EXISTS idx_schedule_definitions_enabled ON schedule_definitions(enabled);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create schedule_definitions table: %w", err)
-	}
-
-	// Schedule occurrences - computed cache of upcoming occurrences
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS schedule_occurrences (
-			def_id TEXT NOT NULL,
-			occurrence_id TEXT NOT NULL,
-			run_at INTEGER NOT NULL,
-			is_next INTEGER DEFAULT 0,
-			PRIMARY KEY (def_id, occurrence_id),
-			FOREIGN KEY (def_id) REFERENCES schedule_definitions(id) ON DELETE CASCADE
-		);
-		CREATE INDEX IF NOT EXISTS idx_occurrences_run_at ON schedule_occurrences(run_at);
-		CREATE INDEX IF NOT EXISTS idx_occurrences_is_next ON schedule_occurrences(is_next);
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to create schedule_occurrences table: %w", err)
-	}
-
 	// Event ledger - append-only history for dedupe and auditing
 	// NO unique constraint - we log multiple events per occurrence (started, completed, failed)
-	_, err = db.Exec(`
+	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS event_ledger (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			event_type TEXT NOT NULL,

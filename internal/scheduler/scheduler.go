@@ -9,7 +9,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/actions"
+	"github.com/dokzlo13/lightd/internal/eventbus"
 	"github.com/dokzlo13/lightd/internal/geo"
 	"github.com/dokzlo13/lightd/internal/ledger"
 )
@@ -22,35 +22,23 @@ const (
 	StrategyPrev Strategy = "PREV"
 )
 
-// LuaInvokeFunc is a callback for invoking actions through the Lua worker
-// This ensures Lua actions are executed in the single Lua worker goroutine
-type LuaInvokeFunc func(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error
-
-// Scheduler manages schedule definitions and occurrence execution
+// Scheduler manages schedule definitions and occurrence execution.
+// Schedules are stored in memory and events are emitted to the EventBus.
 type Scheduler struct {
-	defStore  *DefinitionStore
-	occStore  *OccurrenceStore
-	invoker   *actions.Invoker
+	mu        sync.RWMutex
+	schedules map[string]Schedule
+
+	bus       *eventbus.Bus
 	ledger    *ledger.Ledger
-	evaluator *TimeExprEvaluator
-	geo       *geo.Calculator
-	location  string
-	timezone  string
+	evaluator TimeEvaluator
 	tz        *time.Location
 
-	mu         sync.RWMutex
 	reschedule chan struct{}
-
-	// luaInvoke routes action invocations through the Lua worker for thread safety
-	// If nil, falls back to direct invoker calls (unsafe for Lua actions)
-	luaInvoke LuaInvokeFunc
 }
 
-// New creates a new scheduler
+// New creates a new scheduler with full astronomical time support
 func New(
-	defStore *DefinitionStore,
-	occStore *OccurrenceStore,
-	invoker *actions.Invoker,
+	bus *eventbus.Bus,
 	l *ledger.Ledger,
 	geoCalc *geo.Calculator,
 	location, timezone string,
@@ -62,52 +50,74 @@ func New(
 	}
 
 	return &Scheduler{
-		defStore:   defStore,
-		occStore:   occStore,
-		invoker:    invoker,
+		schedules:  make(map[string]Schedule),
+		bus:        bus,
 		ledger:     l,
-		evaluator:  NewTimeExprEvaluator(geoCalc, location, timezone),
-		geo:        geoCalc,
-		location:   location,
-		timezone:   timezone,
+		evaluator:  NewAstroTimeEvaluator(geoCalc, location, timezone),
 		tz:         tz,
 		reschedule: make(chan struct{}, 1),
 	}
 }
 
-// Define registers a schedule definition
-func (s *Scheduler) Define(id, timeExpr, actionName string, args map[string]any, tag string, misfirePolicy MisfirePolicy) error {
-	// Validate time expression
-	if _, err := ParseTimeExpr(timeExpr); err != nil {
-		return fmt.Errorf("invalid time expression: %w", err)
+// NewWithFixedTimeOnly creates a scheduler that only supports fixed times (no geo)
+func NewWithFixedTimeOnly(
+	bus *eventbus.Bus,
+	l *ledger.Ledger,
+	timezone string,
+) *Scheduler {
+	tz, err := time.LoadLocation(timezone)
+	if err != nil {
+		log.Warn().Err(err).Str("timezone", timezone).Msg("Failed to load timezone, using UTC")
+		tz = time.UTC
 	}
 
-	def := &Definition{
-		ID:            id,
-		TimeExpr:      timeExpr,
-		ActionName:    actionName,
-		ActionArgs:    args,
-		Tag:           tag,
-		MisfirePolicy: misfirePolicy,
-		Enabled:       true,
-		CreatedAt:     time.Now().UTC(),
+	return &Scheduler{
+		schedules:  make(map[string]Schedule),
+		bus:        bus,
+		ledger:     l,
+		evaluator:  NewFixedTimeEvaluator(timezone),
+		tz:         tz,
+		reschedule: make(chan struct{}, 1),
 	}
+}
 
-	if err := s.defStore.Upsert(def); err != nil {
-		return fmt.Errorf("failed to save definition: %w", err)
-	}
+// Register adds a schedule
+func (s *Scheduler) Register(sched Schedule) {
+	s.mu.Lock()
+	s.schedules[sched.ID()] = sched
+	s.mu.Unlock()
 
 	log.Debug().
-		Str("id", id).
-		Str("time_expr", timeExpr).
-		Str("action", actionName).
-		Str("tag", tag).
-		Msg("Schedule definition registered")
+		Str("id", sched.ID()).
+		Str("tag", sched.Tag()).
+		Str("action", sched.ActionName()).
+		Msg("Schedule registered")
 
-	// Recompute occurrences
 	s.notifyReschedule()
+}
 
+// Unregister removes a schedule
+func (s *Scheduler) Unregister(id string) {
+	s.mu.Lock()
+	delete(s.schedules, id)
+	s.mu.Unlock()
+	s.notifyReschedule()
+}
+
+// Define creates and registers a daily schedule (convenience method for Lua)
+func (s *Scheduler) Define(id, timeExpr, actionName string, args map[string]any, tag string, misfirePolicy MisfirePolicy) error {
+	sched, err := NewDailySchedule(id, timeExpr, actionName, args, tag, misfirePolicy, s.evaluator)
+	if err != nil {
+		return err
+	}
+	s.Register(sched)
 	return nil
+}
+
+// DefinePeriodic creates and registers a periodic schedule (convenience method for Lua)
+func (s *Scheduler) DefinePeriodic(id string, interval time.Duration, actionName string, args map[string]any, tag string) {
+	sched := NewPeriodicSchedule(id, interval, actionName, args, tag)
+	s.Register(sched)
 }
 
 // notifyReschedule signals the scheduler to recalculate
@@ -118,290 +128,22 @@ func (s *Scheduler) notifyReschedule() {
 	}
 }
 
-// SetLuaInvoker sets the callback for invoking actions through the Lua worker
-// This MUST be called before Run() to ensure thread-safe Lua action execution
-func (s *Scheduler) SetLuaInvoker(fn LuaInvokeFunc) {
-	s.luaInvoke = fn
-}
-
-// ComputeOccurrences computes the next occurrence for all enabled definitions
-func (s *Scheduler) ComputeOccurrences() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	defs, err := s.defStore.GetAllEnabled()
-	if err != nil {
-		return fmt.Errorf("failed to get definitions: %w", err)
-	}
-
-	now := time.Now()
-
-	for _, def := range defs {
-		// Clear existing occurrences for this definition
-		if err := s.occStore.Clear(def.ID); err != nil {
-			log.Error().Err(err).Str("def_id", def.ID).Msg("Failed to clear occurrences")
-			continue
-		}
-
-		expr, err := def.ParsedTimeExpr()
-		if err != nil {
-			log.Error().Err(err).Str("def_id", def.ID).Msg("Failed to parse time expression")
-			continue
-		}
-
-		// Find next occurrence
-		nextTime, ok := s.evaluator.ComputeNextOccurrence(expr, now)
-		if !ok {
-			log.Warn().Str("def_id", def.ID).Msg("No next occurrence found")
-			continue
-		}
-
-		occ := &Occurrence{
-			DefID:        def.ID,
-			OccurrenceID: OccurrenceID(def.ID, nextTime),
-			RunAt:        nextTime,
-			IsNext:       true,
-		}
-
-		if err := s.occStore.Insert(occ); err != nil {
-			log.Error().Err(err).Str("def_id", def.ID).Msg("Failed to insert occurrence")
-		}
-	}
-
-	return nil
-}
-
-// HandleMisfires processes missed occurrences on startup
-func (s *Scheduler) HandleMisfires(ctx context.Context) error {
-	defs, err := s.defStore.GetAllEnabled()
-	if err != nil {
-		return fmt.Errorf("failed to get definitions: %w", err)
-	}
-
-	now := time.Now()
-
-	for _, def := range defs {
-		// Get last completed time for this specific definition
-		lastCompleted, hasLast := s.ledger.GetLastCompletedForDef(def.ID)
-
-		expr, err := def.ParsedTimeExpr()
-		if err != nil {
-			continue
-		}
-
-		// Compute missed occurrences since last completed
-		missed := s.computeMissedOccurrences(def, expr, lastCompleted, hasLast, now)
-		if len(missed) == 0 {
-			continue
-		}
-
-		log.Info().
-			Str("def_id", def.ID).
-			Int("missed_count", len(missed)).
-			Str("policy", string(def.MisfirePolicy)).
-			Msg("Processing missed occurrences")
-
-		switch def.MisfirePolicy {
-		case MisfirePolicySkip:
-			// Do nothing
-
-		case MisfirePolicyRunLatest:
-			// Run only the most recent missed occurrence
-			latest := missed[len(missed)-1]
-			occID := OccurrenceID(def.ID, latest)
-			if !s.ledger.HasCompleted(occID) {
-				s.invokeScheduled(ctx, def, latest, occID)
-			}
-
-		case MisfirePolicyRunAll:
-			// Run all missed in order
-			for _, t := range missed {
-				occID := OccurrenceID(def.ID, t)
-				if !s.ledger.HasCompleted(occID) {
-					s.invokeScheduled(ctx, def, t, occID)
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *Scheduler) computeMissedOccurrences(def *Definition, expr *TimeExpr, lastCompleted time.Time, hasLast bool, now time.Time) []time.Time {
-	var missed []time.Time
-
-	// If no last completed, don't try to compute missed (fresh start)
-	if !hasLast {
-		return nil
-	}
-
-	// Walk from last completed to now
-	current := lastCompleted
-	for i := 0; i < 366; i++ { // Safety limit
-		nextTime, ok := s.evaluator.ComputeNextOccurrence(expr, current)
-		if !ok {
-			break
-		}
-
-		if nextTime.After(now) {
-			break
-		}
-
-		missed = append(missed, nextTime)
-		current = nextTime
-	}
-
-	return missed
-}
-
-// invokeScheduled invokes a scheduled action with occurrence tracking
-// Uses luaInvoke if set to ensure Lua actions run in the Lua worker goroutine
-func (s *Scheduler) invokeScheduled(ctx context.Context, def *Definition, runAt time.Time, occurrenceID string) {
-	log.Info().
-		Str("def_id", def.ID).
-		Str("action", def.ActionName).
-		Time("run_at", runAt).
-		Str("occurrence_id", occurrenceID).
-		Msg("Invoking scheduled action")
-
-	var err error
-	if s.luaInvoke != nil {
-		// Route through Lua worker for thread-safe execution
-		err = s.luaInvoke(ctx, def.ActionName, def.ActionArgs, occurrenceID, "scheduler", def.ID)
-	} else {
-		// Direct invocation (only safe for non-Lua actions)
-		err = s.invoker.InvokeWithSource(ctx, def.ActionName, def.ActionArgs, occurrenceID, "scheduler", def.ID)
-	}
-
-	if err != nil {
-		log.Error().Err(err).
-			Str("def_id", def.ID).
-			Str("occurrence_id", occurrenceID).
-			Msg("Failed to invoke scheduled action")
-	}
-}
-
-// RunClosest finds and executes the closest definition matching criteria
-// Uses NO idempotency key for manual/programmatic calls (always runs)
-func (s *Scheduler) RunClosest(ctx context.Context, tags []string, strategy Strategy) error {
-	defs, err := s.getDefinitionsByTags(tags)
-	if err != nil {
-		return err
-	}
-
-	if len(defs) == 0 {
-		log.Warn().Strs("tags", tags).Msg("No definitions found with specified tags")
-		return nil
-	}
-
-	now := time.Now()
-	var closestDef *Definition
-	var closestTime time.Time
-
-	for _, def := range defs {
-		expr, err := def.ParsedTimeExpr()
-		if err != nil {
-			continue
-		}
-
-		var t time.Time
-		var ok bool
-
-		switch strategy {
-		case StrategyNext:
-			t, ok = s.evaluator.ComputeNextOccurrence(expr, now)
-		case StrategyPrev:
-			t, ok = s.evaluator.ComputePrevOccurrence(expr, now)
-		default:
-			t, ok = s.evaluator.ComputeNextOccurrence(expr, now)
-		}
-
-		if !ok {
-			continue
-		}
-
-		isCloser := closestDef == nil
-		if !isCloser {
-			switch strategy {
-			case StrategyNext:
-				isCloser = t.Before(closestTime)
-			case StrategyPrev:
-				isCloser = t.After(closestTime)
-			}
-		}
-
-		if isCloser {
-			closestDef = def
-			closestTime = t
-		}
-	}
-
-	if closestDef == nil {
-		log.Warn().
-			Strs("tags", tags).
-			Str("strategy", string(strategy)).
-			Msg("No matching definition found")
-		return nil
-	}
-
-	log.Info().
-		Str("def_id", closestDef.ID).
-		Str("action", closestDef.ActionName).
-		Time("time", closestTime).
-		Str("strategy", string(strategy)).
-		Msg("Executing closest definition")
-
-	// Use empty idempotency key for manual calls (always run, no dedupe)
-	return s.invoker.Invoke(ctx, closestDef.ActionName, closestDef.ActionArgs, "")
-}
-
-func (s *Scheduler) getDefinitionsByTags(tags []string) ([]*Definition, error) {
-	if len(tags) == 0 {
-		return s.defStore.GetAllEnabled()
-	}
-
-	var allDefs []*Definition
-	seen := make(map[string]bool)
-
-	for _, tag := range tags {
-		defs, err := s.defStore.GetByTag(tag)
-		if err != nil {
-			return nil, err
-		}
-		for _, def := range defs {
-			if !seen[def.ID] {
-				seen[def.ID] = true
-				allDefs = append(allDefs, def)
-			}
-		}
-	}
-
-	return allDefs, nil
-}
-
 // Run starts the scheduler loop
 func (s *Scheduler) Run(ctx context.Context) error {
-	// Initial occurrence computation
-	if err := s.ComputeOccurrences(); err != nil {
-		log.Error().Err(err).Msg("Failed to compute initial occurrences")
-	}
-
-	// Handle misfires on startup
-	if err := s.HandleMisfires(ctx); err != nil {
-		log.Error().Err(err).Msg("Failed to handle misfires")
-	}
-
 	log.Info().Msg("Scheduler started")
 
 	for {
-		nextWakeup := s.nextWakeupTime()
-		sleepDuration := time.Until(nextWakeup)
-		if sleepDuration < 0 {
-			sleepDuration = 0
+		occ, sched := s.nextOccurrence(time.Now())
+
+		sleepDuration := time.Hour // default if no schedules
+		if occ != nil {
+			sleepDuration = time.Until(occ.Time)
+			if sleepDuration < 0 {
+				sleepDuration = 0
+			}
 		}
 
 		log.Debug().
-			Time("next_wakeup", nextWakeup).
 			Dur("sleep_duration", sleepDuration).
 			Msg("Scheduler sleeping")
 
@@ -416,115 +158,321 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-s.reschedule:
 			timer.Stop()
 			log.Debug().Msg("Schedule changed, recomputing")
-			if err := s.ComputeOccurrences(); err != nil {
-				log.Error().Err(err).Msg("Failed to recompute occurrences")
-			}
 			continue
 
 		case <-timer.C:
-			s.executeReadyOccurrences(ctx)
+			if occ != nil && sched != nil {
+				s.emit(sched, occ, "scheduler")
+			}
 		}
 	}
 }
 
-func (s *Scheduler) nextWakeupTime() time.Time {
+// RunBootRecovery runs the most recent previous occurrence for schedules,
+// grouped by tag. For schedules with the same tag, only the one with the
+// most recent previous occurrence is executed (since later schedules supersede earlier ones).
+// Schedules without a tag are grouped individually.
+func (s *Scheduler) RunBootRecovery() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	now := time.Now()
 
-	occ, err := s.occStore.GetNext()
-	if err != nil || occ == nil {
-		return now.Add(time.Hour) // Default wakeup
+	// Group schedules by tag (or by ID if no tag)
+	// For each group, find the schedule with the most recent previous occurrence
+	type candidate struct {
+		sched Schedule
+		prev  *Occurrence
 	}
+	winners := make(map[string]candidate)
 
-	if occ.RunAt.Before(now) {
-		return now
-	}
-
-	return occ.RunAt
-}
-
-func (s *Scheduler) executeReadyOccurrences(ctx context.Context) {
-	now := time.Now()
-
-	occs, err := s.occStore.GetPending(now)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to get pending occurrences")
-		return
-	}
-
-	for _, occ := range occs {
-		def, err := s.defStore.Get(occ.DefID)
-		if err != nil || def == nil {
-			log.Error().Err(err).Str("def_id", occ.DefID).Msg("Definition not found")
-			s.occStore.MarkProcessed(occ.OccurrenceID)
+	for _, sched := range s.schedules {
+		if sched.MisfirePolicy() == MisfirePolicySkip {
 			continue
 		}
 
-		s.invokeScheduled(ctx, def, occ.RunAt, occ.OccurrenceID)
-		s.occStore.MarkProcessed(occ.OccurrenceID)
+		prev := sched.Prev(now)
+		if prev == nil {
+			continue
+		}
 
-		// Compute next occurrence for this definition
-		s.computeNextForDef(def)
+		// Group key: use tag if present, otherwise use schedule ID (each untagged schedule is its own group)
+		groupKey := sched.Tag()
+		if groupKey == "" {
+			groupKey = "__untagged:" + sched.ID()
+		}
+
+		existing, exists := winners[groupKey]
+		if !exists || prev.Time.After(existing.prev.Time) {
+			winners[groupKey] = candidate{sched: sched, prev: prev}
+		}
+	}
+
+	// Emit events for the winning schedules only
+	for groupKey, winner := range winners {
+		log.Info().
+			Str("schedule", winner.sched.ID()).
+			Str("group", groupKey).
+			Time("prev_time", winner.prev.Time).
+			Msg("Boot recovery: running most recent occurrence for group")
+
+		// Use a boot-specific occurrence ID to avoid dedupe conflicts
+		bootOcc := NewOccurrenceWithSuffix(winner.sched.ID(), now, "boot")
+		s.emitDirect(winner.sched, bootOcc, "boot_recovery")
 	}
 }
 
-func (s *Scheduler) computeNextForDef(def *Definition) {
-	expr, err := def.ParsedTimeExpr()
-	if err != nil {
-		return
+// nextOccurrence finds the earliest next occurrence across all schedules
+func (s *Scheduler) nextOccurrence(after time.Time) (*Occurrence, Schedule) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var earliest *Occurrence
+	var source Schedule
+
+	for _, sched := range s.schedules {
+		if occ := sched.Next(after); occ != nil {
+			if earliest == nil || occ.Time.Before(earliest.Time) {
+				earliest = occ
+				source = sched
+			}
+		}
 	}
 
-	nextTime, ok := s.evaluator.ComputeNextOccurrence(expr, time.Now())
-	if !ok {
-		return
-	}
-
-	occ := &Occurrence{
-		DefID:        def.ID,
-		OccurrenceID: OccurrenceID(def.ID, nextTime),
-		RunAt:        nextTime,
-		IsNext:       true,
-	}
-
-	if err := s.occStore.Insert(occ); err != nil {
-		log.Error().Err(err).Str("def_id", def.ID).Msg("Failed to insert next occurrence")
-	}
+	return earliest, source
 }
 
-// FormatSchedule returns a human-readable schedule
-func (s *Scheduler) FormatSchedule() string {
-	defs, err := s.defStore.GetAllEnabled()
-	if err != nil {
-		return fmt.Sprintf("Error: %v", err)
+// emit publishes a schedule event to the bus with deduplication check
+func (s *Scheduler) emit(sched Schedule, occ *Occurrence, source string) {
+	// Deduplication check
+	if s.ledger.HasCompleted(occ.ID) {
+		log.Debug().Str("occurrence", occ.ID).Msg("Already completed, skipping")
+		return
 	}
 
-	if len(defs) == 0 {
+	s.emitDirect(sched, occ, source)
+}
+
+// emitDirect publishes a schedule event without deduplication (for boot recovery)
+func (s *Scheduler) emitDirect(sched Schedule, occ *Occurrence, source string) {
+	log.Info().
+		Str("schedule_id", sched.ID()).
+		Str("occurrence_id", occ.ID).
+		Str("action", sched.ActionName()).
+		Time("time", occ.Time).
+		Str("source", source).
+		Msg("Emitting schedule event")
+
+	s.bus.Publish(eventbus.Event{
+		Type: eventbus.EventTypeSchedule,
+		Data: map[string]interface{}{
+			"schedule_id":   sched.ID(),
+			"occurrence_id": occ.ID,
+			"action_name":   sched.ActionName(),
+			"action_args":   sched.ActionArgs(),
+			"run_at":        occ.Time,
+			"source":        source,
+		},
+	})
+}
+
+// RunClosest finds and executes the closest schedule matching criteria.
+// Emits an event (no idempotency key for manual triggers).
+func (s *Scheduler) RunClosest(tags []string, strategy Strategy) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	var closest *Occurrence
+	var closestSched Schedule
+
+	for _, sched := range s.schedules {
+		// Filter by tag
+		if len(tags) > 0 && !containsTag(tags, sched.Tag()) {
+			continue
+		}
+
+		var occ *Occurrence
+		switch strategy {
+		case StrategyNext:
+			occ = sched.Next(now)
+		case StrategyPrev:
+			occ = sched.Prev(now)
+		default:
+			occ = sched.Next(now)
+		}
+
+		if occ == nil {
+			continue
+		}
+
+		isCloser := closest == nil
+		if !isCloser {
+			switch strategy {
+			case StrategyNext:
+				isCloser = occ.Time.Before(closest.Time)
+			case StrategyPrev:
+				isCloser = occ.Time.After(closest.Time)
+			}
+		}
+
+		if isCloser {
+			closest = occ
+			closestSched = sched
+		}
+	}
+
+	if closestSched == nil {
+		log.Warn().
+			Strs("tags", tags).
+			Str("strategy", string(strategy)).
+			Msg("No matching schedule found")
+		return
+	}
+
+	log.Info().
+		Str("schedule_id", closestSched.ID()).
+		Str("action", closestSched.ActionName()).
+		Time("time", closest.Time).
+		Str("strategy", string(strategy)).
+		Msg("Executing closest schedule")
+
+	// Use empty occurrence ID for manual triggers (no dedupe)
+	manualOcc := &Occurrence{
+		ID:         "", // No dedupe
+		ScheduleID: closestSched.ID(),
+		Time:       now,
+	}
+	s.emitDirect(closestSched, manualOcc, "run_closest")
+}
+
+func containsTag(tags []string, tag string) bool {
+	for _, t := range tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// ScheduleEntry represents a single occurrence for display
+type ScheduleEntry struct {
+	ID         string
+	TypeExpr   string
+	Time       time.Time
+	ActionName string
+	Tag        string
+	IsPast     bool
+}
+
+// FormatScheduleForDay returns a human-readable schedule for a specific day.
+func (s *Scheduler) FormatScheduleForDay(day time.Time) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.schedules) == 0 {
 		return "No scheduled definitions"
 	}
 
-	now := time.Now()
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%-20s %-20s %-25s %-20s %s\n", "ID", "TIME EXPR", "NEXT RUN", "ACTION", "TAG"))
-	sb.WriteString(strings.Repeat("-", 110) + "\n")
+	now := time.Now().In(s.tz)
+	dayInTz := day.In(s.tz)
 
-	for _, def := range defs {
-		expr, _ := def.ParsedTimeExpr()
-		nextTime, ok := s.evaluator.ComputeNextOccurrence(expr, now)
+	// Calculate day boundaries
+	startOfDay := time.Date(dayInTz.Year(), dayInTz.Month(), dayInTz.Day(), 0, 0, 0, 0, s.tz)
+	endOfDay := startOfDay.Add(24 * time.Hour)
 
-		nextRunStr := "-"
-		if ok {
-			nextRunStr = nextTime.In(s.tz).Format("2006-01-02 15:04:05")
-		}
+	// Collect all occurrences for the day
+	var entries []ScheduleEntry
 
-		tag := def.Tag
+	for _, sched := range s.schedules {
+		typeExpr := s.getTypeExpr(sched)
+		tag := sched.Tag()
 		if tag == "" {
 			tag = "-"
 		}
 
-		sb.WriteString(fmt.Sprintf("%-20s %-20s %-25s %-20s %s\n",
-			def.ID, def.TimeExpr, nextRunStr, def.ActionName, tag))
+		// For daily schedules, get today's occurrence
+		if daily, ok := sched.(*DailySchedule); ok {
+			occ := daily.Next(startOfDay.Add(-1 * time.Second))
+			if occ != nil && occ.Time.Before(endOfDay) {
+				entries = append(entries, ScheduleEntry{
+					ID:         sched.ID(),
+					TypeExpr:   typeExpr,
+					Time:       occ.Time,
+					ActionName: sched.ActionName(),
+					Tag:        tag,
+					IsPast:     occ.Time.Before(now),
+				})
+			}
+		} else if periodic, ok := sched.(*PeriodicSchedule); ok {
+			// For periodic schedules, collect ALL occurrences for today
+			cursor := startOfDay.Add(-1 * time.Second)
+			for {
+				occ := periodic.Next(cursor)
+				if occ == nil || !occ.Time.Before(endOfDay) {
+					break
+				}
+				entries = append(entries, ScheduleEntry{
+					ID:         sched.ID(),
+					TypeExpr:   typeExpr,
+					Time:       occ.Time,
+					ActionName: sched.ActionName(),
+					Tag:        tag,
+					IsPast:     occ.Time.Before(now),
+				})
+				cursor = occ.Time
+			}
+		}
+	}
+
+	// Sort by time
+	sortScheduleEntries(entries)
+
+	// Format output
+	var sb strings.Builder
+	dateStr := dayInTz.Format("2006-01-02")
+	sb.WriteString(fmt.Sprintf("Schedule for %s (timezone: %s)\n", dateStr, s.tz.String()))
+	sb.WriteString(fmt.Sprintf("%-3s %-20s %-20s %-12s %-20s %s\n", "", "ID", "TYPE/EXPR", "TIME", "ACTION", "TAG"))
+	sb.WriteString(strings.Repeat("-", 100) + "\n")
+
+	for _, entry := range entries {
+		status := " "
+		if entry.IsPast {
+			status = "✓"
+		}
+
+		timeStr := entry.Time.In(s.tz).Format("15:04:05")
+
+		sb.WriteString(fmt.Sprintf("%-3s %-20s %-20s %-12s %-20s %s\n",
+			status, entry.ID, entry.TypeExpr, timeStr, entry.ActionName, entry.Tag))
+	}
+
+	if len(entries) == 0 {
+		sb.WriteString("No occurrences for this day\n")
 	}
 
 	return sb.String()
+}
+
+func (s *Scheduler) getTypeExpr(sched Schedule) string {
+	switch v := sched.(type) {
+	case *DailySchedule:
+		return v.TimeExprString()
+	case *PeriodicSchedule:
+		return fmt.Sprintf("every %s", v.Interval())
+	default:
+		return "unknown"
+	}
+}
+
+func sortScheduleEntries(entries []ScheduleEntry) {
+	for i := 0; i < len(entries)-1; i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if entries[j].Time.Before(entries[i].Time) {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
 }
 
 // Timezone returns the scheduler's timezone
@@ -532,21 +480,19 @@ func (s *Scheduler) Timezone() *time.Location {
 	return s.tz
 }
 
-// Disable disables a definition
+// Evaluator returns the time expression evaluator (for creating schedules externally)
+func (s *Scheduler) Evaluator() TimeEvaluator {
+	return s.evaluator
+}
+
+// Disable removes a schedule by ID
 func (s *Scheduler) Disable(id string) error {
-	if err := s.defStore.SetEnabled(id, false); err != nil {
-		return err
-	}
-	s.occStore.Clear(id)
-	s.notifyReschedule()
+	s.Unregister(id)
 	return nil
 }
 
-// Enable enables a definition
+// Enable is a no-op for in-memory schedules (schedule must be re-registered)
 func (s *Scheduler) Enable(id string) error {
-	if err := s.defStore.SetEnabled(id, true); err != nil {
-		return err
-	}
-	s.notifyReschedule()
+	log.Warn().Str("id", id).Msg("Enable called on in-memory scheduler - schedule must be re-registered via Lua")
 	return nil
 }
