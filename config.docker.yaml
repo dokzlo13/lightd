@@ -1,0 +1,69 @@
+# Docker-optimized configuration
+# All values can be overridden via environment
+# Variables using ${VAR:default} syntax
+#
+# Directory structure:
+#   /app/data   - SQLite database (mount as volume for persistence)
+#   /app/config - config.yaml and lua scripts (mount to customize)
+
+hue:
+  bridge: "${HUE_BRIDGE}"
+  token: "${HUE_TOKEN}"
+  timeout: "${HUE_TIMEOUT:30s}"
+
+database:
+  path: "${DATABASE_PATH:/app/data/lightd.sqlite}"
+
+log:
+  level: "${LOG_LEVEL:info}"
+  colors: ${LOG_COLORS:false}
+
+reconciler:
+  enabled: ${RECONCILER_ENABLED:true}
+  periodic_interval: "${RECONCILER_INTERVAL:5m}"
+  rate_limit_rps: ${RECONCILER_RATE_LIMIT:10.0}
+
+ledger:
+  enabled: ${LEDGER_ENABLED:true}
+  retention_period: "${LEDGER_RETENTION_PERIOD:72h}"
+  retention_interval: "${LEDGER_RETENTION_INTERVAL:24h}"
+
+healthcheck:  # healthcheck is enabled by default and used for docker health check
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+
+eventbus:
+  workers: ${EVENTBUS_WORKERS:4}
+  queue_size: ${EVENTBUS_QUEUE_SIZE:100}
+
+shutdown_timeout: "${SHUTDOWN_TIMEOUT:5s}"
+
+events:
+  webhook:
+    enabled: ${WEBHOOK_ENABLED:true}
+    # webhook port is pinned to 8080 for docker
+    host: "0.0.0.0"
+    port: 8080
+
+  sse:
+    enabled: ${SSE_ENABLED:true}
+    min_retry_backoff: "${SSE_MIN_RETRY_BACKOFF:1s}"
+    max_retry_backoff: "${SSE_MAX_RETRY_BACKOFF:2m}"
+    retry_multiplier: ${SSE_RETRY_MULTIPLIER:2.0}
+    max_reconnects: ${SSE_MAX_RECONNECTS:0}
+
+  scheduler:
+    enabled: ${SCHEDULER_ENABLED:true}
+    geo:
+      enabled: ${GEO_ENABLED:false}
+      use_cache: ${GEO_USE_CACHE:true}
+      name: "${GEO_LOCATION}"
+      timezone: "${TZ}"
+      http_timeout: "${GEO_HTTP_TIMEOUT:10s}"
+      lat: ${GEO_LAT}
+      lon: ${GEO_LON}
+
+# Path to Lua script - mount your scripts to /app/config/
+script: "${SCRIPT_PATH:/app/config/lightd.lua}"
+

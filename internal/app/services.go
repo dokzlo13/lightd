@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"time"
 
 	"github.com/rs/zerolog/log"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/db"
 	"github.com/dokzlo13/lightd/internal/events/schedule"
 	"github.com/dokzlo13/lightd/internal/geo"
+	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/ledger"
 	"github.com/dokzlo13/lightd/internal/state"
 )
@@ -26,6 +28,9 @@ type Services struct {
 	// State store (generic JSON store)
 	Store   *state.Store
 	GeoCalc *geo.Calculator
+
+	// KV storage
+	KV *kv.Manager
 
 	// Action system
 	Registry *actions.Registry
@@ -100,8 +105,11 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	// Initialize scheduler service (now uses EventBus instead of direct invocation)
 	s.Scheduler = NewSchedulerService(cfg, s.Hue.Bus, s.Ledger, s.GeoCalc)
 
+	// Initialize KV manager
+	s.KV = kv.NewManager(database.DB)
+
 	// Initialize Lua service
-	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.SceneIndex, s.Hue.Stores, s.Hue.Orchestrator, s.GeoCalc)
+	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.SceneIndex, s.Hue.Stores, s.Hue.Orchestrator, s.GeoCalc, s.KV)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -153,6 +161,9 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	s.Health.Start(ctx)
 	s.Webhook.Start(ctx)
 
+	// Start KV cleanup goroutine (cleans expired entries every 5 minutes)
+	s.KV.StartCleanup(ctx, 5*time.Minute)
+
 	return nil
 }
 
@@ -169,6 +180,9 @@ func (s *Services) Stop() error {
 
 // Close releases all resources.
 func (s *Services) Close() {
+	if s.KV != nil {
+		s.KV.StopCleanup()
+	}
 	if s.Lua != nil {
 		s.Lua.Close()
 	}

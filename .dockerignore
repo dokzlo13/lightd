@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# IDE and editors
+.idea
+.cursor
+.vscode
+*.swp
+*.swo
+*~
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker
+
+# Documentation
+*.md
+!README.md
+
+# Local config (not needed in build, use volume mounts)
+*.yaml
+!config.docker.yaml
+
+# Lua scripts (users mount their own)
+*.lua
+
+# Database files (should be mounted as volume)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+~*.sqlite
+
+# Build artifacts
+bin/
+dist/
+
+# Test files
+*_test.go
+testdata/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
+

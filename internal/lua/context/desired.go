@@ -11,14 +11,7 @@ import (
 
 // DesiredModule provides ctx.desired for accessing/modifying desired state.
 //
-// Supports two API styles:
-//
-// Legacy direct methods:
-//
-//	ctx.desired:set_bank("1", "Bright")
-//	ctx.desired:set_power("1", true)
-//
-// New chainable builder API:
+// Chainable builder API:
 //
 //	ctx.desired:group("1"):on():set_scene("Relax")
 //	ctx.desired:light("5"):on():set_bri(254)
@@ -58,15 +51,9 @@ func (m *DesiredModule) Install(L *lua.LState, ctx *lua.LTable) {
 
 	desired := L.NewTable()
 
-	// New chainable builder factories
+	// Chainable builder factories
 	L.SetField(desired, "group", L.NewFunction(m.getGroupBuilder()))
 	L.SetField(desired, "light", L.NewFunction(m.getLightBuilder()))
-
-	// Legacy methods (kept for backward compatibility)
-	L.SetField(desired, "set_bank", L.NewFunction(m.setBank()))
-	L.SetField(desired, "set_power", L.NewFunction(m.setPower()))
-	L.SetField(desired, "get_bank", L.NewFunction(m.getBank()))
-	L.SetField(desired, "has_bank", L.NewFunction(m.hasBank()))
 
 	L.SetField(ctx, m.Name(), desired)
 }
@@ -184,87 +171,6 @@ func (m *DesiredModule) getLightBuilder() lua.LGFunction {
 		lightID := L.CheckString(2)
 
 		pushLightBuilder(L, lightID, m)
-		return 1
-	}
-}
-
-// setBank returns a Lua function that sets the bank (scene) for a group.
-func (m *DesiredModule) setBank() lua.LGFunction {
-	return func(L *lua.LState) int {
-		L.CheckTable(1) // self
-		groupID := L.CheckString(2)
-		sceneName := L.CheckString(3)
-
-		err := m.groupStore.Update(groupID, func(current group.Desired) group.Desired {
-			current.SceneName = sceneName
-			return current
-		})
-		if err != nil {
-			log.Error().Err(err).
-				Str("group", groupID).
-				Str("scene", sceneName).
-				Msg("Failed to set bank in desired state")
-		}
-		return 0
-	}
-}
-
-// setPower returns a Lua function that sets the power state for a group.
-func (m *DesiredModule) setPower() lua.LGFunction {
-	return func(L *lua.LState) int {
-		L.CheckTable(1) // self
-		groupID := L.CheckString(2)
-		on := L.CheckBool(3)
-
-		err := m.groupStore.Update(groupID, func(current group.Desired) group.Desired {
-			current.Power = &on
-			return current
-		})
-		if err != nil {
-			log.Error().Err(err).
-				Str("group", groupID).
-				Bool("on", on).
-				Msg("Failed to set power in desired state")
-		}
-		return 0
-	}
-}
-
-// getBank returns a Lua function that gets the current bank for a group.
-func (m *DesiredModule) getBank() lua.LGFunction {
-	return func(L *lua.LState) int {
-		L.CheckTable(1) // self
-		groupID := L.CheckString(2)
-
-		state, _, err := m.groupStore.Get(groupID)
-		if err != nil {
-			log.Error().Err(err).Str("group", groupID).Msg("Failed to get bank")
-			L.Push(lua.LNil)
-			return 1
-		}
-
-		if state.SceneName == "" {
-			L.Push(lua.LNil)
-		} else {
-			L.Push(lua.LString(state.SceneName))
-		}
-		return 1
-	}
-}
-
-// hasBank returns a Lua function that checks if a group has a bank set.
-func (m *DesiredModule) hasBank() lua.LGFunction {
-	return func(L *lua.LState) int {
-		L.CheckTable(1) // self
-		groupID := L.CheckString(2)
-
-		state, _, err := m.groupStore.Get(groupID)
-		if err != nil {
-			L.Push(lua.LFalse)
-			return 1
-		}
-
-		L.Push(lua.LBool(state.SceneName != ""))
 		return 1
 	}
 }

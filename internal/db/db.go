@@ -100,6 +100,24 @@ func initSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to create geocache table: %w", err)
 	}
 
+	// KV store - generic key-value storage with optional TTL
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS kv_store (
+			bucket TEXT NOT NULL,
+			key TEXT NOT NULL,
+			value TEXT NOT NULL,
+			expires_at INTEGER,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (bucket, key)
+		);
+		CREATE INDEX IF NOT EXISTS idx_kv_bucket ON kv_store(bucket);
+		CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv_store(expires_at) WHERE expires_at IS NOT NULL;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create kv_store table: %w", err)
+	}
+
 	return nil
 }
 

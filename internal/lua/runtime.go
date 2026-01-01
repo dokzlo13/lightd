@@ -17,6 +17,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
+	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
 	"github.com/dokzlo13/lightd/internal/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
@@ -42,11 +43,13 @@ type Runtime struct {
 	stores       *stores.Registry
 	orchestrator *reconcile.Orchestrator
 	geoCalc      *geo.Calculator
+	kvManager    *kv.Manager
 
 	// Modules
 	actionModule  *modules.ActionModule
 	schedModule   *modules.SchedModule
 	hueModule     *modules.HueModule
+	kvModule      *modules.KVModule
 	sseModule     *sse.Module
 	webhookModule *webhook.Module
 
@@ -70,6 +73,7 @@ func NewRuntime(
 	storeRegistry *stores.Registry,
 	orchestrator *reconcile.Orchestrator,
 	geoCalc *geo.Calculator,
+	kvManager *kv.Manager,
 ) *Runtime {
 	L := lua.NewState()
 
@@ -84,6 +88,7 @@ func NewRuntime(
 		stores:       storeRegistry,
 		orchestrator: orchestrator,
 		geoCalc:      geoCalc,
+		kvManager:    kvManager,
 		workQueue:    make(chan LuaWork, 100),
 		closing:      make(chan struct{}),
 	}
@@ -190,6 +195,10 @@ func (r *Runtime) registerModules() {
 	// Hue module
 	r.hueModule = modules.NewHueModule(r.bridge, r.sceneIndex)
 	r.L.PreloadModule("hue", r.hueModule.Loader)
+
+	// KV module (persistent key-value storage)
+	r.kvModule = modules.NewKVModule(r.kvManager)
+	r.L.PreloadModule("kv", r.kvModule.Loader)
 
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)

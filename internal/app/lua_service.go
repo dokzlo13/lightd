@@ -11,6 +11,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
+	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/lua"
 	"github.com/dokzlo13/lightd/internal/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
@@ -34,8 +35,9 @@ func NewLuaService(
 	storeRegistry *stores.Registry,
 	orchestrator *reconcile.Orchestrator,
 	geoCalc *geo.Calculator,
+	kvManager *kv.Manager,
 ) (*LuaService, error) {
-	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, sceneIndex, storeRegistry, orchestrator, geoCalc)
+	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, sceneIndex, storeRegistry, orchestrator, geoCalc, kvManager)
 
 	return &LuaService{
 		cfg:     cfg,
