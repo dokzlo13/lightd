@@ -55,7 +55,7 @@ sched.define("night",   "23:00",         "set_scene", { scene = "Nightlight" })
 
 - **Event-driven architecture**: All inputs (button presses, rotary dials, scheduled times, webhooks, device connectivity) flow through a unified event bus and trigger Lua actions.
 
-- **Single-threaded Lua**: All Lua code runs on a dedicated worker goroutine. No concurrency bugs in your scripts—the core handles parallelism, Lua stays simple.
+- **Single-threaded Lua**: All Lua code runs on a dedicated worker goroutine. No concurrency bugs in your scripts - the core handles parallelism, Lua stays simple.
 
 - **Persistence across restarts**: Schedules, state, and key-value data survive restarts via SQLite. Missed schedules are recovered on boot.
 
@@ -65,14 +65,14 @@ sched.define("night",   "23:00",         "set_scene", { scene = "Nightlight" })
 
 **Lightd might be for you if:**
 
-- ✅ **Self-sufficient**: Lightd can drive your entire Hue lighting automation. No Home Assistant or other platforms required—just a Hue bridge and somewhere to run a container.
+- ✅ **Self-sufficient**: Lightd can drive your entire Hue lighting automation. No Home Assistant or other platforms required - just a Hue bridge and somewhere to run a container.
 - ✅ **Hue-focused**: Built specifically for Philips Hue. It speaks the Hue API natively (v1 for control, v2 SSE for events).
-- ✅ **Programmable**: When declarative configs hit their limits, you have a real language. Conditions, loops, state machines—whatever you need.
+- ✅ **Programmable**: When declarative configs hit their limits, you have a real language. Conditions, loops, state machines - whatever you need.
 
 **Lightd is probably not for you if:**
 
 - ❌ **Not an SDK or CLI**: This isn't a library for building Hue apps or a command-line tool. It's a daemon that runs your automation script continuously.
-- ❌ **DIY required**: You need to manage your own configuration. Lightd won't discover your lights or generate configs for you—you need to know your group IDs, button resource IDs, and scene names.
+- ❌ **DIY required**: You need to manage your own configuration. Lightd won't discover your lights or generate configs for you - you need to know your group IDs, button resource IDs, and scene names.
 - ❌ **Hue only**: If you need to control non-Hue devices, you'll need to integrate via webhooks or run something else alongside.
 
 **Project status:**
@@ -126,13 +126,19 @@ flowchart TD
 
 ### Core Components
 
-- **Event Bus**: Bounded worker pool that dispatches events to handlers. Non-blocking with backpressure.
-- **Lua Runtime**: Single-threaded executor for all Lua code. Actions are queued and processed sequentially—no race conditions in your scripts.
-- **Scheduler**: Manages schedule definitions with astronomical time expressions (`@dawn`, `@sunset + 1h`). Handles misfires on restart.
-- **Persistence (SQLite)**: Stores KV data, event ledger (for deduplication), and geocache.
+- **Event Bus**: Bounded worker pool that dispatches events to handlers. Non-blocking with backpressure. Configurable workers and queue size.
+- **Lua Runtime**: Single-threaded executor for all Lua code. Actions are queued and processed sequentially - no race conditions in your scripts.
+- **Scheduler**: Manages schedule definitions with astronomical time expressions (`@dawn`, `@sunset + 1h`). Handles boot recovery - missed schedules are replayed on startup (grouped by tag, most recent wins).
+- **SSE Client**: Maintains persistent connection to Hue bridge with exponential backoff reconnection.
+- **Health Endpoints**: HTTP endpoints (`/health`, `/ready`) for container orchestration and monitoring.
+- **Persistence (SQLite)**:
+  - **KV storage**: User-accessible key-value store for Lua scripts
+  - **Event ledger**: Append-only log for schedule deduplication and action completion tracking (with configurable retention)
+  - **Desired state**: Versioned state store for reconciler (survives restarts)
+  - **Geocache**: Cached coordinates for astronomical time calculations
 - **Two control modes**:
-  - *Immediate mode* (`hue.group("1"):set_scene("Relax")`) — direct API calls, instant feedback, no persistence. Good for rotary dials, brightness adjustments, visual effects.
-  - *Reconciled mode* (`ctx.desired:group("1"):on():set_scene("Relax")`) — declares desired state, persisted to SQLite. The reconciler compares actual vs desired, determines the minimal action (turn on with scene, apply scene, turn off, adjust brightness), and applies it with rate limiting. Survives restarts; handles reconnects and idempotency automatically.
+  - *Immediate mode* (`hue.group("1"):set_scene("Relax")`)  -  direct API calls, instant feedback, no persistence. Good for rotary dials, brightness adjustments, visual effects.
+  - *Reconciled mode* (`ctx.desired:group("1"):on():set_scene("Relax")`)  -  declares desired state, persisted to SQLite. The reconciler compares actual vs desired, determines the minimal action (turn on with scene, apply scene, turn off, adjust brightness), and applies it with rate limiting. Survives restarts; handles reconnects and idempotency automatically.
 
 ### Lua Modules
 
@@ -234,20 +240,173 @@ docker-compose logs -f
 
 ### Configuration
 
-The Docker image uses environment variables for configuration. Key variables:
+Lightd uses a YAML configuration file. See `config.example.yaml` for a complete example.
+
+**Config file structure:**
+
+```yaml
+# =============================================================================
+# HUE BRIDGE CONNECTION
+# Required: IP address and API token for your Philips Hue bridge
+# =============================================================================
+hue:
+  bridge: "192.168.1.100"     # Bridge IP address
+  token: "your-api-token"     # API token (see Hue developer docs)
+  timeout: "30s"              # HTTP request timeout
+
+# =============================================================================
+# DATABASE
+# SQLite database for persistence (KV storage, ledger, desired state, geocache)
+# =============================================================================
+database:
+  path: "./lightd.sqlite"
+
+# =============================================================================
+# LOGGING
+# Configure log output format and verbosity
+# =============================================================================
+log:
+  level: "info"               # debug, info, warn, error
+  use_json: false             # JSON format (recommended for production)
+  colors: true                # Colorize text output (ignored if use_json=true)
+
+# =============================================================================
+# RECONCILER
+# Manages desired state and applies changes to the bridge
+# Disable if you only use immediate mode (hue.group():on())
+# =============================================================================
+reconciler:
+  enabled: true               # Set false to disable reconciler entirely
+  periodic_interval: 0        # Periodic reconciliation (0 = only on-demand)
+  debounce_ms: 0              # Delay before reconciliation (0 = immediate)
+  rate_limit_rps: 10.0        # Hue API rate limit (bridge allows ~10 req/sec)
+
+# =============================================================================
+# LEDGER
+# Append-only event log for schedule deduplication and action tracking
+# Prevents duplicate schedule runs after restarts
+# =============================================================================
+ledger:
+  enabled: true               # Set false to disable (schedules may re-run)
+  retention_period: "72h"     # How long to keep entries
+  retention_interval: "24h"   # How often to clean old entries
+
+# =============================================================================
+# HEALTH CHECK
+# HTTP endpoints for container orchestration (/health, /ready)
+# =============================================================================
+healthcheck:
+  enabled: true
+  host: "0.0.0.0"
+  port: 9090
+
+# =============================================================================
+# EVENT BUS
+# Internal event routing with bounded worker pool
+# =============================================================================
+eventbus:
+  workers: 4                  # Parallel event handlers
+  queue_size: 1024            # Events dropped if queue is full
+
+# =============================================================================
+# KV STORAGE
+# Persistent key-value storage for Lua scripts
+# =============================================================================
+kv:
+  cleanup_interval: "5m"      # How often to remove expired keys
+
+# =============================================================================
+# EVENT SOURCES
+# Enable/disable different event inputs
+# =============================================================================
+events:
+  # ---------------------------------------------------------------------------
+  # WEBHOOK SERVER
+  # HTTP server for external integrations (curl, Home Assistant, etc.)
+  # ---------------------------------------------------------------------------
+  webhook:
+    enabled: true             # Set false to disable webhook server
+    host: "0.0.0.0"
+    port: 8081
+
+  # ---------------------------------------------------------------------------
+  # HUE SSE (Server-Sent Events)
+  # Real-time events from the Hue bridge (buttons, rotary, connectivity)
+  # Reconnects automatically with exponential backoff on connection loss
+  # ---------------------------------------------------------------------------
+  sse:
+    enabled: true             # Set false to disable SSE (no button events!)
+    min_retry_backoff: "1s"   # Initial retry delay after disconnect
+    max_retry_backoff: "2m"   # Maximum retry delay (caps exponential growth)
+    retry_multiplier: 2.0     # Backoff multiplier (delay *= multiplier each retry)
+    max_reconnects: 0         # 0 = infinite reconnection attempts
+
+  # ---------------------------------------------------------------------------
+  # SCHEDULER
+  # Time-based triggers with optional astronomical time support
+  # ---------------------------------------------------------------------------
+  scheduler:
+    enabled: true             # Set false to disable all schedules
+    geo:
+      enabled: true           # Enable astronomical times (@sunrise, @sunset)
+      use_cache: true         # Cache geocoded coordinates in SQLite
+      name: "Amsterdam"       # City name for geocoding (uses Nominatim API)
+      timezone: "Europe/Amsterdam"
+      http_timeout: "10s"     # Timeout for geocoding HTTP requests
+      # lat: 52.3676          # Optional: provide coords to skip geocoding
+      # lon: 4.9041
+
+shutdown_timeout: "5s"        # Graceful shutdown timeout
+
+# =============================================================================
+# LUA SCRIPT
+# Path to your automation script
+# =============================================================================
+script: "main.lua"
+
+```
+
+**Docker environment variables:**
+
+The Docker image maps environment variables to config values. All variables are optional except `HUE_BRIDGE` and `HUE_TOKEN`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HUE_BRIDGE` | Hue bridge IP address | required |
-| `HUE_TOKEN` | Hue API token | required |
-| `TZ` | Timezone | UTC |
+| `HUE_BRIDGE` | Hue bridge IP address | *required* |
+| `HUE_TOKEN` | Hue API token | *required* |
+| `HUE_TIMEOUT` | HTTP timeout for Hue API | 30s |
+| `TZ` | Timezone | - |
+| `SCRIPT_PATH` | Path to Lua script | /app/config/lightd.lua |
+| `DATABASE_PATH` | SQLite database path | /app/data/lightd.sqlite |
+| `LOG_LEVEL` | Log level (debug/info/warn/error) | info |
+| `LOG_JSON` | JSON log format | true |
+| `LOG_COLORS` | Colorize output (ignored if JSON) | false |
 | `GEO_ENABLED` | Enable astronomical times | false |
 | `GEO_LOCATION` | City name for geocoding | - |
-| `GEO_LAT`/`GEO_LON` | Coordinates (skip geocoding) | - |
-| `LOG_LEVEL` | Log level (debug/info/warn/error) | info |
-| `SCRIPT_PATH` | Path to Lua script | /app/config/lightd.lua |
+| `GEO_LAT` | Latitude (skip geocoding) | - |
+| `GEO_LON` | Longitude (skip geocoding) | - |
+| `GEO_USE_CACHE` | Cache geocoded coordinates | true |
+| `GEO_HTTP_TIMEOUT` | Geocoding API timeout | 10s |
+| `SSE_ENABLED` | Enable Hue SSE event stream | true |
+| `SSE_MIN_RETRY_BACKOFF` | Initial retry delay after disconnect | 1s |
+| `SSE_MAX_RETRY_BACKOFF` | Maximum retry delay | 2m |
+| `SSE_RETRY_MULTIPLIER` | Backoff multiplier | 2.0 |
+| `SSE_MAX_RECONNECTS` | Max reconnect attempts (0=infinite) | 0 |
+| `WEBHOOK_ENABLED` | Enable webhook HTTP server | true |
+| `SCHEDULER_ENABLED` | Enable time-based scheduling | true |
+| `RECONCILER_ENABLED` | Enable state reconciler | true |
+| `RECONCILER_INTERVAL` | Periodic reconciliation (0=disabled) | 0 |
+| `RECONCILER_DEBOUNCE_MS` | Delay before reconciliation (ms) | 0 |
+| `RECONCILER_RATE_LIMIT` | Hue API rate limit (req/sec) | 10.0 |
+| `EVENTBUS_WORKERS` | Event processing workers | 4 |
+| `EVENTBUS_QUEUE_SIZE` | Event queue size | 100 |
+| `LEDGER_ENABLED` | Enable event ledger | true |
+| `LEDGER_RETENTION_PERIOD` | Ledger entry retention | 72h |
+| `LEDGER_RETENTION_INTERVAL` | Ledger cleanup interval | 24h |
+| `KV_CLEANUP_INTERVAL` | KV expired entry cleanup | 5m |
+| `SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | 5s |
 
-See `config.docker.yaml` for all available options.
+See [`config.docker.yaml`](./config.docker.yaml) for the full mapping.
 
 ---
 
@@ -268,7 +427,7 @@ Requires Go 1.24+ and CGO (for SQLite).
 
 ### The Problem
 
-I purchased Philips Hue lights for circadian lighting—I wanted warm light in the evening and energizing light in the morning, automatically adjusted based on time of day.
+I purchased Philips Hue lights for circadian lighting - I wanted warm light in the evening and energizing light in the morning, automatically adjusted based on time of day.
 
 The official Hue app has "Natural Light" routines, but they break when you manually control lights. Turn off the lights at night, and the next morning they turn on with last night's "Nightlight" scene instead of the appropriate morning scene.
 
@@ -299,7 +458,7 @@ YAML is great for data, but once you need conditions, loops, and functions, you'
 
 ### Lightd: Code as Configuration
 
-Lightd takes the opposite approach: instead of making YAML more powerful, it uses Lua—a real programming language—for automation logic.
+Lightd takes the opposite approach: instead of making YAML more powerful, it uses Lua - a real programming language - for automation logic.
 
 The Go core handles the hard problems:
 - Event stream management with reconnection
@@ -312,17 +471,6 @@ The Lua script handles the easy part:
 - What should happen when a button is pressed
 - Which scenes apply at which times
 - Any custom logic you can imagine
-
-```lua
--- Complex logic is just... code
-if time_of_day == "morning" and is_weekday() then
-    group:set_scene("Energize")
-elseif brightness < 50 then
-    group:set_scene("Concentrate")
-else
-    group:set_scene("Relax")
-end
-```
 
 ---
 
