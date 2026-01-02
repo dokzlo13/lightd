@@ -46,12 +46,13 @@ func RegisterHandlers(
 			return
 		}
 
-		log.Debug().
+		log.Info().
+			Str("trigger", "webhook").
 			Str("method", method).
 			Str("path", path).
-			Str("handler_action", match.Handler.ActionName).
+			Str("action", match.Handler.ActionName).
 			Interface("path_params", match.PathParams).
-			Msg("Webhook event matched handler")
+			Msg("Action triggered by webhook request")
 
 		// Build collector key from method and registered path pattern
 		collectorKey := match.Handler.Method + ":" + match.Handler.Path

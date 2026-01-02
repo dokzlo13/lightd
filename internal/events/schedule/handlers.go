@@ -25,12 +25,13 @@ func RegisterHandler(
 		scheduleID, _ := event.Data["schedule_id"].(string)
 		source, _ := event.Data["source"].(string)
 
-		log.Debug().
+		log.Info().
+			Str("trigger", "schedule").
 			Str("schedule_id", scheduleID).
 			Str("action", actionName).
 			Str("occurrence_id", occurrenceID).
 			Str("source", source).
-			Msg("Schedule event received")
+			Msg("Action triggered by schedule")
 
 		// Capture values for closure
 		aName := actionName

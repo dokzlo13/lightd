@@ -26,21 +26,24 @@ func RegisterGroupType(L *lua.LState) {
 
 var groupMethods = map[string]lua.LGFunction{
 	// Getters (return values)
-	"id":      groupGetID,
-	"name":    groupGetName,
-	"is_on":   groupIsOn,
-	"all_on":  groupAllOn,
-	"any_on":  groupAnyOn,
-	"get_bri": groupGetBri,
-	"lights":  groupGetLights,
+	"id":        groupGetID,
+	"name":      groupGetName,
+	"is_on":     groupIsOn,
+	"all_on":    groupAllOn,
+	"any_on":    groupAnyOn,
+	"get_bri":   groupGetBri,
+	"get_state": groupGetState,
+	"lights":    groupGetLights,
 
 	// Chainable setters (return self for chaining)
 	"on":        groupOn,
 	"off":       groupOff,
 	"toggle":    groupToggle,
 	"set_bri":   groupSetBri,
+	"set_ct":    groupSetCt,
 	"set_scene": groupSetScene,
 	"set_color": groupSetColorXY,
+	"alert":     groupAlert,
 
 	// Generic state setter
 	"set_state": groupSetState,
@@ -132,6 +135,30 @@ func groupGetBri(L *lua.LState) int {
 	return 1
 }
 
+// groupGetState returns the current color state for saving/restoring
+// group:get_state() -> { bri, xy, ct, colormode }
+func groupGetState(L *lua.LState) int {
+	group, _ := checkGroup(L)
+	tbl := L.NewTable()
+
+	if group.group.State != nil {
+		s := group.group.State
+		L.SetField(tbl, "bri", lua.LNumber(s.Bri))
+		L.SetField(tbl, "ct", lua.LNumber(s.Ct))
+		L.SetField(tbl, "colormode", lua.LString(s.ColorMode))
+
+		if len(s.Xy) >= 2 {
+			xyTbl := L.NewTable()
+			xyTbl.RawSetInt(1, lua.LNumber(s.Xy[0]))
+			xyTbl.RawSetInt(2, lua.LNumber(s.Xy[1]))
+			L.SetField(tbl, "xy", xyTbl)
+		}
+	}
+
+	L.Push(tbl)
+	return 1
+}
+
 // groupGetLights returns the light IDs in the group
 // group:lights() -> table of light IDs
 func groupGetLights(L *lua.LState) int {
@@ -215,6 +242,29 @@ func groupSetBri(L *lua.LState) int {
 	return 1
 }
 
+// groupSetCt sets the group color temperature in mirek (chainable)
+// group:set_ct(ct) -> self
+// ct: color temperature in mirek (153-500, lower = cooler/bluer, higher = warmer/yellower)
+func groupSetCt(L *lua.LState) int {
+	group, ud := checkGroup(L)
+	ct := L.CheckInt(2)
+
+	// Clamp to valid range
+	if ct < 153 {
+		ct = 153
+	}
+	if ct > 500 {
+		ct = 500
+	}
+
+	err := group.group.Ct(uint16(ct))
+	if err != nil {
+		log.Error().Err(err).Int("group", group.group.ID).Int("ct", ct).Msg("Failed to set group color temperature")
+	}
+	L.Push(ud)
+	return 1
+}
+
 // groupSetScene activates a scene on the group (chainable)
 // group:set_scene(scene_name) -> self
 func groupSetScene(L *lua.LState) int {
@@ -251,6 +301,21 @@ func groupSetColorXY(L *lua.LState) int {
 	err := group.group.Xy([]float32{x, y})
 	if err != nil {
 		log.Error().Err(err).Int("group", group.group.ID).Msg("Failed to set group color XY")
+	}
+	L.Push(ud)
+	return 1
+}
+
+// groupAlert triggers an alert on the group (chainable)
+// group:alert(type) -> self
+// type: "none", "select" (single flash), "lselect" (15 second flash)
+func groupAlert(L *lua.LState) int {
+	group, ud := checkGroup(L)
+	alertType := L.OptString(2, "select")
+
+	err := group.group.Alert(alertType)
+	if err != nil {
+		log.Error().Err(err).Int("group", group.group.ID).Str("alert", alertType).Msg("Failed to set group alert")
 	}
 	L.Push(ud)
 	return 1

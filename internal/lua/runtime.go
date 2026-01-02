@@ -166,6 +166,10 @@ func (r *Runtime) registerModules() {
 	collectModule := collect.NewModule()
 	r.L.PreloadModule("collect", collectModule.Loader)
 
+	// Utils module (sleep, etc.)
+	utilsModule := modules.NewUtilsModule()
+	r.L.PreloadModule("utils", utilsModule.Loader)
+
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)
 	r.sseModule = modules.NewSSEModule(r.deps.Config.Events.SSE.IsEnabled())

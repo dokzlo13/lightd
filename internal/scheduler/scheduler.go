@@ -346,6 +346,64 @@ func (s *Scheduler) RunClosest(tags []string, strategy Strategy) {
 	s.emitDirect(closestSched, manualOcc, "run_closest")
 }
 
+// GetClosest finds the closest schedule matching criteria without running it.
+// Returns *ScheduleInfo or nil if not found.
+func (s *Scheduler) GetClosest(tags []string, strategy Strategy) *ScheduleInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	var closest *Occurrence
+	var closestSched Schedule
+
+	for _, sched := range s.schedules {
+		// Filter by tag
+		if len(tags) > 0 && !containsTag(tags, sched.Tag()) {
+			continue
+		}
+
+		var occ *Occurrence
+		switch strategy {
+		case StrategyNext:
+			occ = sched.Next(now)
+		case StrategyPrev:
+			occ = sched.Prev(now)
+		default:
+			occ = sched.Next(now)
+		}
+
+		if occ == nil {
+			continue
+		}
+
+		isCloser := closest == nil
+		if !isCloser {
+			switch strategy {
+			case StrategyNext:
+				isCloser = occ.Time.Before(closest.Time)
+			case StrategyPrev:
+				isCloser = occ.Time.After(closest.Time)
+			}
+		}
+
+		if isCloser {
+			closest = occ
+			closestSched = sched
+		}
+	}
+
+	if closestSched == nil {
+		return nil
+	}
+
+	return &ScheduleInfo{
+		ID:         closestSched.ID(),
+		ActionName: closestSched.ActionName(),
+		Tag:        closestSched.Tag(),
+		Time:       closest.Time,
+	}
+}
+
 func containsTag(tags []string, tag string) bool {
 	for _, t := range tags {
 		if t == tag {
@@ -494,5 +552,94 @@ func (s *Scheduler) Disable(id string) error {
 // Enable is a no-op for in-memory schedules (schedule must be re-registered)
 func (s *Scheduler) Enable(id string) error {
 	log.Warn().Str("id", id).Msg("Enable called on in-memory scheduler - schedule must be re-registered via Lua")
+	return nil
+}
+
+// ScheduleInfo represents a schedule for cycling/listing
+type ScheduleInfo struct {
+	ID         string
+	ActionName string
+	Tag        string
+	Time       time.Time // Today's occurrence time (for ordering)
+}
+
+// GetSchedulesByTag returns schedules matching a tag, sorted by today's occurrence time.
+// This is used for cycling through schedules in order.
+func (s *Scheduler) GetSchedulesByTag(tag string) []ScheduleInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now()
+	startOfDay := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, s.tz)
+
+	var items []ScheduleInfo
+
+	for _, sched := range s.schedules {
+		// Filter by tag if specified
+		if tag != "" && sched.Tag() != tag {
+			continue
+		}
+
+		// Get today's occurrence for ordering
+		// Try to find the next occurrence after start of day
+		occ := sched.Next(startOfDay.Add(-1 * time.Second))
+		if occ == nil {
+			// Fallback to previous occurrence
+			occ = sched.Prev(now)
+		}
+
+		if occ != nil {
+			items = append(items, ScheduleInfo{
+				ID:         sched.ID(),
+				ActionName: sched.ActionName(),
+				Tag:        sched.Tag(),
+				Time:       occ.Time,
+			})
+		}
+	}
+
+	// Sort by time of day
+	sortScheduleInfoByTime(items)
+
+	return items
+}
+
+// sortScheduleInfoByTime sorts schedule info by occurrence time
+func sortScheduleInfoByTime(items []ScheduleInfo) {
+	for i := 0; i < len(items)-1; i++ {
+		for j := i + 1; j < len(items); j++ {
+			if items[j].Time.Before(items[i].Time) {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+}
+
+// RunByID executes a schedule by ID directly.
+// Returns an error if the schedule is not found.
+func (s *Scheduler) RunByID(id string) error {
+	s.mu.RLock()
+	sched, exists := s.schedules[id]
+	s.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("schedule %q not found", id)
+	}
+
+	now := time.Now()
+
+	log.Info().
+		Str("schedule_id", id).
+		Str("action", sched.ActionName()).
+		Msg("Running schedule by ID")
+
+	// Use empty occurrence ID for manual triggers (no dedupe)
+	manualOcc := &Occurrence{
+		ID:         "", // No dedupe
+		ScheduleID: id,
+		Time:       now,
+	}
+	s.emitDirect(sched, manualOcc, "run_by_id")
+
 	return nil
 }

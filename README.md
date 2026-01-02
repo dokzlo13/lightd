@@ -1,417 +1,328 @@
 # Lightd
 
-> The most overengineered way to turn on your lightbulb
-
 [![License](https://img.shields.io/github/license/dokzlo13/lightd)](LICENSE)
 [![GoVersion](https://img.shields.io/github/go-mod/go-version/dokzlo13/lightd)](go.mod)
 [![Release](https://img.shields.io/github/v/release/dokzlo13/lightd)](https://github.com/dokzlo13/lightd/releases)
-[![LastCommit](https://img.shields.io/github/last-commit/dokzlo13/lightd)](https://github.com/dokzlo13/lightd/commits)
 
-Lightd is a **Philips Hue automation daemon**: a small Go core (persistence, scheduling, event ingestion, reconciliation) plus a **Lua policy layer** (your actual "configuration", written as code).
+> The most overengineered way to turn on your lightbulb
 
-It's meant to feel like a tiny, purpose-built automation runtime:
+Lightd is a **Philips Hue automation daemon** that lets you program your lights. It combines a robust Go core (event handling, persistence, scheduling, rate limiting) with a **Lua scripting layer** where you write your actual automation logic.
 
-- define time phases (including dawn/noon/sunset offsets)
-- react to Hue buttons and rotary events
-- repair state after reconnects (reconciliation)
-- keep schedules durable across restarts (SQLite)
+```lua
+local action  = require("action")
+local sse     = require("events.sse")
+local webhook = require("events.webhook")
+local sched   = require("sched")
+local hue     = require("hue")
+local utils   = require("utils")
 
-This is the successor to my original Python/YAML project: [`dokzlo13/hueplanner`](https://github.com/dokzlo13/hueplanner).
+-- React to button press: toggle lights with time-appropriate scene
+sse.button("my-button-id", "short_release", "toggle_lights", {})
+action.define("toggle_lights", function(ctx, args)
+    local group, _ = hue.group("1")
+    if group:any_on() then
+        group:off()
+    else
+        group:set_scene("Relax"):on()
+    end
+end)
+
+-- HTTP webhook: POST /rainbow to cycle colors
+webhook.define("POST", "/rainbow", "run_rainbow", {})
+action.define("run_rainbow", function(ctx, args)
+    local group, _ = hue.group("1")
+    local colors = {
+        {0.68, 0.31}, {0.17, 0.70}, {0.15, 0.06},  -- red, green, blue
+        {0.58, 0.38}, {0.44, 0.52}, {0.31, 0.32},  -- yellow, orange, purple
+    }
+    for _, xy in ipairs(colors) do
+        group:set_color(xy[1], xy[2])
+        utils.sleep(500)
+    end
+    group:set_scene("Relax")  -- restore
+end)
+
+-- Schedule scene changes based on astronomical time
+sched.define("evening", "@sunset - 30m", "set_scene", { scene = "Relax" })
+sched.define("night",   "23:00",         "set_scene", { scene = "Nightlight" })
+```
 
 ---
 
-## Key ideas (how Lightd thinks)
+## Key Ideas
 
-- **Policy vs mechanism**: You write *policy* in Lua; the daemon provides the *mechanism* (scheduler, persistence, Hue IO).
-- **Desired state + reconciliation**: actions write desired state; a reconciler applies the minimal diff to the bridge.
-- **Idempotent execution**: schedules and device events get stable IDs so restarts don't cause duplicate actions.
-- **Single-threaded Lua**: all Lua runs through one worker to keep it safe and simple.
+- **Code as configuration**: Your automation logic lives in a Lua script. When requirements get complex, you have a real programming language with variables, functions, conditionals, and loops.
+
+- **Event-driven architecture**: All inputs (button presses, rotary dials, scheduled times, webhooks, device connectivity) flow through a unified event bus and trigger Lua actions.
+
+- **Single-threaded Lua**: All Lua code runs on a dedicated worker goroutine. No concurrency bugs in your scripts—the core handles parallelism, Lua stays simple.
+
+- **Persistence across restarts**: Schedules, state, and key-value data survive restarts via SQLite. Missed schedules are recovered on boot.
 
 ---
 
-## Architecture
+## Why / Why Not
 
-### Components
+**Lightd might be for you if:**
+
+- ✅ **Self-sufficient**: Lightd can drive your entire Hue lighting automation. No Home Assistant or other platforms required—just a Hue bridge and somewhere to run a container.
+- ✅ **Hue-focused**: Built specifically for Philips Hue. It speaks the Hue API natively (v1 for control, v2 SSE for events).
+- ✅ **Programmable**: When declarative configs hit their limits, you have a real language. Conditions, loops, state machines—whatever you need.
+
+**Lightd is probably not for you if:**
+
+- ❌ **Not an SDK or CLI**: This isn't a library for building Hue apps or a command-line tool. It's a daemon that runs your automation script continuously.
+- ❌ **DIY required**: You need to manage your own configuration. Lightd won't discover your lights or generate configs for you—you need to know your group IDs, button resource IDs, and scene names.
+- ❌ **Hue only**: If you need to control non-Hue devices, you'll need to integrate via webhooks or run something else alongside.
+
+**Project status:**
+
+- 🚧 **Early stage**: Not all Hue features are covered. I focused on my own use cases (groups, scenes, buttons, rotary). Contributions are welcome!
+- 🤖 **Vibe-coded**: This project was built with help from LLM coding agents. While I do quality control, some code may be unconventional or contain bugs. PRs and issues appreciated.
+
+---
+
+## Architecture Overview
 
 ```mermaid
 flowchart TD
-  subgraph HueBridge [HueBridge]
-    HueApi["HueAPI(v1groupsscenes)"]
-    HueSSE["HueSSE(v2eventstream)"]
-  end
+    subgraph Sources["Event Sources"]
+        SSE["Hue SSE<br/>(buttons, rotary)"]
+        Sched["Scheduler<br/>(cron + astro)"]
+        WH["Webhook<br/>(HTTP triggers)"]
+        Conn["Connectivity<br/>(device online)"]
+    end
 
-  subgraph Core [GoCore]
-    App[App]
-    LuaRT[LuaRuntimeSingleThread]
-    LuaMods[LuaModules]
-    EventSvc[EventService]
-    Scheduler[PersistentScheduler]
-    Invoker[ActionInvoker]
-    Desired[DesiredStateStore]
-    Reconciler[Reconciler]
-    Bus[EventBus]
-    DB[(SQLite)]
-    Geo[GeoCalculator]
-  end
+    subgraph Core["Go Core"]
+        Bus["Event Bus<br/>(worker pool)"]
+        Lua["Lua Runtime<br/>(single-threaded)"]
+        Actions["Actions"]
+    end
 
-  Script["main.lua"]
+    subgraph Output["Effects"]
+        HueAPI["Hue API"]
+        DB["SQLite"]
+        Reconciler["Desired State<br/>+ Reconciler"]
+    end
 
-  Script --> LuaRT
-  LuaRT --> LuaMods
-  LuaMods --> Scheduler
-  LuaMods --> Invoker
-  Invoker --> Desired
-  Invoker --> Reconciler
-  Reconciler --> HueApi
-  HueSSE --> Bus
-  Bus --> EventSvc
-  EventSvc --> LuaRT
-  Scheduler -->|"invokeThroughLua"| LuaRT
-  Scheduler --> Geo
-  Scheduler --> DB
-  Invoker --> DB
-  Desired --> DB
-  Geo --> DB
-  App --> Core
+    SSE --> Bus
+    Sched --> Bus
+    WH --> Bus
+    Conn --> Bus
+    Bus --> Lua
+    Lua --> Actions
+    Actions --> HueAPI
+    Actions --> DB
+    Actions --> Reconciler
+    Reconciler --> HueAPI
 ```
 
-### Event flow (what happens on a button press)
+### Event Sources
 
-```mermaid
-sequenceDiagram
-  participant HueBridge as HueBridge
-  participant SSE as EventStream
-  participant Bus as EventBus
-  participant EventSvc as EventService
-  participant Lua as LuaWorker
-  participant Inv as ActionInvoker
-  participant Store as DesiredState(SQLite)
-  participant Rec as Reconciler
-  participant HueApi as HueAPI
+- **Hue SSE**: Real-time events from the Hue bridge (button presses, rotary dial turns, device connectivity changes, light state changes)
+- **Scheduler**: Time-based triggers with astronomical time support (`@dawn`, `@sunset`, etc.) and fixed times
+- **Webhook**: HTTP endpoints for external integrations
+- **Connectivity**: Device online/offline events for state recovery
 
-  HueBridge->>SSE: SSEEvent(button)
-  SSE->>Bus: Publish(buttonEvent)
-  Bus->>EventSvc: Dispatch(buttonEvent)
-  EventSvc->>Lua: Queue(handler)
-  Lua->>Inv: Invoke(actionName,args,eventId)
-  Inv->>Store: UpdateDesiredState
-  Lua->>Rec: ctx:reconcile()
-  Rec->>HueApi: ApplyDiff(rateLimited)
-```
+### Core Components
+
+- **Event Bus**: Bounded worker pool that dispatches events to handlers. Non-blocking with backpressure.
+- **Lua Runtime**: Single-threaded executor for all Lua code. Actions are queued and processed sequentially—no race conditions in your scripts.
+- **Scheduler**: Manages schedule definitions with astronomical time expressions (`@dawn`, `@sunset + 1h`). Handles misfires on restart.
+- **Persistence (SQLite)**: Stores KV data, event ledger (for deduplication), and geocache.
+- **Two control modes**:
+  - *Immediate mode* (`hue.group("1"):set_scene("Relax")`) — direct API calls, instant feedback, no persistence. Good for rotary dials, brightness adjustments, visual effects.
+  - *Reconciled mode* (`ctx.desired:group("1"):on():set_scene("Relax")`) — declares desired state, persisted to SQLite. The reconciler compares actual vs desired, determines the minimal action (turn on with scene, apply scene, turn off, adjust brightness), and applies it with rate limiting. Survives restarts; handles reconnects and idempotency automatically.
+
+### Lua Modules
+
+| Module | Purpose |
+|--------|---------|
+| `action` | Define and run actions |
+| `sched` | Schedule definitions and time-based triggers |
+| `hue` | Direct Hue API access (lights, groups, scenes) |
+| `events.sse` | Button, rotary, connectivity, light change handlers |
+| `events.webhook` | HTTP webhook handlers |
+| `kv` | Persistent key-value storage |
+| `geo` | Astronomical time calculations |
+| `log` | Structured logging |
+| `collect` | Event aggregation middleware |
+| `utils` | Utilities (sleep, etc.) |
+
+For the complete Lua API reference, see [MANUAL.md](MANUAL.md).
 
 ---
 
-## Quick start
+## Quick Start with Docker
 
 ### Prerequisites
 
-- **Philips Hue bridge** reachable from the machine running Lightd.
-- A **Hue API key / application token** (keep it secret). The README intentionally does not duplicate the steps; refer to Philips Hue official documentation.
-- **Go 1.24+** (see `go.mod`).
+- **Philips Hue bridge** reachable from your network
+- **Hue API token** (see [Hue developer documentation](https://developers.meethue.com/develop/get-started-2/))
 
-### Build
+### 1. Create your Lua script
 
-```bash
-git clone git@github.com:dokzlo13/lightd.git
-cd lightd
-go build -o lightd ./cmd/lightd
+```lua
+-- lightd.lua
+local action = require("action")
+local sse = require("events.sse")
+local sched = require("sched")
+local hue = require("hue")
+local log = require("log")
+
+-- Toggle group on button press
+sse.button("YOUR_BUTTON_ID", "short_release", "toggle", {})
+
+action.define("toggle", function(ctx, args)
+    local group, err = hue.group("1")
+    if err then
+        log.error("Failed to get group: " .. err)
+        return
+    end
+    
+    if group:any_on() then
+        group:off()
+        log.info("Lights off")
+    else
+        group:set_scene("Energize"):on()
+        log.info("Lights on with Energize scene")
+    end
+end)
+
+-- Change scene at sunset
+sched.define("sunset_relax", "@sunset", "set_relax", {})
+
+action.define("set_relax", function(ctx, args)
+    local group, _ = hue.group("1")
+    if group:any_on() then
+        group:set_scene("Relax")
+    end
+end)
+
+log.info("Lightd script loaded")
 ```
 
-### Configure
-
-Create your own `config.yaml` and adjust:
+### 2. Create docker-compose.yml
 
 ```yaml
-hue:
-  bridge: "192.168.10.12"
-  token: "${HUE_TOKEN:replace-me}"
-  timeout: "30s"
-
-  # Event stream reconnect policy
-  min_retry_backoff: "1s"
-  max_retry_backoff: "2m"
-  retry_multiplier: 2.0
-  max_reconnects: 0
-
-geo:
-  name: "Espoo, Finland"
-  timezone: "Europe/Helsinki"
-  http_timeout: "10s"
-  # Optional: lat/lon to avoid external geocoding
-  # lat: 60.2055
-  # lon: 24.6559
-
-database:
-  path: "./hueplanner.sqlite"
-
-log:
-  level: "${LOG_LEVEL:info}"
-  colors: true
-  print_schedule: "30m"
-
-cache:
-  enabled: false               # Currently not wired (reserved); cache TTL is controlled by refresh_interval
-  refresh_interval: "5m"       # Group state cache TTL
-
-reconciler:
-  periodic_interval: "5m"
-  rate_limit_rps: 10.0
-
-ledger:
-  cleanup_interval: "24h"
-  retention_days: 3
-
-healthcheck:
-  enabled: true
-  host: "0.0.0.0"
-  port: 9090
-
-eventbus:
-  workers: 4
-  queue_size: 100
-
-shutdown_timeout: "5s"
-script: "main.lua"
+services:
+  lightd:
+    image: ghcr.io/dokzlo13/lightd:latest
+    container_name: lightd
+    restart: unless-stopped
+    environment:
+      HUE_BRIDGE: "192.168.1.100"       # Your Hue bridge IP (required)
+      HUE_TOKEN: "your-api-token"       # Your Hue API token (required)
+      TZ: "Europe/Amsterdam"            # Your timezone
+      GEO_ENABLED: "true"               # Enable astronomical times
+      GEO_LOCATION: "Amsterdam"         # City for sunrise/sunset calculation
+      LOG_LEVEL: "info"
+    volumes:
+      - ./data:/app/data                # Persist SQLite database
+      - ./lightd.lua:/app/config/lightd.lua
+    ports:
+      - "8080:8080"                     # Webhook endpoint (optional)
+      - "9090:9090"                     # Health check
 ```
 
-### Run
+### 3. Run
 
 ```bash
+docker-compose up -d
+docker-compose logs -f
+```
+
+### Configuration
+
+The Docker image uses environment variables for configuration. Key variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HUE_BRIDGE` | Hue bridge IP address | required |
+| `HUE_TOKEN` | Hue API token | required |
+| `TZ` | Timezone | UTC |
+| `GEO_ENABLED` | Enable astronomical times | false |
+| `GEO_LOCATION` | City name for geocoding | - |
+| `GEO_LAT`/`GEO_LON` | Coordinates (skip geocoding) | - |
+| `LOG_LEVEL` | Log level (debug/info/warn/error) | info |
+| `SCRIPT_PATH` | Path to Lua script | /app/config/lightd.lua |
+
+See `config.docker.yaml` for all available options.
+
+---
+
+## Building from Source
+
+```bash
+git clone https://github.com/dokzlo13/lightd.git
+cd lightd
+go build -o lightd ./cmd/lightd
 ./lightd -config config.yaml
 ```
 
-Useful flags:
-
-- `-config`: path to config file (default: `config.yaml`)
-- `--reset-state`: clears stored desired state (bank scenes) on startup
-
-Health endpoints (when enabled):
-
-- `GET /health`
-- `GET /ready`
+Requires Go 1.24+ and CGO (for SQLite).
 
 ---
 
-## Lua scripting model
+## Why Lightd Exists
 
-### Environment variable substitution in YAML
+### The Problem
 
-Anywhere in `config.yaml` you can use `${VAR}` or `${VAR:default}`. Example:
+I purchased Philips Hue lights for circadian lighting—I wanted warm light in the evening and energizing light in the morning, automatically adjusted based on time of day.
+
+The official Hue app has "Natural Light" routines, but they break when you manually control lights. Turn off the lights at night, and the next morning they turn on with last night's "Nightlight" scene instead of the appropriate morning scene.
+
+I wanted lights that **always** activate with the correct scene for the current time of day.
+
+### Why Not Home Assistant?
+
+I don't run a full home automation stack. I just wanted smart lights that work correctly. Setting up Home Assistant, learning its YAML syntax, and maintaining another service felt like overkill for my use case.
+
+So I wrote my own solution.
+
+### First Attempt: hueplanner (Python + YAML)
+
+My first attempt, [hueplanner](https://github.com/dokzlo13/hueplanner), used Python with YAML configuration. It worked initially, but as requirements grew, the YAML became unwieldy:
 
 ```yaml
-hue:
-  token: "${HUE_TOKEN:replace-me}"
-log:
-  level: "${LOG_LEVEL:info}"
+# This started simple...
+schedules:
+  - time: "@sunset"
+    action: set_scene
+    scene: Relax
+
+# ...but adding conditions, variables, and complex logic
+# turned it into a custom DSL nightmare
 ```
 
-Your Lua script is the *behavior*. It does two things:
+YAML is great for data, but once you need conditions, loops, and functions, you're building a worse programming language inside a configuration format.
 
-1. **Defines schedules** (stable rules stored in SQLite)
-2. **Registers event handlers** (Hue button/rotary/connectivity events)
+### Lightd: Code as Configuration
 
-### Modules available to Lua
+Lightd takes the opposite approach: instead of making YAML more powerful, it uses Lua—a real programming language—for automation logic.
 
-| Module | What it is for | Main functions |
-|---|---|---|
-| `sched` | Persistent schedules | `define`, `run_closest`, `enable`, `disable`, `print` |
-| `input` | Event handler wiring | `button`, `rotary`, `connectivity` |
-| `action` | Define actions | `define`, `define_stateful` |
-| `geo` | Astronomy helpers | `today` |
-| `hue` | Direct Hue calls (imperative helpers) | `cache.group`, `set_group_brightness`, `adjust_group_brightness`, `get_group_brightness`, `recall_scene` |
-| `log` | Structured logs | `debug`, `info`, `warn`, `error` |
+The Go core handles the hard problems:
+- Event stream management with reconnection
+- Rate limiting for Hue API
+- Persistence and crash recovery
+- Concurrent event processing
+- Astronomical time calculations
 
-### Actions and the action context (`ctx`)
-
-Every action receives a `ctx` and `args`:
-
-- `ctx.actual:group(groupId) -> (stateTable, err)`
-  - stateTable: `{ all_on = bool, any_on = bool }`
-- `ctx.desired:set_bank(groupId, sceneName)`
-- `ctx.desired:set_power(groupId, boolean)`
-- `ctx.desired:get_bank(groupId) -> sceneNameOrNil`
-- `ctx:reconcile()` triggers reconciliation
-
-### Scheduler time expressions
-
-Schedule definitions use a small expression language:
-
-- Fixed time: `"22:15"`
-- Astronomical base times: `@dawn`, `@sunrise`, `@noon`, `@sunset`, `@dusk`
-- Optional offsets: `@sunset - 30m`, `@noon + 1h30m`
-
-Notes:
-
-- In polar regions, if an astronomical event does not exist that day, that occurrence is skipped.
-- Special DST policies are not implemented yet (fixed times behave like standard `time.Date` in the configured timezone).
-
----
-
----
-
-## Persistence model (SQLite)
-
-Lightd persists both "what should happen" and "what has happened".
-
-```mermaid
-flowchart LR
-  Defs["schedule_definitions"]
-  Occs["schedule_occurrences"]
-  Ledger["event_ledger"]
-  Desired["desired_state"]
-  GeoCache["geocache"]
-
-  Defs --> Occs
-  Defs --> Ledger
-  Occs --> Ledger
-  Desired --> Ledger
-```
-
-Tables (high level):
-
-- `schedule_definitions`: stable schedule rules defined from Lua via `sched.define(...)`
-- `schedule_occurrences`: computed "next" occurrences cache
-- `event_ledger`: append-only history for dedupe, restart recovery, auditing
-- `desired_state`: per-group desired state (bank scene + desired power), versioned for dirty tracking
-- `geocache`: cached geocoding lookups (so Nominatim is not called every run)
-
----
-
-## Reliability semantics (the stuff that makes it safe)
-
-### Idempotency
-
-Lightd deduplicates by **idempotency key**:
-
-- **Scheduled actions**: key is the occurrence ID (`defId/unixTimestamp`)
-- **Hue button events**: key is derived from resource ID + event timestamp from SSE
-- **Manual calls**: empty key means "always run" (no dedupe)
-
-### Crash / restart recovery
-
-For stateful actions, Lightd writes an `action_started` ledger entry containing the **captured decision** (derived from actual state). If the process dies mid-flight, the invoker finds the orphaned start and **replays** the captured decision.
-
-### Misfires
-
-If the app was down when an occurrence should have fired, each schedule has a `misfire_policy`:
-
-- `skip`
-- `run_latest` (default)
-- `run_all`
-
----
-
-## Operations & troubleshooting
-
-### Inspect the schedule
-
-Lightd periodically prints the formatted schedule (interval controlled by `log.print_schedule`).
-
-You can also call from Lua:
+The Lua script handles the easy part:
+- What should happen when a button is pressed
+- Which scenes apply at which times
+- Any custom logic you can imagine
 
 ```lua
-local sched = require("sched")
-sched.print()
+-- Complex logic is just... code
+if time_of_day == "morning" and is_weekday() then
+    group:set_scene("Energize")
+elseif brightness < 50 then
+    group:set_scene("Concentrate")
+else
+    group:set_scene("Relax")
+end
 ```
-
-### Inspect state and history
-
-Everything important is in SQLite:
-
-- `desired_state` shows what Lightd currently wants
-- `event_ledger` shows what ran (and why it was deduped / recovered)
-- `schedule_definitions` shows the rules defined by Lua
-
-### Reset behavior
-
-If your desired "bank" got into a weird state after changing scripts:
-
-```bash
-./lightd -config config.yaml --reset-state
-```
-
----
-
-## Why I made this (motivation)
-
-Smart lights are "simple" until you try to make them **predictable** across real life:
-
-- circadian schedules based on sunrise/sunset
-- physical buttons that should "do the right thing" no matter the time of day
-- devices that drop off the mesh and come back in a weird state
-
-For me, the trigger was circadian lighting in a place with dramatic seasons: in winter everything is dark early, in summer the sun barely sets. I wanted a setup where "daylight" phases are **computed** (dawn/noon/sunset, with offsets) and the buttons always map to "current phase", instead of getting stuck on whatever scene happened to be active last.
-
-As the automation grew to include **time-based rules + hardware events + connectivity events (and potentially webhooks)**, the system stopped being a static configuration problem and became a **dynamic system** problem.
-
-This is why Lightd uses a split:
-
-- A **stable core** that is good at the hard problems (persistence, idempotency, recovery, rate limiting, concurrency)
-- A **scripting layer** that stays ergonomic as the behavior becomes more complex
-
-In other words: when the world is dynamic, the "configuration" eventually becomes a program. Lightd embraces that explicitly, while keeping the unsafe parts boxed into a small, testable core.
-
----
-
-## Why I migrated from Python + YAML to Go + Lua (and changed the architecture)
-
-The original system started as "just a scheduler", but it naturally evolved into a **rules engine**. That's not a failure of the YAML approach - it's what happens when you pile real-world requirements onto home automation.
-
-### Why a compiled core (Go) helps
-
-- **Smaller footprint & simpler ops**: a single static-ish binary is easier to deploy and typically uses less memory than a full Python runtime + dependencies.
-- **Concurrency model that fits the problem**: long-lived SSE streams, retries/backoff, background loops, and rate-limited IO are straightforward in Go.
-- **Hard guarantees**: it's easier to make persistence/idempotency/recovery "always on" infrastructure instead of "best effort glue".
-- **Embedding a scripting VM is natural**: Go can host Lua cleanly while keeping all stateful side effects in the core.
-
-### Why a YAML DSL bloats (and why it's not your fault)
-
-Once you have:
-
-- dynamic times (dawn/noon/sunset with offsets)
-- day re-planning / recalculation
-- persistent scheduling and dedupe
-- multiple trigger sources (Hue button/rotary, reconnect/connectivity)
-- "closest schedule" queries
-- stateful toggles and fallbacks
-
-…a declarative format starts needing variables, loops, functions, conditionals, modules, composition, and debugging tools. At that point **YAML becomes "a worse programming language"** and the complexity becomes unavoidable.
-
-So the sane line is:
-
-- **YAML for data** (infrastructure config: bridge address, timeouts, database path, log level)
-- **Lua for logic** (behavior: schedules, actions, handlers, reuse)
-
-### The architecture that stays sane: "event → state → effects"
-
-The scalable mental model is to make everything the same shape:
-
-1. **Events** come in (button/rotary press, connectivity change, scheduled occurrence due).
-2. A pure-ish **update step** decides what the system wants to be true (update internal desired state).
-3. An **effects step** performs side effects (Hue API calls via reconciliation, persistence/ledger updates).
-
-This is basically the Elm/Redux idea applied to home automation - the big win is that "a lot of different hooks" stop being special cases. They're just different **event sources** feeding the same pipeline.
-
-Concretely, you can treat inputs as one logical stream:
-
-- Hue button/rotary → `EventBus(button|rotary, {resource_id, ...})`
-- Hue connectivity → `EventBus(connectivity, {device_id, status})`
-- Scheduler occurrence due → `Invoke(action, args, occurrence_id="def_id/unix")` (idempotent, ledger-backed)
-- Astronomical times → evaluated on-demand from `@dawn/@sunrise/@noon/@sunset/@dusk` (scheduler) or `geo.today()` (Lua)
-
-Lightd already follows this shape internally: Hue SSE publishes into the bus, `EventService` routes matching handlers onto the single Lua worker, actions update `desired_state`, and the reconciler applies effects to the bridge. Schedules are durable and invoke actions directly with stable occurrence IDs for dedupe.
-
-### Durable schedule definitions instead of a “forever-schedule DSL”
-
-If your schedule depends on day-specific inputs (astronomical times, offsets, seasons), trying to encode that logic into a declarative DSL is what causes the explosion.
-
-A cleaner model (and what Lightd does today) is:
-
-- Lua defines **durable schedule definitions** via `sched.define(id, time_expr, action_name, args, opts)`; definitions live in SQLite.
-- The core scheduler computes the next **occurrence** for each enabled definition (using geo times when `time_expr` references `@dawn/@sunset/...`) and handles misfires on restart.
-- At runtime, the scheduler sleeps until the next occurrence and invokes the target action (routed through the Lua worker for thread safety) with `occurrence_id = "def_id/unix"` as the idempotency key.
-
-Even if you don't literally rebuild the whole day every night, this framing is useful: **code generates the day's intent**, the core runtime executes it reliably.
 
 ---
 

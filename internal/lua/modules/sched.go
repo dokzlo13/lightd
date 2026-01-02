@@ -9,11 +9,12 @@ import (
 	"github.com/dokzlo13/lightd/internal/scheduler"
 )
 
-// SchedModule provides sched.define(), sched.periodic(), and sched.run_closest() to Lua.
+// SchedModule provides sched.define(), sched.periodic(), sched.run_closest(),
+// sched.list(), and sched.run() to Lua.
 //
 // ERROR HANDLING CONVENTION:
 //   - define(), periodic(), disable(): Use L.RaiseError() for critical setup failures
-//   - run_closest(): Returns (ok, error_string) for runtime operations
+//   - run_closest(), run(): Returns (ok, error_string) for runtime operations
 type SchedModule struct {
 	scheduler *scheduler.Scheduler
 	enabled   bool
@@ -41,6 +42,11 @@ func (m *SchedModule) Loader(L *lua.LState) int {
 	L.SetField(mod, "run_closest", L.NewFunction(m.runClosest))
 	L.SetField(mod, "print", L.NewFunction(m.print))
 	L.SetField(mod, "disable", L.NewFunction(m.disable))
+
+	// Primitives for cycling (logic implemented in Lua)
+	L.SetField(mod, "list", L.NewFunction(m.list))
+	L.SetField(mod, "get_closest", L.NewFunction(m.getClosest))
+	L.SetField(mod, "run", L.NewFunction(m.run))
 
 	L.Push(mod)
 	return 1
@@ -153,6 +159,77 @@ func (m *SchedModule) runClosest(L *lua.LState) int {
 	L.Push(lua.LBool(true))
 	L.Push(lua.LNil)
 	return 2
+}
+
+// list(opts) -> table of schedule IDs
+// Returns schedules matching the tag, sorted by today's occurrence time.
+// opts.tag: filter by tag (optional, returns all if not specified)
+func (m *SchedModule) list(L *lua.LState) int {
+	optsTable := L.OptTable(1, L.NewTable())
+
+	tag := ""
+	if t := optsTable.RawGetString("tag"); t != lua.LNil {
+		tag = t.String()
+	}
+
+	schedules := m.scheduler.GetSchedulesByTag(tag)
+
+	tbl := L.NewTable()
+	for i, info := range schedules {
+		tbl.RawSetInt(i+1, lua.LString(info.ID))
+	}
+
+	L.Push(tbl)
+	return 1
+}
+
+// run(id) -> (ok, err)
+// Runs a specific schedule by ID. Uses NO idempotency key (always runs).
+func (m *SchedModule) run(L *lua.LState) int {
+	id := L.CheckString(1)
+
+	if err := m.scheduler.RunByID(id); err != nil {
+		L.Push(lua.LFalse)
+		L.Push(lua.LString(err.Error()))
+		return 2
+	}
+
+	L.Push(lua.LTrue)
+	L.Push(lua.LNil)
+	return 2
+}
+
+// get_closest(opts) -> { id, action, tag, time } or nil
+// Returns the closest schedule matching criteria without running it.
+// opts.tag: filter by tag (optional)
+// opts.strategy: "PREV" or "NEXT" (default: "PREV")
+func (m *SchedModule) getClosest(L *lua.LState) int {
+	optsTable := L.OptTable(1, L.NewTable())
+
+	// Parse tag
+	var tags []string
+	if t := optsTable.RawGetString("tag"); t != lua.LNil {
+		tags = append(tags, t.String())
+	}
+
+	// Parse strategy (default to PREV for finding current schedule)
+	strategy := scheduler.StrategyPrev
+	if s := optsTable.RawGetString("strategy"); s != lua.LNil {
+		strategy = scheduler.Strategy(s.String())
+	}
+
+	info := m.scheduler.GetClosest(tags, strategy)
+	if info == nil {
+		L.Push(lua.LNil)
+	} else {
+		tbl := L.NewTable()
+		L.SetField(tbl, "id", lua.LString(info.ID))
+		L.SetField(tbl, "action", lua.LString(info.ActionName))
+		L.SetField(tbl, "tag", lua.LString(info.Tag))
+		L.SetField(tbl, "time", lua.LString(info.Time.Format("15:04:05")))
+		L.Push(tbl)
+	}
+	return 1
 }
 
 // print(opts) - Print the current schedule

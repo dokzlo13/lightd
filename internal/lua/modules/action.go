@@ -105,7 +105,7 @@ func (m *ActionModule) run(L *lua.LState) int {
 	// Create a minimal action context
 	actx := actions.NewContext(ctx, nil, nil, nil, nil)
 
-	log.Debug().Str("action", name).Msg("Running action from Lua")
+	log.Info().Str("trigger", "lua").Str("action", name).Msg("Action triggered by Lua script")
 
 	if err := action.Execute(actx, args); err != nil {
 		L.RaiseError("action %q failed: %s", name, err.Error())

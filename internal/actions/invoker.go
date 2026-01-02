@@ -64,9 +64,15 @@ func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string
 	actx := i.ctxFactory(ctx)
 
 	// Execute action
-	logEvent := log.Debug().Str("action", actionName).Interface("args", args)
+	logEvent := log.Info().Str("action", actionName)
 	if source != "" {
 		logEvent = logEvent.Str("source", source)
+	}
+	if defID != "" {
+		logEvent = logEvent.Str("def_id", defID)
+	}
+	if len(args) > 0 {
+		logEvent = logEvent.Interface("args", args)
 	}
 	logEvent.Msg("Executing action")
 

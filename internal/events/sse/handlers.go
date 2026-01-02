@@ -20,7 +20,15 @@ type HandlerRegistry interface {
 	FindLightChangeHandlers(resourceID, resourceType string) []*LightChangeHandler
 }
 
-// RegisterHandlers subscribes to SSE events on the event bus and dispatches to handlers
+// MutableRegistry extends HandlerRegistry with change notification.
+// When handlers are modified at runtime, the callback is invoked to invalidate caches.
+type MutableRegistry interface {
+	HandlerRegistry
+	SetOnHandlersChanged(callback func())
+}
+
+// RegisterHandlers subscribes to SSE events on the event bus and dispatches to handlers.
+// If the registry implements MutableRegistry, collectors are invalidated when handlers change.
 func RegisterHandlers(
 	ctx context.Context,
 	registry HandlerRegistry,
@@ -28,10 +36,90 @@ func RegisterHandlers(
 	invoker *actions.Invoker,
 	luaExec exec.Executor,
 ) {
-	registerButtonHandler(ctx, registry, bus, invoker, luaExec)
-	registerConnectivityHandler(ctx, registry, bus, invoker, luaExec)
-	registerRotaryHandler(ctx, registry, bus, invoker, luaExec)
-	registerLightChangeHandler(ctx, registry, bus, invoker, luaExec)
+	// Collector caches for each event type
+	buttonCollectors := &collectorCache{collectors: make(map[string]middleware.Collector)}
+	connectivityCollectors := &collectorCache{collectors: make(map[string]middleware.Collector)}
+	rotaryCollectors := &collectorCache{collectors: make(map[string]middleware.Collector)}
+	lightChangeCollectors := &lightChangeCollectorCache{collectors: make(map[string]middleware.Collector)}
+
+	// If registry supports change notification, set up invalidation
+	if mutableReg, ok := registry.(MutableRegistry); ok {
+		mutableReg.SetOnHandlersChanged(func() {
+			log.Debug().Msg("Handlers changed, invalidating all collector caches")
+			buttonCollectors.Clear()
+			connectivityCollectors.Clear()
+			rotaryCollectors.Clear()
+			lightChangeCollectors.Clear()
+		})
+	}
+
+	registerButtonHandler(ctx, registry, bus, invoker, luaExec, buttonCollectors)
+	registerConnectivityHandler(ctx, registry, bus, invoker, luaExec, connectivityCollectors)
+	registerRotaryHandler(ctx, registry, bus, invoker, luaExec, rotaryCollectors)
+	registerLightChangeHandler(ctx, registry, bus, invoker, luaExec, lightChangeCollectors)
+}
+
+// collectorCache holds a thread-safe map of collectors that can be cleared
+type collectorCache struct {
+	mu         sync.Mutex
+	collectors map[string]middleware.Collector
+}
+
+// Get returns a collector for the key, or nil if not found
+func (c *collectorCache) Get(key string) (middleware.Collector, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	coll, ok := c.collectors[key]
+	return coll, ok
+}
+
+// Set stores a collector for the key
+func (c *collectorCache) Set(key string, coll middleware.Collector) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.collectors[key] = coll
+}
+
+// Clear closes all collectors and clears the cache
+func (c *collectorCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, coll := range c.collectors {
+		coll.Close()
+		delete(c.collectors, key)
+	}
+	log.Debug().Msg("Cleared collector cache")
+}
+
+// lightChangeCollectorCache holds collectors keyed by string (handler identity)
+type lightChangeCollectorCache struct {
+	mu         sync.Mutex
+	collectors map[string]middleware.Collector
+}
+
+func (c *lightChangeCollectorCache) Get(key string) (middleware.Collector, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	coll, ok := c.collectors[key]
+	return coll, ok
+}
+
+func (c *lightChangeCollectorCache) Set(key string, coll middleware.Collector) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.collectors[key] = coll
+}
+
+func (c *lightChangeCollectorCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, coll := range c.collectors {
+		coll.Close()
+		delete(c.collectors, key)
+	}
+	log.Debug().Msg("Cleared light change collector cache")
 }
 
 // registerButtonHandler sets up button event handling via the event bus.
@@ -41,10 +129,8 @@ func registerButtonHandler(
 	bus *events.Bus,
 	invoker *actions.Invoker,
 	luaExec exec.Executor,
+	cache *collectorCache,
 ) {
-	collectors := make(map[string]middleware.Collector)
-	var mu sync.Mutex
-
 	bus.Subscribe(events.EventTypeButton, func(event events.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		buttonAction, _ := event.Data["action"].(string)
@@ -55,22 +141,21 @@ func registerButtonHandler(
 			return
 		}
 
-		log.Debug().
+		log.Info().
+			Str("trigger", "button").
 			Str("resource_id", resourceID).
-			Str("action", buttonAction).
-			Str("handler_action", handler.ActionName).
-			Msg("Button event matched handler")
+			Str("button_action", buttonAction).
+			Str("action", handler.ActionName).
+			Msg("Action triggered by button press")
 
 		// Build collector key
 		collectorKey := resourceID + ":" + buttonAction
 
-		mu.Lock()
-		collector, ok := collectors[collectorKey]
+		collector, ok := cache.Get(collectorKey)
 		if !ok {
 			collector = createButtonCollector(ctx, handler, invoker, luaExec)
-			collectors[collectorKey] = collector
+			cache.Set(collectorKey, collector)
 		}
-		mu.Unlock()
 
 		collector.AddEvent(map[string]any{
 			"resource_id": resourceID,
@@ -129,10 +214,8 @@ func registerConnectivityHandler(
 	bus *events.Bus,
 	invoker *actions.Invoker,
 	luaExec exec.Executor,
+	cache *collectorCache,
 ) {
-	collectors := make(map[string]middleware.Collector)
-	var mu sync.Mutex
-
 	bus.Subscribe(events.EventTypeConnectivity, func(event events.Event) {
 		deviceID, _ := event.Data["device_id"].(string)
 		status, _ := event.Data["status"].(string)
@@ -142,22 +225,21 @@ func registerConnectivityHandler(
 			return
 		}
 
-		log.Debug().
+		log.Info().
+			Str("trigger", "connectivity").
 			Str("device_id", deviceID).
 			Str("status", status).
-			Str("handler_action", handler.ActionName).
-			Msg("Connectivity event matched handler")
+			Str("action", handler.ActionName).
+			Msg("Action triggered by connectivity change")
 
 		// Build collector key
 		collectorKey := deviceID + ":" + status
 
-		mu.Lock()
-		collector, ok := collectors[collectorKey]
+		collector, ok := cache.Get(collectorKey)
 		if !ok {
 			collector = createConnectivityCollector(ctx, handler, invoker, luaExec)
-			collectors[collectorKey] = collector
+			cache.Set(collectorKey, collector)
 		}
-		mu.Unlock()
 
 		collector.AddEvent(map[string]any{
 			"device_id": deviceID,
@@ -214,10 +296,8 @@ func registerRotaryHandler(
 	bus *events.Bus,
 	invoker *actions.Invoker,
 	luaExec exec.Executor,
+	cache *collectorCache,
 ) {
-	collectors := make(map[string]middleware.Collector)
-	var mu sync.Mutex
-
 	bus.Subscribe(events.EventTypeRotary, func(event events.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		direction, _ := event.Data["direction"].(string)
@@ -228,13 +308,19 @@ func registerRotaryHandler(
 			return
 		}
 
-		mu.Lock()
-		collector, ok := collectors[resourceID]
+		log.Info().
+			Str("trigger", "rotary").
+			Str("resource_id", resourceID).
+			Str("direction", direction).
+			Int("steps", steps).
+			Str("action", handler.ActionName).
+			Msg("Action triggered by rotary dial")
+
+		collector, ok := cache.Get(resourceID)
 		if !ok {
 			collector = createRotaryCollector(ctx, handler, invoker, luaExec)
-			collectors[resourceID] = collector
+			cache.Set(resourceID, collector)
 		}
-		mu.Unlock()
 
 		collector.AddEvent(map[string]any{
 			"direction": direction,
@@ -287,11 +373,8 @@ func registerLightChangeHandler(
 	bus *events.Bus,
 	invoker *actions.Invoker,
 	luaExec exec.Executor,
+	cache *lightChangeCollectorCache,
 ) {
-	// Map from handler pointer to collector (each handler gets its own collector)
-	collectors := make(map[*LightChangeHandler]middleware.Collector)
-	var mu sync.Mutex
-
 	bus.Subscribe(events.EventTypeLightChange, func(event events.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		resourceType, _ := event.Data["resource_type"].(string)
@@ -301,21 +384,23 @@ func registerLightChangeHandler(
 			return
 		}
 
-		log.Debug().
+		log.Info().
+			Str("trigger", "light_change").
 			Str("resource_id", resourceID).
 			Str("resource_type", resourceType).
 			Int("handler_count", len(handlers)).
-			Msg("Light change event matched handlers")
+			Msg("Action triggered by light change")
 
 		// Dispatch to all matching handlers
 		for _, handler := range handlers {
-			mu.Lock()
-			collector, ok := collectors[handler]
+			// Use handler identity as key (action name + resource pattern)
+			key := handler.ActionName + ":" + handler.ResourceID.String() + ":" + handler.ResourceType.String()
+
+			collector, ok := cache.Get(key)
 			if !ok {
 				collector = createLightChangeCollector(ctx, handler, invoker, luaExec)
-				collectors[handler] = collector
+				cache.Set(key, collector)
 			}
-			mu.Unlock()
 
 			// Pass all event data to the collector
 			collector.AddEvent(copyEventData(event.Data))
