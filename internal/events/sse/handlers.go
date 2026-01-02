@@ -7,43 +7,50 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/eventbus"
-	"github.com/dokzlo13/lightd/internal/luaexec"
-	"github.com/dokzlo13/lightd/internal/middleware"
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/events"
+	"github.com/dokzlo13/lightd/internal/events/middleware"
+	"github.com/dokzlo13/lightd/internal/lua/exec"
 )
 
+// HandlerRegistry provides handler lookup functions
+type HandlerRegistry interface {
+	FindButtonHandler(resourceID, buttonAction string) *ButtonHandler
+	FindConnectivityHandler(deviceID, status string) *ConnectivityHandler
+	FindRotaryHandler(resourceID string) *RotaryHandler
+	FindLightChangeHandlers(resourceID, resourceType string) []*LightChangeHandler
+}
+
 // RegisterHandlers subscribes to SSE events on the event bus and dispatches to handlers
-func (m *Module) RegisterHandlers(
+func RegisterHandlers(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	registry HandlerRegistry,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
-	desiredStore *state.TypedStore[group.Desired],
+	luaExec exec.Executor,
 ) {
-	m.registerButtonHandler(ctx, bus, invoker, luaExec, desiredStore)
-	m.registerConnectivityHandler(ctx, bus, invoker, luaExec)
-	m.registerRotaryHandler(ctx, bus, invoker, luaExec)
+	registerButtonHandler(ctx, registry, bus, invoker, luaExec)
+	registerConnectivityHandler(ctx, registry, bus, invoker, luaExec)
+	registerRotaryHandler(ctx, registry, bus, invoker, luaExec)
+	registerLightChangeHandler(ctx, registry, bus, invoker, luaExec)
 }
 
 // registerButtonHandler sets up button event handling via the event bus.
-func (m *Module) registerButtonHandler(
+func registerButtonHandler(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	registry HandlerRegistry,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
-	desiredStore *state.TypedStore[group.Desired],
+	luaExec exec.Executor,
 ) {
 	collectors := make(map[string]middleware.Collector)
 	var mu sync.Mutex
 
-	bus.Subscribe(eventbus.EventTypeButton, func(event eventbus.Event) {
+	bus.Subscribe(events.EventTypeButton, func(event events.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		buttonAction, _ := event.Data["action"].(string)
 		eventID, _ := event.Data["event_id"].(string)
 
-		handler := m.FindButtonHandler(resourceID, buttonAction)
+		handler := registry.FindButtonHandler(resourceID, buttonAction)
 		if handler == nil {
 			return
 		}
@@ -60,7 +67,7 @@ func (m *Module) registerButtonHandler(
 		mu.Lock()
 		collector, ok := collectors[collectorKey]
 		if !ok {
-			collector = createButtonCollector(ctx, handler, invoker, luaExec, desiredStore)
+			collector = createButtonCollector(ctx, handler, invoker, luaExec)
 			collectors[collectorKey] = collector
 		}
 		mu.Unlock()
@@ -78,8 +85,7 @@ func createButtonCollector(
 	ctx context.Context,
 	handler *ButtonHandler,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
-	desiredStore *state.TypedStore[group.Desired],
+	luaExec exec.Executor,
 ) middleware.Collector {
 	onFlush := func(events []map[string]any) {
 		luaExec.Do(ctx, func(workCtx context.Context) {
@@ -87,7 +93,7 @@ func createButtonCollector(
 
 			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
 				// Safe to call LState() here - we're inside Do() callback on Lua worker
-				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
 			} else if len(events) > 0 {
 				args = events[0]
 			} else {
@@ -105,19 +111,6 @@ func createButtonCollector(
 			delete(args, "resource_id")
 			delete(args, "action")
 
-			if handler.IsToggle {
-				// Special handling for toggle buttons:
-				// 1. Run init_bank first (no dedupe)
-				// 2. Then run toggle_group (with dedupe)
-				groupID, _ := handler.ActionArgs["group"].(string)
-				if groupID != "" {
-					// Check if bank is set
-					desired, _, _ := desiredStore.Get(groupID)
-					if desired.SceneName == "" {
-						invoker.Invoke(workCtx, "init_bank", map[string]any{"group": groupID}, "")
-					}
-				}
-			}
 			// Invoke action with button event ID as idempotency key
 			invoker.Invoke(workCtx, handler.ActionName, args, eid)
 		})
@@ -130,20 +123,21 @@ func createButtonCollector(
 }
 
 // registerConnectivityHandler sets up connectivity event handling via the event bus.
-func (m *Module) registerConnectivityHandler(
+func registerConnectivityHandler(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	registry HandlerRegistry,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) {
 	collectors := make(map[string]middleware.Collector)
 	var mu sync.Mutex
 
-	bus.Subscribe(eventbus.EventTypeConnectivity, func(event eventbus.Event) {
+	bus.Subscribe(events.EventTypeConnectivity, func(event events.Event) {
 		deviceID, _ := event.Data["device_id"].(string)
 		status, _ := event.Data["status"].(string)
 
-		handler := m.FindConnectivityHandler(deviceID, status)
+		handler := registry.FindConnectivityHandler(deviceID, status)
 		if handler == nil {
 			return
 		}
@@ -177,7 +171,7 @@ func createConnectivityCollector(
 	ctx context.Context,
 	handler *ConnectivityHandler,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) middleware.Collector {
 	onFlush := func(events []map[string]any) {
 		luaExec.Do(ctx, func(workCtx context.Context) {
@@ -185,7 +179,7 @@ func createConnectivityCollector(
 
 			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
 				// Safe to call LState() here - we're inside Do() callback on Lua worker
-				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
 			} else if len(events) > 0 {
 				args = events[0]
 			} else {
@@ -214,21 +208,22 @@ func createConnectivityCollector(
 }
 
 // registerRotaryHandler sets up rotary event handling via the event bus.
-func (m *Module) registerRotaryHandler(
+func registerRotaryHandler(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	registry HandlerRegistry,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) {
 	collectors := make(map[string]middleware.Collector)
 	var mu sync.Mutex
 
-	bus.Subscribe(eventbus.EventTypeRotary, func(event eventbus.Event) {
+	bus.Subscribe(events.EventTypeRotary, func(event events.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		direction, _ := event.Data["direction"].(string)
 		steps, _ := event.Data["steps"].(int)
 
-		handler := m.FindRotaryHandler(resourceID)
+		handler := registry.FindRotaryHandler(resourceID)
 		if handler == nil {
 			return
 		}
@@ -253,7 +248,7 @@ func createRotaryCollector(
 	ctx context.Context,
 	handler *RotaryHandler,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) middleware.Collector {
 	onFlush := func(events []map[string]any) {
 		luaExec.Do(ctx, func(workCtx context.Context) {
@@ -261,7 +256,7 @@ func createRotaryCollector(
 
 			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
 				// Safe to call LState() here - we're inside Do() callback on Lua worker
-				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
 			} else if len(events) > 0 {
 				args = events[0]
 			} else {
@@ -275,6 +270,95 @@ func createRotaryCollector(
 
 			if err := invoker.Invoke(workCtx, handler.ActionName, args, ""); err != nil {
 				log.Error().Err(err).Str("action", handler.ActionName).Msg("Failed to invoke rotary action")
+			}
+		})
+	}
+
+	if handler.CollectorFactory != nil {
+		return handler.CollectorFactory.Create(onFlush)
+	}
+	return middleware.NewImmediateCollector(onFlush)
+}
+
+// registerLightChangeHandler sets up light change event handling via the event bus.
+func registerLightChangeHandler(
+	ctx context.Context,
+	registry HandlerRegistry,
+	bus *events.Bus,
+	invoker *actions.Invoker,
+	luaExec exec.Executor,
+) {
+	// Map from handler pointer to collector (each handler gets its own collector)
+	collectors := make(map[*LightChangeHandler]middleware.Collector)
+	var mu sync.Mutex
+
+	bus.Subscribe(events.EventTypeLightChange, func(event events.Event) {
+		resourceID, _ := event.Data["resource_id"].(string)
+		resourceType, _ := event.Data["resource_type"].(string)
+
+		handlers := registry.FindLightChangeHandlers(resourceID, resourceType)
+		if len(handlers) == 0 {
+			return
+		}
+
+		log.Debug().
+			Str("resource_id", resourceID).
+			Str("resource_type", resourceType).
+			Int("handler_count", len(handlers)).
+			Msg("Light change event matched handlers")
+
+		// Dispatch to all matching handlers
+		for _, handler := range handlers {
+			mu.Lock()
+			collector, ok := collectors[handler]
+			if !ok {
+				collector = createLightChangeCollector(ctx, handler, invoker, luaExec)
+				collectors[handler] = collector
+			}
+			mu.Unlock()
+
+			// Pass all event data to the collector
+			collector.AddEvent(copyEventData(event.Data))
+		}
+	})
+}
+
+// copyEventData creates a copy of event data map
+func copyEventData(data map[string]interface{}) map[string]any {
+	result := make(map[string]any, len(data))
+	for k, v := range data {
+		result[k] = v
+	}
+	return result
+}
+
+// createLightChangeCollector creates a collector for light change events
+func createLightChangeCollector(
+	ctx context.Context,
+	handler *LightChangeHandler,
+	invoker *actions.Invoker,
+	luaExec exec.Executor,
+) middleware.Collector {
+	onFlush := func(events []map[string]any) {
+		luaExec.Do(ctx, func(workCtx context.Context) {
+			var args map[string]any
+
+			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
+				// Safe to call LState() here - we're inside Do() callback on Lua worker
+				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+			} else if len(events) > 0 {
+				args = events[0]
+			} else {
+				args = make(map[string]any)
+			}
+
+			// Merge with static action args
+			for k, v := range handler.ActionArgs {
+				args[k] = v
+			}
+
+			if err := invoker.Invoke(workCtx, handler.ActionName, args, ""); err != nil {
+				log.Error().Err(err).Str("action", handler.ActionName).Msg("Failed to invoke light change action")
 			}
 		})
 	}

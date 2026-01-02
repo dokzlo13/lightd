@@ -13,7 +13,8 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
+	"github.com/dokzlo13/lightd/internal/events/sse"
 )
 
 // ErrMaxReconnectsExceeded is returned when the maximum number of reconnect attempts is exceeded.
@@ -27,16 +28,6 @@ type EventStreamConfig struct {
 	MaxReconnects int           // Max reconnect attempts, 0 = infinite
 }
 
-// DefaultEventStreamConfig returns sensible defaults for event stream configuration.
-func DefaultEventStreamConfig() EventStreamConfig {
-	return EventStreamConfig{
-		MinBackoff:    1 * time.Second,
-		MaxBackoff:    2 * time.Minute,
-		Multiplier:    2.0,
-		MaxReconnects: 0, // infinite
-	}
-}
-
 // EventStream listens to the Hue event stream (SSE) via V2 API.
 // This is the primary reason for this custom V2 client - no Go library
 // currently supports Hue V2 SSE events.
@@ -44,11 +35,6 @@ type EventStream struct {
 	v2Client   *Client
 	httpClient *http.Client
 	config     EventStreamConfig
-}
-
-// NewEventStream creates a new event stream listener
-func NewEventStream(v2Client *Client) *EventStream {
-	return NewEventStreamWithConfig(v2Client, DefaultEventStreamConfig())
 }
 
 // NewEventStreamWithConfig creates a new event stream listener with custom configuration
@@ -69,7 +55,7 @@ func NewEventStreamWithConfig(v2Client *Client, config EventStreamConfig) *Event
 
 // Run starts listening to the event stream with automatic reconnection.
 // Returns ErrMaxReconnectsExceeded if max reconnects is exceeded.
-func (e *EventStream) Run(ctx context.Context, bus *eventbus.Bus) error {
+func (e *EventStream) Run(ctx context.Context, bus *events.Bus) error {
 	retryCount := 0
 	currentBackoff := e.config.MinBackoff
 
@@ -125,7 +111,7 @@ func (e *EventStream) Run(ctx context.Context, bus *eventbus.Bus) error {
 	}
 }
 
-func (e *EventStream) connect(ctx context.Context, bus *eventbus.Bus) error {
+func (e *EventStream) connect(ctx context.Context, bus *events.Bus) error {
 	url := fmt.Sprintf("https://%s/eventstream/clip/v2", e.v2Client.Address())
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -182,7 +168,7 @@ func (e *EventStream) connect(ctx context.Context, bus *eventbus.Bus) error {
 	return nil
 }
 
-func (e *EventStream) processEvent(data string, bus *eventbus.Bus) {
+func (e *EventStream) processEvent(data string, bus *events.Bus) {
 	var events []map[string]interface{}
 	if err := json.Unmarshal([]byte(data), &events); err != nil {
 		log.Warn().Err(err).Str("data", data).Msg("Failed to parse event")
@@ -194,7 +180,7 @@ func (e *EventStream) processEvent(data string, bus *eventbus.Bus) {
 	}
 }
 
-func (e *EventStream) handleEvent(event map[string]interface{}, bus *eventbus.Bus) {
+func (e *EventStream) handleEvent(event map[string]interface{}, bus *events.Bus) {
 	eventType, _ := event["type"].(string)
 	dataItems, _ := event["data"].([]interface{})
 
@@ -217,6 +203,12 @@ func (e *EventStream) handleEvent(event map[string]interface{}, bus *eventbus.Bu
 		case "zigbee_connectivity":
 			e.handleConnectivityEvent(itemID, itemMap, bus)
 
+		case string(sse.LightResourceTypeLight):
+			e.handleLightChangeEvent(itemID, itemMap, sse.LightResourceTypeLight, bus)
+
+		case string(sse.LightResourceTypeGroupedLight):
+			e.handleLightChangeEvent(itemID, itemMap, sse.LightResourceTypeGroupedLight, bus)
+
 		default:
 			log.Trace().
 				Str("event_type", eventType).
@@ -227,7 +219,7 @@ func (e *EventStream) handleEvent(event map[string]interface{}, bus *eventbus.Bu
 	}
 }
 
-func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, bus *eventbus.Bus) {
+func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, bus *events.Bus) {
 	button, ok := data["button"].(map[string]interface{})
 	if !ok {
 		return
@@ -250,8 +242,8 @@ func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, 
 		Str("event_id", eventID).
 		Msg("Button event")
 
-	bus.Publish(eventbus.Event{
-		Type: eventbus.EventTypeButton,
+	bus.Publish(events.Event{
+		Type: events.EventTypeButton,
 		Data: map[string]interface{}{
 			"resource_id": id,
 			"action":      action,
@@ -260,7 +252,7 @@ func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, 
 	})
 }
 
-func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, bus *eventbus.Bus) {
+func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, bus *events.Bus) {
 	rotary, ok := data["relative_rotary"].(map[string]interface{})
 	if !ok {
 		return
@@ -294,8 +286,8 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 		Str("event_id", eventID).
 		Msg("Rotary event")
 
-	bus.Publish(eventbus.Event{
-		Type: eventbus.EventTypeRotary,
+	bus.Publish(events.Event{
+		Type: events.EventTypeRotary,
 		Data: map[string]interface{}{
 			"resource_id": id,
 			"action":      action, // "start" or "repeat"
@@ -307,7 +299,7 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 	})
 }
 
-func (e *EventStream) handleConnectivityEvent(id string, data map[string]interface{}, bus *eventbus.Bus) {
+func (e *EventStream) handleConnectivityEvent(id string, data map[string]interface{}, bus *events.Bus) {
 	status, _ := data["status"].(string)
 
 	log.Debug().
@@ -315,8 +307,8 @@ func (e *EventStream) handleConnectivityEvent(id string, data map[string]interfa
 		Str("status", status).
 		Msg("Connectivity event")
 
-	bus.Publish(eventbus.Event{
-		Type: eventbus.EventTypeConnectivity,
+	bus.Publish(events.Event{
+		Type: events.EventTypeConnectivity,
 		Data: map[string]interface{}{
 			"device_id": id,
 			"status":    status,
@@ -324,3 +316,63 @@ func (e *EventStream) handleConnectivityEvent(id string, data map[string]interfa
 	})
 }
 
+func (e *EventStream) handleLightChangeEvent(id string, data map[string]interface{}, resourceType sse.LightResourceType, bus *events.Bus) {
+	eventData := map[string]interface{}{
+		"resource_id":   id,
+		"resource_type": string(resourceType),
+	}
+
+	// Extract owner info (device or zone/room)
+	if owner, ok := data["owner"].(map[string]interface{}); ok {
+		if ownerID, ok := owner["rid"].(string); ok {
+			eventData["owner_id"] = ownerID
+		}
+		if ownerType, ok := owner["rtype"].(string); ok {
+			eventData["owner_type"] = ownerType
+		}
+	}
+
+	// Extract dimming info
+	if dimming, ok := data["dimming"].(map[string]interface{}); ok {
+		if brightness, ok := dimming["brightness"].(float64); ok {
+			eventData["brightness"] = brightness
+		}
+	}
+
+	// Extract on/off state
+	if on, ok := data["on"].(map[string]interface{}); ok {
+		if isOn, ok := on["on"].(bool); ok {
+			eventData["power"] = isOn
+		}
+	}
+
+	// Extract color temperature
+	if colorTemp, ok := data["color_temperature"].(map[string]interface{}); ok {
+		if mirek, ok := colorTemp["mirek"].(float64); ok {
+			eventData["color_temp_mirek"] = int(mirek)
+		}
+	}
+
+	// Extract color (xy)
+	if color, ok := data["color"].(map[string]interface{}); ok {
+		if xy, ok := color["xy"].(map[string]interface{}); ok {
+			if x, ok := xy["x"].(float64); ok {
+				eventData["color_x"] = x
+			}
+			if y, ok := xy["y"].(float64); ok {
+				eventData["color_y"] = y
+			}
+		}
+	}
+
+	log.Debug().
+		Str("id", id).
+		Str("resource_type", string(resourceType)).
+		Interface("data", eventData).
+		Msg("Light change event")
+
+	bus.Publish(events.Event{
+		Type: events.EventTypeLightChange,
+		Data: eventData,
+	})
+}

@@ -6,7 +6,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/config"
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/webhook"
 )
 
@@ -17,8 +17,8 @@ type WebhookService struct {
 }
 
 // NewWebhookService creates a new WebhookService.
-func NewWebhookService(cfg *config.Config, bus *eventbus.Bus) *WebhookService {
-	server := webhook.NewServer(cfg.Events.Webhook.Host, cfg.Events.Webhook.Port, bus)
+func NewWebhookService(cfg *config.Config, bus *events.Bus) *WebhookService {
+	server := webhook.NewServer(cfg.Events.Webhook.GetHost(), cfg.Events.Webhook.GetPort(), bus)
 	return &WebhookService{
 		cfg:    cfg,
 		server: server,
@@ -39,7 +39,7 @@ func (s *WebhookService) Start(ctx context.Context) {
 	}
 
 	go func() {
-		if err := s.server.Run(ctx, s.cfg.ShutdownTimeout.Duration()); err != nil {
+		if err := s.server.Run(ctx, s.cfg.GetShutdownTimeout()); err != nil {
 			log.Error().Err(err).Msg("Webhook server error")
 		}
 	}()

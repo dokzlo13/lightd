@@ -11,8 +11,6 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/events/sse"
-	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
 	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
 )
@@ -34,8 +32,8 @@ type Runtime struct {
 	schedModule   *modules.SchedModule
 	hueModule     *modules.HueModule
 	kvModule      *modules.KVModule
-	sseModule     *sse.Module
-	webhookModule *webhook.Module
+	sseModule     *modules.SSEModule
+	webhookModule *modules.WebhookModule
 
 	// Work queue for thread-safe Lua execution
 	workQueue chan LuaWork
@@ -170,11 +168,11 @@ func (r *Runtime) registerModules() {
 
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)
-	r.sseModule = sse.NewModule(r.deps.Config.Events.SSE.IsEnabled())
+	r.sseModule = modules.NewSSEModule(r.deps.Config.Events.SSE.IsEnabled())
 	r.L.PreloadModule("events.sse", r.sseModule.Loader)
 
 	// Webhook module (HTTP webhook events)
-	r.webhookModule = webhook.NewModule(r.deps.Config.Events.Webhook.Enabled)
+	r.webhookModule = modules.NewWebhookModule(r.deps.Config.Events.Webhook.Enabled)
 	r.L.PreloadModule("events.webhook", r.webhookModule.Loader)
 }
 
@@ -243,12 +241,12 @@ func (r *Runtime) LoadScript(path string) error {
 }
 
 // GetSSEModule returns the SSE module for handler registration
-func (r *Runtime) GetSSEModule() *sse.Module {
+func (r *Runtime) GetSSEModule() *modules.SSEModule {
 	return r.sseModule
 }
 
 // GetWebhookModule returns the webhook module for handler registration
-func (r *Runtime) GetWebhookModule() *webhook.Module {
+func (r *Runtime) GetWebhookModule() *modules.WebhookModule {
 	return r.webhookModule
 }
 

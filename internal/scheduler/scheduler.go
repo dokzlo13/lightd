@@ -9,9 +9,9 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/ledger"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // Strategy for finding closest schedule
@@ -28,8 +28,8 @@ type Scheduler struct {
 	mu        sync.RWMutex
 	schedules map[string]Schedule
 
-	bus       *eventbus.Bus
-	ledger    *ledger.Ledger
+	bus       *events.Bus
+	ledger    *storage.Ledger
 	evaluator TimeEvaluator
 	tz        *time.Location
 
@@ -38,8 +38,8 @@ type Scheduler struct {
 
 // New creates a new scheduler with full astronomical time support
 func New(
-	bus *eventbus.Bus,
-	l *ledger.Ledger,
+	bus *events.Bus,
+	l *storage.Ledger,
 	geoCalc *geo.Calculator,
 	location, timezone string,
 ) *Scheduler {
@@ -61,8 +61,8 @@ func New(
 
 // NewWithFixedTimeOnly creates a scheduler that only supports fixed times (no geo)
 func NewWithFixedTimeOnly(
-	bus *eventbus.Bus,
-	l *ledger.Ledger,
+	bus *events.Bus,
+	l *storage.Ledger,
 	timezone string,
 ) *Scheduler {
 	tz, err := time.LoadLocation(timezone)
@@ -263,8 +263,8 @@ func (s *Scheduler) emitDirect(sched Schedule, occ *Occurrence, source string) {
 		Str("source", source).
 		Msg("Emitting schedule event")
 
-	s.bus.Publish(eventbus.Event{
-		Type: eventbus.EventTypeSchedule,
+	s.bus.Publish(events.Event{
+		Type: events.EventTypeSchedule,
 		Data: map[string]interface{}{
 			"schedule_id":   sched.ID(),
 			"occurrence_id": occ.ID,

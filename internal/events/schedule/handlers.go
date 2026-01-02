@@ -7,18 +7,18 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/eventbus"
-	"github.com/dokzlo13/lightd/internal/luaexec"
+	"github.com/dokzlo13/lightd/internal/events"
+	"github.com/dokzlo13/lightd/internal/lua/exec"
 )
 
 // RegisterHandler subscribes to schedule events on the event bus and dispatches to the invoker.
 func RegisterHandler(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) {
-	bus.Subscribe(eventbus.EventTypeSchedule, func(event eventbus.Event) {
+	bus.Subscribe(events.EventTypeSchedule, func(event events.Event) {
 		actionName, _ := event.Data["action_name"].(string)
 		actionArgs, _ := event.Data["action_args"].(map[string]any)
 		occurrenceID, _ := event.Data["occurrence_id"].(string)

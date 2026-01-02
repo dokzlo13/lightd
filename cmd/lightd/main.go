@@ -13,20 +13,23 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	// Support both -c and --config for config path
+	var configPath string
+	flag.StringVar(&configPath, "config", "config.yaml", "Path to configuration file")
+	flag.StringVar(&configPath, "c", "config.yaml", "Path to configuration file (shorthand)")
 	resetState := flag.Bool("reset-state", false, "Clear stored desired state (bank scenes) on startup")
 	flag.Parse()
 
 	// Load configuration
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to load configuration")
 	}
 
 	// Setup logging
-	setupLogging(cfg.Log.Level, cfg.Log.Colors)
+	setupLogging(cfg.Log.GetLevel(), cfg.Log.UseJSON, cfg.Log.Colors)
 
-	log.Info().Str("config", *configPath).Msg("Starting lightd")
+	log.Info().Str("config", configPath).Msg("Starting lightd")
 
 	// Create application
 	application, err := app.New(cfg)
@@ -59,19 +62,20 @@ func main() {
 	}
 }
 
-func setupLogging(level string, colors bool) {
+func setupLogging(level string, useJSON bool, colors bool) {
 	// ISO 8601 format with timezone
 	zerolog.TimeFieldFormat = time.RFC3339
 
-	if colors {
-		// Pretty console output with colors and ISO timestamp
+	if useJSON {
+		// JSON output for production
+		log.Logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
+	} else {
+		// Text output (with optional colors)
 		log.Logger = log.Output(zerolog.ConsoleWriter{
 			Out:        os.Stderr,
 			TimeFormat: "2006-01-02T15:04:05.000Z07:00",
+			NoColor:    !colors,
 		})
-	} else {
-		// JSON output for production with ISO timestamp
-		log.Logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
 	}
 
 	switch level {

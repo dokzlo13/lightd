@@ -215,7 +215,7 @@ Your Lua script is the *behavior*. It does two things:
 | Module | What it is for | Main functions |
 |---|---|---|
 | `sched` | Persistent schedules | `define`, `run_closest`, `enable`, `disable`, `print` |
-| `input` | Event handler wiring | `button`, `button_toggle`, `rotary`, `connectivity` |
+| `input` | Event handler wiring | `button`, `rotary`, `connectivity` |
 | `action` | Define actions | `define`, `define_stateful` |
 | `geo` | Astronomy helpers | `today` |
 | `hue` | Direct Hue calls (imperative helpers) | `cache.group`, `set_group_brightness`, `adjust_group_brightness`, `get_group_brightness`, `recall_scene` |

@@ -10,7 +10,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
 )
 
 // PathMatcher checks if a request matches a registered handler
@@ -21,13 +21,13 @@ type PathMatcher interface {
 // Server is an HTTP server that receives webhooks and publishes events to the bus.
 type Server struct {
 	addr        string
-	bus         *eventbus.Bus
+	bus         *events.Bus
 	httpServer  *http.Server
 	pathMatcher PathMatcher
 }
 
 // NewServer creates a new webhook server.
-func NewServer(host string, port int, bus *eventbus.Bus) *Server {
+func NewServer(host string, port int, bus *events.Bus) *Server {
 	return &Server{
 		addr: fmt.Sprintf("%s:%d", host, port),
 		bus:  bus,
@@ -127,8 +127,8 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		Msg("Received webhook request")
 
 	// Publish event to bus
-	s.bus.Publish(eventbus.Event{
-		Type: eventbus.EventTypeWebhook,
+	s.bus.Publish(events.Event{
+		Type: events.EventTypeWebhook,
 		Data: map[string]interface{}{
 			"method":   r.Method,
 			"path":     r.URL.Path,

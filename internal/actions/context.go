@@ -4,8 +4,8 @@ package actions
 import (
 	"context"
 
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // ActualState provides read-only access to the actual Hue state
@@ -24,7 +24,7 @@ type Reconciler interface {
 type Context struct {
 	ctx        context.Context // Go context for cancellation/timeout
 	actual     ActualState
-	desired    *state.TypedStore[group.Desired]
+	desired    *storage.TypedStore[group.Desired]
 	reconciler Reconciler
 	runAction  func(name string, args map[string]any) error
 }
@@ -33,7 +33,7 @@ type Context struct {
 func NewContext(
 	ctx context.Context,
 	actual ActualState,
-	desired *state.TypedStore[group.Desired],
+	desired *storage.TypedStore[group.Desired],
 	reconciler Reconciler,
 	runAction func(name string, args map[string]any) error,
 ) *Context {
@@ -57,7 +57,7 @@ func (c *Context) Actual() ActualState {
 }
 
 // Desired returns the desired state store
-func (c *Context) Desired() *state.TypedStore[group.Desired] {
+func (c *Context) Desired() *storage.TypedStore[group.Desired] {
 	return c.desired
 }
 

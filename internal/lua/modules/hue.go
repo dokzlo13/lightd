@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/cache"
+	"github.com/dokzlo13/lightd/internal/hue"
 )
 
 // HueModule provides hue.* functions to Lua.
@@ -44,11 +44,11 @@ import (
 //	})
 type HueModule struct {
 	bridge     *huego.Bridge
-	sceneIndex *cache.SceneIndex
+	sceneIndex *hue.SceneIndex
 }
 
 // NewHueModule creates a new hue module
-func NewHueModule(bridge *huego.Bridge, sceneIndex *cache.SceneIndex) *HueModule {
+func NewHueModule(bridge *huego.Bridge, sceneIndex *hue.SceneIndex) *HueModule {
 	return &HueModule{
 		bridge:     bridge,
 		sceneIndex: sceneIndex,

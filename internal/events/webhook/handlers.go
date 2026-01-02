@@ -7,23 +7,29 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
+	"github.com/dokzlo13/lightd/internal/events/middleware"
 	luactx "github.com/dokzlo13/lightd/internal/lua/context"
-	"github.com/dokzlo13/lightd/internal/luaexec"
-	"github.com/dokzlo13/lightd/internal/middleware"
+	"github.com/dokzlo13/lightd/internal/lua/exec"
 )
 
+// HandlerRegistry provides handler lookup functions
+type HandlerRegistry interface {
+	FindHandler(method, path string) *MatchResult
+}
+
 // RegisterHandlers subscribes to webhook events on the event bus and dispatches to handlers
-func (m *Module) RegisterHandlers(
+func RegisterHandlers(
 	ctx context.Context,
-	bus *eventbus.Bus,
+	registry HandlerRegistry,
+	bus *events.Bus,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) {
 	collectors := make(map[string]middleware.Collector)
 	var mu sync.Mutex
 
-	bus.Subscribe(eventbus.EventTypeWebhook, func(event eventbus.Event) {
+	bus.Subscribe(events.EventTypeWebhook, func(event events.Event) {
 		method, _ := event.Data["method"].(string)
 		path, _ := event.Data["path"].(string)
 		body, _ := event.Data["body"].(string)
@@ -31,7 +37,7 @@ func (m *Module) RegisterHandlers(
 		headers, _ := event.Data["headers"].(map[string]interface{})
 		eventID, _ := event.Data["event_id"].(string)
 
-		match := m.FindHandler(method, path)
+		match := registry.FindHandler(method, path)
 		if match == nil {
 			log.Debug().
 				Str("method", method).
@@ -87,7 +93,7 @@ func createWebhookCollector(
 	ctx context.Context,
 	handler *Handler,
 	invoker *actions.Invoker,
-	luaExec luaexec.Executor,
+	luaExec exec.Executor,
 ) middleware.Collector {
 	onFlush := func(events []map[string]any) {
 		luaExec.Do(ctx, func(workCtx context.Context) {
@@ -95,7 +101,7 @@ func createWebhookCollector(
 
 			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
 				// Safe to call LState() here - we're inside Do() callback on Lua worker
-				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
 			} else if len(events) > 0 {
 				args = events[0]
 			} else {

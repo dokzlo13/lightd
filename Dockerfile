@@ -82,5 +82,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -sf http://localhost:9090/health || exit 1
 
 # Run the application with default config path
-# Override with: docker run lightd -config /path/to/config.yaml
-ENTRYPOINT ["lightd", "-config", "/app/config/config.yaml"]
+# Override with: docker run lightd -c /path/to/config.yaml
+ENTRYPOINT ["lightd", "-c", "/app/config/config.yaml"]

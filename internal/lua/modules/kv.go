@@ -6,7 +6,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/kv"
+	"github.com/dokzlo13/lightd/internal/storage/kv"
 )
 
 const bucketTypeName = "kv_bucket"

@@ -4,9 +4,9 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
-	"github.com/dokzlo13/lightd/internal/reconcile/light"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/light"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // DesiredModule provides ctx.desired for accessing/modifying desired state.
@@ -17,8 +17,8 @@ import (
 //	ctx.desired:light("5"):on():set_bri(254)
 //	ctx:reconcile()  -- flushes pending and triggers reconciler
 type DesiredModule struct {
-	groupStore *state.TypedStore[group.Desired]
-	lightStore *state.TypedStore[light.Desired]
+	groupStore *storage.TypedStore[group.Desired]
+	lightStore *storage.TypedStore[light.Desired]
 
 	// Pending builders (keyed by ID)
 	pendingGroups map[string]*GroupDesiredBuilder
@@ -27,8 +27,8 @@ type DesiredModule struct {
 
 // NewDesiredModule creates a new desired state module.
 func NewDesiredModule(
-	groupStore *state.TypedStore[group.Desired],
-	lightStore *state.TypedStore[light.Desired],
+	groupStore *storage.TypedStore[group.Desired],
+	lightStore *storage.TypedStore[light.Desired],
 ) *DesiredModule {
 	return &DesiredModule{
 		groupStore:    groupStore,

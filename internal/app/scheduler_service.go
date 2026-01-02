@@ -7,25 +7,25 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/config"
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/ledger"
 	"github.com/dokzlo13/lightd/internal/scheduler"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // SchedulerService wraps the scheduler and related periodic tasks.
 type SchedulerService struct {
 	cfg       *config.Config
 	Scheduler *scheduler.Scheduler
-	ledger    *ledger.Ledger
+	ledger    *storage.Ledger
 	enabled   bool
 }
 
 // NewSchedulerService creates a new SchedulerService.
 func NewSchedulerService(
 	cfg *config.Config,
-	bus *eventbus.Bus,
-	l *ledger.Ledger,
+	bus *events.Bus,
+	l *storage.Ledger,
 	geoCalc *geo.Calculator,
 ) *SchedulerService {
 	enabled := cfg.Events.Scheduler.IsEnabled()
@@ -35,10 +35,10 @@ func NewSchedulerService(
 	if enabled {
 		if geoCfg.IsEnabled() {
 			// Full scheduler with astronomical time support
-			sched = scheduler.New(bus, l, geoCalc, geoCfg.Name, geoCfg.Timezone)
+			sched = scheduler.New(bus, l, geoCalc, geoCfg.Name, geoCfg.GetTimezone())
 		} else {
 			// Fixed-time only scheduler (no geo required)
-			sched = scheduler.NewWithFixedTimeOnly(bus, l, geoCfg.Timezone)
+			sched = scheduler.NewWithFixedTimeOnly(bus, l, geoCfg.GetTimezone())
 			log.Info().Msg("Scheduler geo is disabled - astronomical times (@dawn, @noon, @sunset, etc.) are not available")
 		}
 	}
@@ -81,8 +81,8 @@ func (s *SchedulerService) Start(ctx context.Context) {
 
 // runLedgerCleanup periodically cleans up old ledger entries.
 func (s *SchedulerService) runLedgerCleanup(ctx context.Context) {
-	retention := s.cfg.Ledger.RetentionPeriod.Duration()
-	interval := s.cfg.Ledger.RetentionInterval.Duration()
+	retention := s.cfg.Ledger.GetRetentionPeriod()
+	interval := s.cfg.Ledger.GetRetentionInterval()
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

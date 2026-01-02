@@ -3,7 +3,7 @@ package context
 import (
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
 )
 
 const groupBuilderTypeName = "desired.group"

@@ -16,11 +16,13 @@ database:
 
 log:
   level: "${LOG_LEVEL:info}"
-  colors: ${LOG_COLORS:false}
+  use_json: ${LOG_JSON:true}    # JSON output by default in docker
+  colors: ${LOG_COLORS:false}   # ignored when use_json is true
 
 reconciler:
   enabled: ${RECONCILER_ENABLED:true}
-  periodic_interval: "${RECONCILER_INTERVAL:5m}"
+  periodic_interval: "${RECONCILER_INTERVAL:0}"   # 0 = disabled (default)
+  debounce_ms: ${RECONCILER_DEBOUNCE_MS:0}        # 0 = immediate
   rate_limit_rps: ${RECONCILER_RATE_LIMIT:10.0}
 
 ledger:
@@ -36,6 +38,9 @@ healthcheck:  # healthcheck is enabled by default and used for docker health che
 eventbus:
   workers: ${EVENTBUS_WORKERS:4}
   queue_size: ${EVENTBUS_QUEUE_SIZE:100}
+
+kv:
+  cleanup_interval: "${KV_CLEANUP_INTERVAL:5m}"
 
 shutdown_timeout: "${SHUTDOWN_TIMEOUT:5s}"
 

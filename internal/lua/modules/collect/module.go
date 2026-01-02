@@ -3,7 +3,7 @@ package collect
 import (
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/middleware"
+	"github.com/dokzlo13/lightd/internal/events/middleware"
 )
 
 const collectorTypeName = "Collector"

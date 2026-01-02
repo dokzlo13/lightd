@@ -29,10 +29,6 @@ type Client struct {
 // V2 client uses the custom HTTP client with TLS verification disabled
 // (required for Hue bridge's self-signed certificates).
 func NewClient(address, token string, timeout time.Duration) *Client {
-	if timeout == 0 {
-		timeout = 30 * time.Second
-	}
-
 	// Create HTTP client for V2 with TLS verification disabled
 	// (Hue bridge uses self-signed certificates)
 	transport := &http.Transport{

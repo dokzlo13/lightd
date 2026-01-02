@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // Default HTTP client (timeout set per-request via context)
@@ -36,7 +38,7 @@ type Calculator struct {
 	locationCache map[string]*Location
 
 	// Persistent geocache (optional, backed by SQLite)
-	persistentCache *Cache
+	persistentCache *storage.GeoCache
 
 	// Pre-configured location (optional, avoids geocoding)
 	defaultLocation *Location
@@ -62,10 +64,7 @@ func NewCalculator() *Calculator {
 }
 
 // NewCalculatorWithCache creates a calculator with persistent geocache
-func NewCalculatorWithCache(httpTimeout time.Duration, persistentCache *Cache) *Calculator {
-	if httpTimeout == 0 {
-		httpTimeout = 10 * time.Second
-	}
+func NewCalculatorWithCache(httpTimeout time.Duration, persistentCache *storage.GeoCache) *Calculator {
 	return &Calculator{
 		cache:           make(map[string]*AstroTimes),
 		locationCache:   make(map[string]*Location),
@@ -98,11 +97,7 @@ func NewCalculatorWithLocation(name string, lat, lon float64, timezone string) *
 }
 
 // NewCalculatorWithLocationAndCache creates a calculator with both pre-configured coordinates and persistent cache
-func NewCalculatorWithLocationAndCache(name string, lat, lon float64, timezone string, httpTimeout time.Duration, persistentCache *Cache) *Calculator {
-	if httpTimeout == 0 {
-		httpTimeout = 10 * time.Second
-	}
-
+func NewCalculatorWithLocationAndCache(name string, lat, lon float64, timezone string, httpTimeout time.Duration, persistentCache *storage.GeoCache) *Calculator {
 	loc := &Location{
 		Name:      name,
 		Latitude:  lat,
@@ -178,7 +173,12 @@ func (c *Calculator) getLocation(name string) (*Location, error) {
 
 	// 3. Check persistent cache (SQLite)
 	if c.persistentCache != nil {
-		if loc, found := c.persistentCache.Get(name); found {
+		if cachedLoc, found := c.persistentCache.Get(name); found {
+			loc := &Location{
+				Name:      cachedLoc.Name,
+				Latitude:  cachedLoc.Latitude,
+				Longitude: cachedLoc.Longitude,
+			}
 			// Also populate in-memory cache
 			c.mu.Lock()
 			c.locationCache[name] = loc
@@ -200,7 +200,11 @@ func (c *Calculator) getLocation(name string) (*Location, error) {
 
 	// Store in persistent cache for future runs
 	if c.persistentCache != nil {
-		c.persistentCache.Put(name, loc)
+		c.persistentCache.Put(name, &storage.CachedLocation{
+			Name:      loc.Name,
+			Latitude:  loc.Latitude,
+			Longitude: loc.Longitude,
+		})
 	}
 
 	return loc, nil
@@ -208,11 +212,7 @@ func (c *Calculator) getLocation(name string) (*Location, error) {
 
 // geocode performs geocoding via Nominatim with proper timeout
 func (c *Calculator) geocode(name string) (*Location, error) {
-	timeout := c.httpTimeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), c.httpTimeout)
 	defer cancel()
 
 	apiURL := fmt.Sprintf("https://nominatim.openstreetmap.org/search?q=%s&format=json&limit=1",

@@ -6,18 +6,18 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/ledger"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // Invoker executes actions with deduplication
 type Invoker struct {
 	registry   *Registry
-	ledger     *ledger.Ledger
+	ledger     *storage.Ledger
 	ctxFactory func(ctx context.Context) *Context
 }
 
 // NewInvoker creates a new action invoker
-func NewInvoker(registry *Registry, l *ledger.Ledger, ctxFactory func(ctx context.Context) *Context) *Invoker {
+func NewInvoker(registry *Registry, l *storage.Ledger, ctxFactory func(ctx context.Context) *Context) *Invoker {
 	return &Invoker{
 		registry:   registry,
 		ledger:     l,
@@ -75,7 +75,7 @@ func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string
 	// Log completion or failure
 	if err != nil {
 		if idempotencyKey != "" {
-			i.appendLedger(ledger.EventActionFailed, idempotencyKey, source, defID, map[string]any{
+			i.appendLedger(storage.EventActionFailed, idempotencyKey, source, defID, map[string]any{
 				"action": actionName,
 				"error":  err.Error(),
 			})
@@ -84,7 +84,7 @@ func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string
 	}
 
 	if idempotencyKey != "" {
-		i.appendLedger(ledger.EventActionCompleted, idempotencyKey, source, defID, map[string]any{
+		i.appendLedger(storage.EventActionCompleted, idempotencyKey, source, defID, map[string]any{
 			"action": actionName,
 		})
 	}
@@ -93,7 +93,7 @@ func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string
 }
 
 // appendLedger appends to ledger, using source/defID if provided
-func (i *Invoker) appendLedger(eventType ledger.EventType, idempotencyKey, source, defID string, payload map[string]any) error {
+func (i *Invoker) appendLedger(eventType storage.EventType, idempotencyKey, source, defID string, payload map[string]any) error {
 	if source != "" || defID != "" {
 		return i.ledger.AppendWithSource(eventType, idempotencyKey, source, defID, payload)
 	}

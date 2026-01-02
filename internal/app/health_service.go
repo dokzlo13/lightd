@@ -33,7 +33,7 @@ func (s *HealthService) Start(ctx context.Context) {
 }
 
 func (s *HealthService) run(ctx context.Context) {
-	addr := fmt.Sprintf("%s:%d", s.cfg.Healthcheck.Host, s.cfg.Healthcheck.Port)
+	addr := fmt.Sprintf("%s:%d", s.cfg.Healthcheck.GetHost(), s.cfg.Healthcheck.GetPort())
 
 	mux := http.NewServeMux()
 
@@ -60,7 +60,7 @@ func (s *HealthService) run(ctx context.Context) {
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.Duration())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.GetShutdownTimeout())
 		defer cancel()
 		if err := s.server.Shutdown(shutdownCtx); err != nil {
 			log.Error().Err(err).Msg("Health check server shutdown error")
@@ -71,4 +71,3 @@ func (s *HealthService) run(ctx context.Context) {
 		log.Error().Err(err).Msg("Health check server error")
 	}
 }
-

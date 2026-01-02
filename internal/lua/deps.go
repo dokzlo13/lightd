@@ -4,13 +4,12 @@ import (
 	"github.com/amimof/huego"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/kv"
-	"github.com/dokzlo13/lightd/internal/reconcile"
+	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile"
 	"github.com/dokzlo13/lightd/internal/scheduler"
-	"github.com/dokzlo13/lightd/internal/stores"
+	"github.com/dokzlo13/lightd/internal/storage/kv"
 )
 
 // RuntimeDeps groups all dependencies needed by Lua runtime.
@@ -21,8 +20,8 @@ type RuntimeDeps struct {
 	Invoker      *actions.Invoker
 	Scheduler    *scheduler.Scheduler
 	Bridge       *huego.Bridge
-	SceneIndex   *cache.SceneIndex
-	Stores       *stores.Registry
+	SceneIndex   *hue.SceneIndex
+	Stores       *hue.StoreRegistry
 	Orchestrator *reconcile.Orchestrator
 	GeoCalc      *geo.Calculator
 	KVManager    *kv.Manager

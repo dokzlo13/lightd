@@ -6,9 +6,8 @@ import (
 	luastate "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/config"
-	"github.com/dokzlo13/lightd/internal/events/sse"
-	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/lua"
+	"github.com/dokzlo13/lightd/internal/lua/modules"
 )
 
 // LuaService wraps the Lua runtime and provides thread-safe execution.
@@ -30,7 +29,7 @@ func NewLuaService(deps lua.RuntimeDeps) (*LuaService, error) {
 // LoadScript loads and executes the Lua script.
 // Must be called before Start().
 func (s *LuaService) LoadScript() error {
-	if err := s.Runtime.LoadScript(s.cfg.Script); err != nil {
+	if err := s.Runtime.LoadScript(s.cfg.GetScript()); err != nil {
 		return err
 	}
 	return nil
@@ -43,12 +42,12 @@ func (s *LuaService) Start(ctx context.Context) {
 }
 
 // GetSSEModule returns the SSE module for handler registration.
-func (s *LuaService) GetSSEModule() *sse.Module {
+func (s *LuaService) GetSSEModule() *modules.SSEModule {
 	return s.Runtime.GetSSEModule()
 }
 
 // GetWebhookModule returns the webhook module for handler registration.
-func (s *LuaService) GetWebhookModule() *webhook.Module {
+func (s *LuaService) GetWebhookModule() *modules.WebhookModule {
 	return s.Runtime.GetWebhookModule()
 }
 

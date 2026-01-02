@@ -8,10 +8,10 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
+	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
 	luactx "github.com/dokzlo13/lightd/internal/lua/context"
-	"github.com/dokzlo13/lightd/internal/reconcile"
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
-	"github.com/dokzlo13/lightd/internal/stores"
 )
 
 // actionContext holds common dependencies for Lua actions.
@@ -47,7 +47,7 @@ type ActionModule struct {
 func NewActionModule(
 	registry *actions.Registry,
 	bridge *huego.Bridge,
-	storeRegistry *stores.Registry,
+	storeRegistry *hue.StoreRegistry,
 	orchestrator *reconcile.Orchestrator,
 ) *ActionModule {
 	// Create the GroupActualProvider for actual state access

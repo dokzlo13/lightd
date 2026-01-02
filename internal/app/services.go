@@ -2,19 +2,18 @@ package app
 
 import (
 	"context"
-	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
-	"github.com/dokzlo13/lightd/internal/db"
 	"github.com/dokzlo13/lightd/internal/events/schedule"
+	"github.com/dokzlo13/lightd/internal/events/sse"
+	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/kv"
-	"github.com/dokzlo13/lightd/internal/ledger"
 	"github.com/dokzlo13/lightd/internal/lua"
-	"github.com/dokzlo13/lightd/internal/state"
+	"github.com/dokzlo13/lightd/internal/storage"
+	"github.com/dokzlo13/lightd/internal/storage/kv"
 )
 
 // Services is a container for all application services.
@@ -23,11 +22,11 @@ type Services struct {
 	cfg *config.Config
 
 	// Core infrastructure
-	DB     *db.DB
-	Ledger *ledger.Ledger
+	DB     *storage.DB
+	Ledger *storage.Ledger
 
 	// State store (generic JSON store)
-	Store   *state.Store
+	Store   *storage.Store
 	GeoCalc *geo.Calculator
 
 	// KV storage
@@ -50,33 +49,33 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	s := &Services{cfg: cfg}
 
 	// Initialize database
-	database, err := db.Open(cfg.Database.Path)
+	database, err := storage.Open(cfg.Database.GetPath())
 	if err != nil {
 		return nil, err
 	}
 	s.DB = database
 
 	// Initialize ledger
-	s.Ledger = ledger.New(database.DB)
+	s.Ledger = storage.NewLedger(database.DB)
 
 	// Initialize generic state store
-	s.Store = state.NewStore(database.DB)
+	s.Store = storage.NewStore(database.DB)
 
 	// Initialize geo calculator (config is under events.scheduler.geo)
 	geoCfg := cfg.Events.Scheduler.Geo
-	geoCache := geo.NewCache(database.DB)
+	geoCache := storage.NewGeoCache(database.DB)
 	if geoCfg.Lat != 0 || geoCfg.Lon != 0 {
 		s.GeoCalc = geo.NewCalculatorWithLocationAndCache(
 			geoCfg.Name,
 			geoCfg.Lat,
 			geoCfg.Lon,
-			geoCfg.Timezone,
-			geoCfg.HTTPTimeout.Duration(),
+			geoCfg.GetTimezone(),
+			geoCfg.GetHTTPTimeout(),
 			geoCache,
 		)
 	} else {
 		log.Warn().Msg("No lat/lon configured, will use Nominatim geocoding (cached in SQLite)")
-		s.GeoCalc = geo.NewCalculatorWithCache(geoCfg.HTTPTimeout.Duration(), geoCache)
+		s.GeoCalc = geo.NewCalculatorWithCache(geoCfg.GetHTTPTimeout(), geoCache)
 	}
 
 	// Initialize action registry
@@ -122,6 +121,7 @@ func NewServices(cfg *config.Config) (*Services, error) {
 		GeoCalc:      s.GeoCalc,
 		KVManager:    s.KV,
 	}
+
 	s.Lua, err = NewLuaService(luaDeps)
 	if err != nil {
 		s.Close()
@@ -153,12 +153,13 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	// Register event handlers from modules (after Lua script is loaded)
 	// SSE handlers (button, rotary, connectivity from Hue event stream)
 	if s.cfg.Events.SSE.IsEnabled() {
-		s.Lua.GetSSEModule().RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua, s.Hue.Stores.Groups())
+		sseModule := s.Lua.GetSSEModule()
+		sse.RegisterHandlers(ctx, sseModule, s.Hue.Bus, s.Invoker, s.Lua)
 	}
 	// Webhook handlers (HTTP webhook events)
 	if s.cfg.Events.Webhook.Enabled {
 		webhookModule := s.Lua.GetWebhookModule()
-		webhookModule.RegisterHandlers(ctx, s.Hue.Bus, s.Invoker, s.Lua)
+		webhook.RegisterHandlers(ctx, webhookModule, s.Hue.Bus, s.Invoker, s.Lua)
 		// Set path matcher for HTTP request validation
 		s.Webhook.SetPathMatcher(webhookModule)
 	}
@@ -174,8 +175,8 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	s.Health.Start(ctx)
 	s.Webhook.Start(ctx)
 
-	// Start KV cleanup goroutine (cleans expired entries every 5 minutes)
-	s.KV.StartCleanup(ctx, 5*time.Minute)
+	// Start KV cleanup goroutine
+	s.KV.StartCleanup(ctx, s.cfg.KV.GetCleanupInterval())
 
 	return nil
 }

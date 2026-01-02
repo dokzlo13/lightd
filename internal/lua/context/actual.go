@@ -4,7 +4,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
 )
 
 // ActualModule provides ctx.actual for accessing current Hue state.
@@ -46,8 +46,7 @@ func (m *ActualModule) Install(L *lua.LState, ctx *lua.LTable) {
 	L.SetField(ctx, m.Name(), actual)
 }
 
-// group is a Lua function that fetches fresh group state.
-// Always fetches from bridge (not cache) to ensure fresh data for decisions.
+// group is a Lua function that fetches fresh group state from the bridge.
 // Uses L.Context() for cancellation support.
 func (m *ActualModule) group(L *lua.LState) int {
 	L.CheckTable(1) // self
@@ -68,7 +67,6 @@ func (m *ActualModule) group(L *lua.LState) int {
 	tbl := L.NewTable()
 	L.SetField(tbl, "all_on", lua.LBool(state.AllOn))
 	L.SetField(tbl, "any_on", lua.LBool(state.AnyOn))
-	L.SetField(tbl, "last_applied_scene", lua.LString(state.LastAppliedScene))
 	L.Push(tbl)
 	L.Push(lua.LNil) // no error
 	return 2

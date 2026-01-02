@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/cache"
+	"github.com/dokzlo13/lightd/internal/hue"
 )
 
 const groupTypeName = "hue.group"
@@ -15,7 +15,7 @@ const groupTypeName = "hue.group"
 // GroupUserdata wraps a huego.Group for Lua access
 type GroupUserdata struct {
 	group      *huego.Group
-	sceneIndex *cache.SceneIndex
+	sceneIndex *hue.SceneIndex
 }
 
 // RegisterGroupType registers the hue.group metatable
@@ -47,7 +47,7 @@ var groupMethods = map[string]lua.LGFunction{
 }
 
 // pushGroup creates a new Group userdata and pushes it onto the stack
-func pushGroup(L *lua.LState, group *huego.Group, sceneIndex *cache.SceneIndex) {
+func pushGroup(L *lua.LState, group *huego.Group, sceneIndex *hue.SceneIndex) {
 	ud := L.NewUserData()
 	ud.Value = &GroupUserdata{group: group, sceneIndex: sceneIndex}
 	L.SetMetatable(ud, L.GetTypeMetatable(groupTypeName))

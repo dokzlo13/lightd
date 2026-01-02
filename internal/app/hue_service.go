@@ -6,16 +6,14 @@ import (
 
 	"github.com/rs/zerolog/log"
 
-	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
-	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
+	"github.com/dokzlo13/lightd/internal/hue/reconcile/light"
 	v2 "github.com/dokzlo13/lightd/internal/hue/v2"
-	"github.com/dokzlo13/lightd/internal/reconcile"
-	"github.com/dokzlo13/lightd/internal/reconcile/group"
-	"github.com/dokzlo13/lightd/internal/reconcile/light"
-	"github.com/dokzlo13/lightd/internal/state"
-	"github.com/dokzlo13/lightd/internal/stores"
+	"github.com/dokzlo13/lightd/internal/storage"
 )
 
 // HueService wraps all Hue-related components: client, cache, event stream, and orchestrator.
@@ -23,11 +21,11 @@ type HueService struct {
 	cfg *config.Config
 
 	Client       *hue.Client
-	SceneIndex   *cache.SceneIndex
+	SceneIndex   *hue.SceneIndex
 	EventStream  *v2.EventStream
 	Orchestrator *reconcile.Orchestrator
-	Bus          *eventbus.Bus
-	Stores       *stores.Registry
+	Bus          *events.Bus
+	Stores       *hue.StoreRegistry
 
 	// Resource providers
 	GroupProvider *group.Provider
@@ -35,15 +33,15 @@ type HueService struct {
 }
 
 // NewHueService creates a new HueService with all components initialized but not connected.
-func NewHueService(cfg *config.Config, db *sql.DB, store *state.Store) (*HueService, error) {
+func NewHueService(cfg *config.Config, db *sql.DB, store *storage.Store) (*HueService, error) {
 	// Initialize Hue client (holder for V1/V2 clients with shared HTTP config)
-	client := hue.NewClient(cfg.Hue.Bridge, cfg.Hue.Token, cfg.Hue.Timeout.Duration())
+	client := hue.NewClient(cfg.Hue.Bridge, cfg.Hue.Token, cfg.Hue.GetTimeout())
 
 	// Initialize scene index (pure index, caller loads data)
-	sceneIndex := cache.NewSceneIndex()
+	sceneIndex := hue.NewSceneIndex()
 
 	// Create store registry (centralized typed stores)
-	storeRegistry := stores.NewRegistry(store)
+	storeRegistry := hue.NewStoreRegistry(store)
 
 	// Create actual state providers (no caching - always fetch from bridge)
 	groupActualProvider := group.NewActualProvider(client.V1())
@@ -59,21 +57,22 @@ func NewHueService(cfg *config.Config, db *sql.DB, store *state.Store) (*HueServ
 
 	// Initialize orchestrator
 	orchestrator := reconcile.NewOrchestrator(
-		cfg.Reconciler.PeriodicInterval.Duration(),
-		cfg.Reconciler.RateLimitRPS,
+		cfg.Reconciler.GetPeriodicInterval(),
+		cfg.Reconciler.GetDebounceMs(),
+		cfg.Reconciler.GetRateLimitRPS(),
 	)
 	orchestrator.Register(groupProvider)
 	orchestrator.Register(lightProvider)
 
 	// Initialize event bus
-	bus := eventbus.NewWithConfig(cfg.EventBus.GetWorkers(), cfg.EventBus.GetQueueSize())
+	bus := events.NewBusWithConfig(cfg.EventBus.GetWorkers(), cfg.EventBus.GetQueueSize())
 
 	// Initialize event stream with V2 client and retry configuration (from events.sse)
 	eventStreamConfig := v2.EventStreamConfig{
-		MinBackoff:    cfg.Events.SSE.MinRetryBackoff.Duration(),
-		MaxBackoff:    cfg.Events.SSE.MaxRetryBackoff.Duration(),
-		Multiplier:    cfg.Events.SSE.RetryMultiplier,
-		MaxReconnects: cfg.Events.SSE.MaxReconnects,
+		MinBackoff:    cfg.Events.SSE.GetMinRetryBackoff(),
+		MaxBackoff:    cfg.Events.SSE.GetMaxRetryBackoff(),
+		Multiplier:    cfg.Events.SSE.GetRetryMultiplier(),
+		MaxReconnects: cfg.Events.SSE.GetMaxReconnects(),
 	}
 	eventStream := v2.NewEventStreamWithConfig(client.V2(), eventStreamConfig)
 
@@ -141,7 +140,7 @@ func (s *HueService) StartBackground(ctx context.Context, onFatalError func(erro
 // Close releases all resources.
 func (s *HueService) Close() {
 	if s.Bus != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout.Duration())
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.GetShutdownTimeout())
 		defer cancel()
 		s.Bus.Close(ctx)
 	}
