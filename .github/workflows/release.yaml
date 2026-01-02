@@ -23,29 +23,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux AMD64
+          # Linux AMD64 - servers, desktops
           - os: linux
             arch: amd64
             runner: ubuntu-latest
             ext: ""
             cc: gcc
-          # Linux ARM64
+          # Linux ARM64 - Raspberry Pi, ARM servers
           - os: linux
             arch: arm64
             runner: ubuntu-latest
             ext: ""
             cc: aarch64-linux-gnu-gcc
             cross: true
-          # macOS AMD64
-          - os: darwin
-            arch: amd64
-            runner: macos-13
-            ext: ""
-            cc: clang
-          # macOS ARM64 (Apple Silicon)
+          # macOS ARM64 (Apple Silicon M1/M2/M3/M4)
           - os: darwin
             arch: arm64
-            runner: macos-14
+            runner: macos-latest
             ext: ""
             cc: clang
           # Windows AMD64
@@ -178,7 +172,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
