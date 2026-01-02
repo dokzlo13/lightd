@@ -6,31 +6,34 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/lua/modules"
+	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
 )
 
 // ButtonHandler is called when a button event occurs
 type ButtonHandler struct {
-	ResourceID   string
-	ButtonAction string
-	ActionName   string
-	ActionArgs   map[string]any
-	IsToggle     bool // For button_toggle, special handling
+	ResourceID       string
+	ButtonAction     string
+	ActionName       string
+	ActionArgs       map[string]any
+	IsToggle         bool                      // For button_toggle, special handling
+	CollectorFactory *collect.CollectorFactory // nil = immediate
 }
 
 // ConnectivityHandler is called when connectivity changes
 type ConnectivityHandler struct {
-	DeviceID   string
-	Status     string
-	ActionName string
-	ActionArgs map[string]any
+	DeviceID         string
+	Status           string
+	ActionName       string
+	ActionArgs       map[string]any
+	CollectorFactory *collect.CollectorFactory // nil = immediate
 }
 
 // RotaryHandler is called when a rotary event occurs
 type RotaryHandler struct {
-	ResourceID string
-	ActionName string
-	ActionArgs map[string]any
-	DebounceMs int // Debounce time in milliseconds (default: 50)
+	ResourceID       string
+	ActionName       string
+	ActionArgs       map[string]any
+	CollectorFactory *collect.CollectorFactory // nil = immediate
 }
 
 // Module provides events.sse Lua module for SSE event handlers
@@ -126,8 +129,8 @@ func (m *Module) connectivity(L *lua.LState) int {
 }
 
 // rotary(resource_id, action_name, args) - Register a rotary handler
-// The action will receive direction, steps, and duration in args
-// Optional args.debounce_ms sets the debounce time (default: 50ms)
+// The action will receive direction and steps in args
+// Optional args.middleware sets the collector middleware
 func (m *Module) rotary(L *lua.LState) int {
 	resourceID := L.CheckString(1)
 	actionName := L.CheckString(2)
@@ -135,20 +138,18 @@ func (m *Module) rotary(L *lua.LState) int {
 
 	args := modules.LuaTableToMap(argsTable)
 
-	// Extract debounce_ms from args (default: 50)
-	debounceMs := 50
-	if v, ok := args["debounce_ms"]; ok {
-		if f, ok := v.(float64); ok {
-			debounceMs = int(f)
-		}
-		delete(args, "debounce_ms") // Don't pass to action
+	// Extract collector factory from middleware field
+	var factory *collect.CollectorFactory
+	if mw := argsTable.RawGetString("middleware"); mw != lua.LNil {
+		factory = collect.ExtractFactory(mw)
+		delete(args, "middleware")
 	}
 
 	m.rotaryHandlers = append(m.rotaryHandlers, RotaryHandler{
-		ResourceID: resourceID,
-		ActionName: actionName,
-		ActionArgs: args,
-		DebounceMs: debounceMs,
+		ResourceID:       resourceID,
+		ActionName:       actionName,
+		ActionArgs:       args,
+		CollectorFactory: factory,
 	})
 
 	return 0

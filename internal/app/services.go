@@ -13,6 +13,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/geo"
 	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/ledger"
+	"github.com/dokzlo13/lightd/internal/lua"
 	"github.com/dokzlo13/lightd/internal/state"
 )
 
@@ -109,7 +110,19 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	s.KV = kv.NewManager(database.DB)
 
 	// Initialize Lua service
-	s.Lua, err = NewLuaService(cfg, s.Registry, s.Invoker, s.Scheduler.Scheduler, s.Hue.Client.V1(), s.Hue.SceneIndex, s.Hue.Stores, s.Hue.Orchestrator, s.GeoCalc, s.KV)
+	luaDeps := lua.RuntimeDeps{
+		Config:       cfg,
+		Registry:     s.Registry,
+		Invoker:      s.Invoker,
+		Scheduler:    s.Scheduler.Scheduler,
+		Bridge:       s.Hue.Client.V1(),
+		SceneIndex:   s.Hue.SceneIndex,
+		Stores:       s.Hue.Stores,
+		Orchestrator: s.Hue.Orchestrator,
+		GeoCalc:      s.GeoCalc,
+		KVManager:    s.KV,
+	}
+	s.Lua, err = NewLuaService(luaDeps)
 	if err != nil {
 		s.Close()
 		return nil, err

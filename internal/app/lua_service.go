@@ -3,19 +3,12 @@ package app
 import (
 	"context"
 
-	"github.com/amimof/huego"
+	luastate "github.com/yuin/gopher-lua"
 
-	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/cache"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
-	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/lua"
-	"github.com/dokzlo13/lightd/internal/reconcile"
-	"github.com/dokzlo13/lightd/internal/scheduler"
-	"github.com/dokzlo13/lightd/internal/stores"
 )
 
 // LuaService wraps the Lua runtime and provides thread-safe execution.
@@ -25,22 +18,11 @@ type LuaService struct {
 }
 
 // NewLuaService creates a new LuaService.
-func NewLuaService(
-	cfg *config.Config,
-	registry *actions.Registry,
-	invoker *actions.Invoker,
-	sched *scheduler.Scheduler,
-	bridge *huego.Bridge,
-	sceneIndex *cache.SceneIndex,
-	storeRegistry *stores.Registry,
-	orchestrator *reconcile.Orchestrator,
-	geoCalc *geo.Calculator,
-	kvManager *kv.Manager,
-) (*LuaService, error) {
-	runtime := lua.NewRuntime(cfg, registry, invoker, sched, bridge, sceneIndex, storeRegistry, orchestrator, geoCalc, kvManager)
+func NewLuaService(deps lua.RuntimeDeps) (*LuaService, error) {
+	runtime := lua.NewRuntime(deps)
 
 	return &LuaService{
-		cfg:     cfg,
+		cfg:     deps.Config,
 		Runtime: runtime,
 	}, nil
 }
@@ -81,4 +63,9 @@ func (s *LuaService) Close() {
 	if s.Runtime != nil {
 		s.Runtime.Close()
 	}
+}
+
+// LState returns the underlying Lua state for module operations.
+func (s *LuaService) LState() *luastate.LState {
+	return s.Runtime.L
 }

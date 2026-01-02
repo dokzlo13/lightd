@@ -8,14 +8,16 @@ import (
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/lua/modules"
+	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
 )
 
 // Handler is called when a webhook event matches
 type Handler struct {
-	Method     string
-	Path       string
-	ActionName string
-	ActionArgs map[string]any
+	Method           string
+	Path             string
+	ActionName       string
+	ActionArgs       map[string]any
+	CollectorFactory *collect.CollectorFactory // nil = immediate
 }
 
 // Module provides events.webhook Lua module for webhook handlers
@@ -55,11 +57,19 @@ func (m *Module) define(L *lua.LState) int {
 
 	args := modules.LuaTableToMap(argsTable)
 
+	// Extract collector factory from middleware field
+	var factory *collect.CollectorFactory
+	if mw := argsTable.RawGetString("middleware"); mw != lua.LNil {
+		factory = collect.ExtractFactory(mw)
+		delete(args, "middleware")
+	}
+
 	m.handlers = append(m.handlers, Handler{
-		Method:     method,
-		Path:       path,
-		ActionName: actionName,
-		ActionArgs: args,
+		Method:           method,
+		Path:             path,
+		ActionName:       actionName,
+		ActionArgs:       args,
+		CollectorFactory: factory,
 	})
 
 	log.Info().

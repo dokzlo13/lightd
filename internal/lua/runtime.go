@@ -7,21 +7,14 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/amimof/huego"
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
 	"github.com/dokzlo13/lightd/internal/actions"
-	"github.com/dokzlo13/lightd/internal/cache"
-	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/events/webhook"
-	"github.com/dokzlo13/lightd/internal/geo"
-	"github.com/dokzlo13/lightd/internal/kv"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
-	"github.com/dokzlo13/lightd/internal/reconcile"
-	"github.com/dokzlo13/lightd/internal/scheduler"
-	"github.com/dokzlo13/lightd/internal/stores"
+	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
 )
 
 // ErrRuntimeClosed is returned when the Lua runtime is closed
@@ -33,17 +26,8 @@ type LuaWork func(ctx context.Context)
 
 // Runtime manages the Lua VM with single-threaded execution
 type Runtime struct {
-	L            *lua.LState
-	config       *config.Config
-	registry     *actions.Registry
-	invoker      *actions.Invoker
-	scheduler    *scheduler.Scheduler
-	bridge       *huego.Bridge
-	sceneIndex   *cache.SceneIndex
-	stores       *stores.Registry
-	orchestrator *reconcile.Orchestrator
-	geoCalc      *geo.Calculator
-	kvManager    *kv.Manager
+	L    *lua.LState
+	deps RuntimeDeps
 
 	// Modules
 	actionModule  *modules.ActionModule
@@ -63,34 +47,14 @@ type Runtime struct {
 }
 
 // NewRuntime creates a new Lua runtime
-func NewRuntime(
-	cfg *config.Config,
-	registry *actions.Registry,
-	invoker *actions.Invoker,
-	sched *scheduler.Scheduler,
-	bridge *huego.Bridge,
-	sceneIndex *cache.SceneIndex,
-	storeRegistry *stores.Registry,
-	orchestrator *reconcile.Orchestrator,
-	geoCalc *geo.Calculator,
-	kvManager *kv.Manager,
-) *Runtime {
+func NewRuntime(deps RuntimeDeps) *Runtime {
 	L := lua.NewState()
 
 	r := &Runtime{
-		L:            L,
-		config:       cfg,
-		registry:     registry,
-		invoker:      invoker,
-		scheduler:    sched,
-		bridge:       bridge,
-		sceneIndex:   sceneIndex,
-		stores:       storeRegistry,
-		orchestrator: orchestrator,
-		geoCalc:      geoCalc,
-		kvManager:    kvManager,
-		workQueue:    make(chan LuaWork, 100),
-		closing:      make(chan struct{}),
+		L:         L,
+		deps:      deps,
+		workQueue: make(chan LuaWork, 100),
+		closing:   make(chan struct{}),
 	}
 
 	r.registerModules()
@@ -180,33 +144,37 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("log", logModule.Loader)
 
 	// Geo module (uses shared calculator to avoid duplicate geocoding)
-	geoCfg := r.config.Events.Scheduler.Geo
-	geoModule := modules.NewGeoModule(geoCfg.Name, geoCfg.Timezone, r.geoCalc)
+	geoCfg := r.deps.Config.Events.Scheduler.Geo
+	geoModule := modules.NewGeoModule(geoCfg.Name, geoCfg.Timezone, r.deps.GeoCalc)
 	r.L.PreloadModule("geo", geoModule.Loader)
 
 	// Action module
-	r.actionModule = modules.NewActionModule(r.registry, r.bridge, r.stores, r.orchestrator)
+	r.actionModule = modules.NewActionModule(r.deps.Registry, r.deps.Bridge, r.deps.Stores, r.deps.Orchestrator)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Sched module
-	r.schedModule = modules.NewSchedModule(r.scheduler, r.config.Events.Scheduler.IsEnabled())
+	r.schedModule = modules.NewSchedModule(r.deps.Scheduler, r.deps.Config.Events.Scheduler.IsEnabled())
 	r.L.PreloadModule("sched", r.schedModule.Loader)
 
 	// Hue module
-	r.hueModule = modules.NewHueModule(r.bridge, r.sceneIndex)
+	r.hueModule = modules.NewHueModule(r.deps.Bridge, r.deps.SceneIndex)
 	r.L.PreloadModule("hue", r.hueModule.Loader)
 
 	// KV module (persistent key-value storage)
-	r.kvModule = modules.NewKVModule(r.kvManager)
+	r.kvModule = modules.NewKVModule(r.deps.KVManager)
 	r.L.PreloadModule("kv", r.kvModule.Loader)
+
+	// Collect module (event collectors for middleware)
+	collectModule := collect.NewModule()
+	r.L.PreloadModule("collect", collectModule.Loader)
 
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)
-	r.sseModule = sse.NewModule(r.config.Events.SSE.IsEnabled())
+	r.sseModule = sse.NewModule(r.deps.Config.Events.SSE.IsEnabled())
 	r.L.PreloadModule("events.sse", r.sseModule.Loader)
 
 	// Webhook module (HTTP webhook events)
-	r.webhookModule = webhook.NewModule(r.config.Events.Webhook.Enabled)
+	r.webhookModule = webhook.NewModule(r.deps.Config.Events.Webhook.Enabled)
 	r.L.PreloadModule("events.webhook", r.webhookModule.Loader)
 }
 
@@ -259,7 +227,7 @@ func (r *Runtime) LoadScript(path string) error {
 	// Resolve path relative to config file
 	if !filepath.IsAbs(path) {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			configDir := filepath.Dir(r.config.Script)
+			configDir := filepath.Dir(r.deps.Config.Script)
 			path = filepath.Join(configDir, path)
 		}
 	}
@@ -286,5 +254,5 @@ func (r *Runtime) GetWebhookModule() *webhook.Module {
 
 // Invoker returns the action invoker
 func (r *Runtime) Invoker() *actions.Invoker {
-	return r.invoker
+	return r.deps.Invoker
 }

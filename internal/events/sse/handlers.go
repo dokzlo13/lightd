@@ -3,33 +3,23 @@ package sse
 import (
 	"context"
 	"sync"
-	"time"
 
 	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/luaexec"
+	"github.com/dokzlo13/lightd/internal/middleware"
 	"github.com/dokzlo13/lightd/internal/reconcile/group"
 	"github.com/dokzlo13/lightd/internal/state"
 )
-
-// Rotary direction constants
-const (
-	RotaryDirectionClockwise        = "clock_wise"
-	RotaryDirectionCounterClockwise = "counter_clock_wise"
-)
-
-// LuaExecutor provides thread-safe Lua execution
-type LuaExecutor interface {
-	Do(ctx context.Context, work func(ctx context.Context)) bool
-}
 
 // RegisterHandlers subscribes to SSE events on the event bus and dispatches to handlers
 func (m *Module) RegisterHandlers(
 	ctx context.Context,
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
-	luaExec LuaExecutor,
+	luaExec luaexec.Executor,
 	desiredStore *state.TypedStore[group.Desired],
 ) {
 	m.registerButtonHandler(ctx, bus, invoker, luaExec, desiredStore)
@@ -42,9 +32,12 @@ func (m *Module) registerButtonHandler(
 	ctx context.Context,
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
-	luaExec LuaExecutor,
+	luaExec luaexec.Executor,
 	desiredStore *state.TypedStore[group.Desired],
 ) {
+	collectors := make(map[string]middleware.Collector)
+	var mu sync.Mutex
+
 	bus.Subscribe(eventbus.EventTypeButton, func(event eventbus.Event) {
 		resourceID, _ := event.Data["resource_id"].(string)
 		buttonAction, _ := event.Data["action"].(string)
@@ -61,17 +54,62 @@ func (m *Module) registerButtonHandler(
 			Str("handler_action", handler.ActionName).
 			Msg("Button event matched handler")
 
-		// Capture handler values for closure
-		h := handler
-		eid := eventID
+		// Build collector key
+		collectorKey := resourceID + ":" + buttonAction
 
-		// Queue work to Lua worker (single-threaded execution)
+		mu.Lock()
+		collector, ok := collectors[collectorKey]
+		if !ok {
+			collector = createButtonCollector(ctx, handler, invoker, luaExec, desiredStore)
+			collectors[collectorKey] = collector
+		}
+		mu.Unlock()
+
+		collector.AddEvent(map[string]any{
+			"resource_id": resourceID,
+			"action":      buttonAction,
+			"event_id":    eventID,
+		})
+	})
+}
+
+// createButtonCollector creates a collector for button events
+func createButtonCollector(
+	ctx context.Context,
+	handler *ButtonHandler,
+	invoker *actions.Invoker,
+	luaExec luaexec.Executor,
+	desiredStore *state.TypedStore[group.Desired],
+) middleware.Collector {
+	onFlush := func(events []map[string]any) {
 		luaExec.Do(ctx, func(workCtx context.Context) {
-			if h.IsToggle {
+			var args map[string]any
+
+			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
+				// Safe to call LState() here - we're inside Do() callback on Lua worker
+				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+			} else if len(events) > 0 {
+				args = events[0]
+			} else {
+				args = make(map[string]any)
+			}
+
+			// Merge with static action args
+			for k, v := range handler.ActionArgs {
+				args[k] = v
+			}
+
+			// Get event_id from args for idempotency
+			eid, _ := args["event_id"].(string)
+			delete(args, "event_id")
+			delete(args, "resource_id")
+			delete(args, "action")
+
+			if handler.IsToggle {
 				// Special handling for toggle buttons:
 				// 1. Run init_bank first (no dedupe)
 				// 2. Then run toggle_group (with dedupe)
-				groupID, _ := h.ActionArgs["group"].(string)
+				groupID, _ := handler.ActionArgs["group"].(string)
 				if groupID != "" {
 					// Check if bank is set
 					desired, _, _ := desiredStore.Get(groupID)
@@ -81,9 +119,14 @@ func (m *Module) registerButtonHandler(
 				}
 			}
 			// Invoke action with button event ID as idempotency key
-			invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, eid)
+			invoker.Invoke(workCtx, handler.ActionName, args, eid)
 		})
-	})
+	}
+
+	if handler.CollectorFactory != nil {
+		return handler.CollectorFactory.Create(onFlush)
+	}
+	return middleware.NewImmediateCollector(onFlush)
 }
 
 // registerConnectivityHandler sets up connectivity event handling via the event bus.
@@ -91,8 +134,11 @@ func (m *Module) registerConnectivityHandler(
 	ctx context.Context,
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
-	luaExec LuaExecutor,
+	luaExec luaexec.Executor,
 ) {
+	collectors := make(map[string]middleware.Collector)
+	var mu sync.Mutex
+
 	bus.Subscribe(eventbus.EventTypeConnectivity, func(event eventbus.Event) {
 		deviceID, _ := event.Data["device_id"].(string)
 		status, _ := event.Data["status"].(string)
@@ -108,27 +154,73 @@ func (m *Module) registerConnectivityHandler(
 			Str("handler_action", handler.ActionName).
 			Msg("Connectivity event matched handler")
 
-		// Capture handler values for closure
-		h := handler
+		// Build collector key
+		collectorKey := deviceID + ":" + status
 
-		// Queue work to Lua worker (single-threaded execution)
-		luaExec.Do(ctx, func(workCtx context.Context) {
-			if err := invoker.Invoke(workCtx, h.ActionName, h.ActionArgs, ""); err != nil {
-				log.Error().Err(err).Str("action", h.ActionName).Msg("Failed to invoke connectivity action")
-			}
+		mu.Lock()
+		collector, ok := collectors[collectorKey]
+		if !ok {
+			collector = createConnectivityCollector(ctx, handler, invoker, luaExec)
+			collectors[collectorKey] = collector
+		}
+		mu.Unlock()
+
+		collector.AddEvent(map[string]any{
+			"device_id": deviceID,
+			"status":    status,
 		})
 	})
 }
 
-// registerRotaryHandler sets up rotary event handling via the event bus with debouncing.
+// createConnectivityCollector creates a collector for connectivity events
+func createConnectivityCollector(
+	ctx context.Context,
+	handler *ConnectivityHandler,
+	invoker *actions.Invoker,
+	luaExec luaexec.Executor,
+) middleware.Collector {
+	onFlush := func(events []map[string]any) {
+		luaExec.Do(ctx, func(workCtx context.Context) {
+			var args map[string]any
+
+			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
+				// Safe to call LState() here - we're inside Do() callback on Lua worker
+				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+			} else if len(events) > 0 {
+				args = events[0]
+			} else {
+				args = make(map[string]any)
+			}
+
+			// Merge with static action args
+			for k, v := range handler.ActionArgs {
+				args[k] = v
+			}
+
+			// Remove event metadata from args
+			delete(args, "device_id")
+			delete(args, "status")
+
+			if err := invoker.Invoke(workCtx, handler.ActionName, args, ""); err != nil {
+				log.Error().Err(err).Str("action", handler.ActionName).Msg("Failed to invoke connectivity action")
+			}
+		})
+	}
+
+	if handler.CollectorFactory != nil {
+		return handler.CollectorFactory.Create(onFlush)
+	}
+	return middleware.NewImmediateCollector(onFlush)
+}
+
+// registerRotaryHandler sets up rotary event handling via the event bus.
 func (m *Module) registerRotaryHandler(
 	ctx context.Context,
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
-	luaExec LuaExecutor,
+	luaExec luaexec.Executor,
 ) {
-	// Create a debouncer per resource ID
-	debouncers := make(map[string]*rotaryDebouncer)
+	collectors := make(map[string]middleware.Collector)
 	var mu sync.Mutex
 
 	bus.Subscribe(eventbus.EventTypeRotary, func(event eventbus.Event) {
@@ -141,99 +233,54 @@ func (m *Module) registerRotaryHandler(
 			return
 		}
 
-		// Get or create debouncer for this resource
 		mu.Lock()
-		debouncer, ok := debouncers[resourceID]
+		collector, ok := collectors[resourceID]
 		if !ok {
-			debounceMs := handler.DebounceMs
-			if debounceMs <= 0 {
-				debounceMs = 50 // default
-			}
-			debouncer = &rotaryDebouncer{
-				handler:      handler,
-				invoker:      invoker,
-				luaExec:      luaExec,
-				ctx:          ctx,
-				debounceTime: time.Duration(debounceMs) * time.Millisecond,
-			}
-			log.Debug().
-				Str("resource_id", resourceID).
-				Int("debounce_ms", debounceMs).
-				Msg("Created rotary debouncer")
-			debouncers[resourceID] = debouncer
+			collector = createRotaryCollector(ctx, handler, invoker, luaExec)
+			collectors[resourceID] = collector
 		}
 		mu.Unlock()
 
-		// Add event to debouncer
-		debouncer.addEvent(direction, steps)
+		collector.AddEvent(map[string]any{
+			"direction": direction,
+			"steps":     steps,
+		})
 	})
 }
 
-// rotaryDebouncer accumulates rotary events and fires once after a quiet period.
-type rotaryDebouncer struct {
-	mu               sync.Mutex
-	accumulatedSteps int
-	timer            *time.Timer
-	debounceTime     time.Duration
-	handler          *RotaryHandler
-	invoker          *actions.Invoker
-	luaExec          LuaExecutor
-	ctx              context.Context
-}
+// createRotaryCollector creates a collector for rotary events
+func createRotaryCollector(
+	ctx context.Context,
+	handler *RotaryHandler,
+	invoker *actions.Invoker,
+	luaExec luaexec.Executor,
+) middleware.Collector {
+	onFlush := func(events []map[string]any) {
+		luaExec.Do(ctx, func(workCtx context.Context) {
+			var args map[string]any
 
-func (d *rotaryDebouncer) addEvent(direction string, steps int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
+				// Safe to call LState() here - we're inside Do() callback on Lua worker
+				args = luaexec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
+			} else if len(events) > 0 {
+				args = events[0]
+			} else {
+				args = make(map[string]any)
+			}
 
-	// Accumulate raw steps with sign based on direction
-	// Let Lua handle the brightness conversion
-	if direction == RotaryDirectionCounterClockwise {
-		steps = -steps
-	}
-	d.accumulatedSteps += steps
+			// Merge with static action args
+			for k, v := range handler.ActionArgs {
+				args[k] = v
+			}
 
-	// Reset/start timer - fire after debounce time of quiet
-	if d.timer != nil {
-		d.timer.Stop()
-	}
-	d.timer = time.AfterFunc(d.debounceTime, d.apply)
-}
-
-func (d *rotaryDebouncer) apply() {
-	d.mu.Lock()
-	steps := d.accumulatedSteps
-	d.accumulatedSteps = 0
-	d.mu.Unlock()
-
-	if steps == 0 {
-		return
+			if err := invoker.Invoke(workCtx, handler.ActionName, args, ""); err != nil {
+				log.Error().Err(err).Str("action", handler.ActionName).Msg("Failed to invoke rotary action")
+			}
+		})
 	}
 
-	// Determine direction from net steps
-	direction := RotaryDirectionClockwise
-	if steps < 0 {
-		direction = RotaryDirectionCounterClockwise
-		steps = -steps // steps should be positive for Lua
+	if handler.CollectorFactory != nil {
+		return handler.CollectorFactory.Create(onFlush)
 	}
-
-	log.Debug().
-		Str("direction", direction).
-		Int("net_steps", steps).
-		Msg("Rotary debounced - applying")
-
-	// Merge event data with handler args
-	args := make(map[string]any)
-	for k, v := range d.handler.ActionArgs {
-		args[k] = v
-	}
-	args["direction"] = direction
-	args["steps"] = steps // Raw steps, Lua handles conversion
-
-	// Queue work to Lua worker
-	actionName := d.handler.ActionName
-	d.luaExec.Do(d.ctx, func(workCtx context.Context) {
-		if err := d.invoker.Invoke(workCtx, actionName, args, ""); err != nil {
-			log.Error().Err(err).Str("action", actionName).Msg("Failed to invoke rotary action")
-		}
-	})
+	return middleware.NewImmediateCollector(onFlush)
 }

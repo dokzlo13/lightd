@@ -8,19 +8,15 @@ import (
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/eventbus"
+	"github.com/dokzlo13/lightd/internal/luaexec"
 )
-
-// LuaExecutor provides thread-safe Lua execution
-type LuaExecutor interface {
-	Do(ctx context.Context, work func(ctx context.Context)) bool
-}
 
 // RegisterHandler subscribes to schedule events on the event bus and dispatches to the invoker.
 func RegisterHandler(
 	ctx context.Context,
 	bus *eventbus.Bus,
 	invoker *actions.Invoker,
-	luaExec LuaExecutor,
+	luaExec luaexec.Executor,
 ) {
 	bus.Subscribe(eventbus.EventTypeSchedule, func(event eventbus.Event) {
 		actionName, _ := event.Data["action_name"].(string)
