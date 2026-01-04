@@ -22,7 +22,7 @@ Thumbs.db
 config.yaml
 
 # Local lua scripts (user-provided)
-main.lua
+*.lua
 
 # --- Databases (SQLite) ---
 *.sqlite

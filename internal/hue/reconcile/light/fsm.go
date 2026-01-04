@@ -1,10 +1,10 @@
-package group
+package light
 
 import (
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/compare"
 )
 
-// PowerState represents the power state of a group.
+// PowerState represents the power state of a light.
 type PowerState int
 
 const (
@@ -17,10 +17,8 @@ type Action int
 
 const (
 	ActionNone Action = iota
-	ActionTurnOnWithScene
 	ActionTurnOnWithState
 	ActionTurnOff
-	ActionApplyScene
 	ActionApplyState
 )
 
@@ -29,14 +27,10 @@ func (a Action) String() string {
 	switch a {
 	case ActionNone:
 		return "none"
-	case ActionTurnOnWithScene:
-		return "turn_on_with_scene"
 	case ActionTurnOnWithState:
 		return "turn_on_with_state"
 	case ActionTurnOff:
 		return "turn_off"
-	case ActionApplyScene:
-		return "apply_scene"
 	case ActionApplyState:
 		return "apply_state"
 	default:
@@ -45,14 +39,13 @@ func (a Action) String() string {
 }
 
 // DetermineAction determines what action to take based on desired and actual state.
-// This is the core FSM logic for group reconciliation.
+// This is the core FSM logic for light reconciliation.
 //
 // Decision tree:
-//  1. If group is OFF and we want ON → TurnOnWithScene or TurnOnWithState
-//  2. If group is ON and we want OFF → TurnOff
-//  3. If group is ON and we want a scene → ApplyScene
-//  4. If group is ON and state differs → ApplyState
-//  5. Otherwise → None
+//  1. If light is OFF and we want ON → TurnOnWithState
+//  2. If light is ON and we want OFF → TurnOff
+//  3. If light is ON and state differs → ApplyState
+//  4. Otherwise → None
 func DetermineAction(desired Desired, actual Actual) Action {
 	currentPower := derivePowerState(actual)
 
@@ -68,48 +61,41 @@ func DetermineAction(desired Desired, actual Actual) Action {
 
 // derivePowerState determines the current power state from actual.
 func derivePowerState(actual Actual) PowerState {
-	if actual.AnyOn {
+	if actual.On != nil && *actual.On {
 		return PowerStateOn
 	}
 	return PowerStateOff
 }
 
-// determineActionFromOff determines action when group is currently off.
+// determineActionFromOff determines action when light is currently off.
 func determineActionFromOff(desired Desired) Action {
 	if !wantsPowerOn(desired) {
 		return ActionNone
 	}
 
-	// Group is off and we want it on
-	if desired.SceneName != "" {
-		return ActionTurnOnWithScene
-	}
-	if hasColorProperties(desired.State) {
+	// Light is off and we want it on
+	if hasColorProperties(desired) {
 		return ActionTurnOnWithState
 	}
 
-	// Power on requested but no scene or state to apply
-	// This shouldn't happen in normal usage, but we can't turn on without something
+	// Just turn on without specific state - still need to send On=true
+	if desired.On != nil && *desired.On {
+		return ActionTurnOnWithState
+	}
+
 	return ActionNone
 }
 
-// determineActionFromOn determines action when group is currently on.
+// determineActionFromOn determines action when light is currently on.
 func determineActionFromOn(desired Desired, actual Actual) Action {
 	// First priority: power off
 	if wantsPowerOff(desired) {
 		return ActionTurnOff
 	}
 
-	// Second priority: apply scene if one is desired
-	// We always apply scenes because we can't verify the current scene
-	// (bridge doesn't report active scene name, only resulting state)
-	if desired.SceneName != "" {
-		return ActionApplyScene
-	}
-
-	// Third priority: color/brightness changes
-	if hasColorProperties(desired.State) {
-		if !stateMatches(desired.State, actual.State) {
+	// Second priority: color/brightness changes
+	if hasColorProperties(desired) {
+		if !stateMatches(desired, actual.State) {
 			return ActionApplyState
 		}
 	}

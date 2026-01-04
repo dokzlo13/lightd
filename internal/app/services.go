@@ -3,8 +3,6 @@ package app
 import (
 	"context"
 
-	"github.com/rs/zerolog/log"
-
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events/schedule"
@@ -62,20 +60,31 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	s.Store = storage.NewStore(database.DB)
 
 	// Initialize geo calculator (config is under events.scheduler.geo)
-	geoCfg := cfg.Events.Scheduler.Geo
-	geoCache := storage.NewGeoCache(database.DB)
-	if geoCfg.Lat != 0 || geoCfg.Lon != 0 {
-		s.GeoCalc = geo.NewCalculatorWithLocationAndCache(
-			geoCfg.Name,
+	// Note: config.Validate() should be called before NewServices() to ensure geo config is valid
+	schedCfg := cfg.Events.Scheduler
+	geoCfg := schedCfg.Geo
+	if schedCfg.IsEnabled() && geoCfg.IsEnabled() {
+		// Resolve location at boot (geocoding happens once here)
+		geoCache := storage.NewGeoCache(database.DB)
+		geocoder := geo.NewGeocoder(geoCfg.GetHTTPTimeout(), geoCache)
+
+		loc, err := geo.ResolveOnBoot(
+			context.Background(),
+			geocoder,
+			geoCfg.Location,
 			geoCfg.Lat,
 			geoCfg.Lon,
-			geoCfg.GetTimezone(),
-			geoCfg.GetHTTPTimeout(),
-			geoCache,
+			schedCfg.GetTimezone(), // Timezone is now at scheduler level
 		)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+
+		s.GeoCalc = geo.NewCalculator(loc)
 	} else {
-		log.Warn().Msg("No lat/lon configured, will use Nominatim geocoding (cached in SQLite)")
-		s.GeoCalc = geo.NewCalculatorWithCache(geoCfg.GetHTTPTimeout(), geoCache)
+		// Geo/scheduler disabled, create calculator without location
+		s.GeoCalc = geo.NewCalculator(nil)
 	}
 
 	// Initialize action registry

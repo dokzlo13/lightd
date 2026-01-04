@@ -33,15 +33,22 @@ func (p *ActualProvider) Get(ctx context.Context, lightID string) (Actual, error
 	}
 
 	actual := Actual{}
+
 	if light.State != nil {
-		actual.On = light.State.On
-		actual.Bri = light.State.Bri
-		actual.Hue = light.State.Hue
-		actual.Sat = light.State.Sat
-		actual.Xy = light.State.Xy
-		actual.Ct = light.State.Ct
+		actual.State = FromHuegoState(light.State)
+		actual.Reachable = light.State.Reachable
 	}
 
 	return actual, nil
 }
 
+// GetLight fetches the full huego.Light object for direct manipulation.
+// This is useful when we need to call methods on the light.
+func (p *ActualProvider) GetLight(ctx context.Context, lightID string) (*huego.Light, error) {
+	id, err := strconv.Atoi(lightID)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.bridge.GetLight(id)
+}

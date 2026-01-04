@@ -22,33 +22,39 @@ func NewActualProvider(bridge *huego.Bridge) *ActualProvider {
 
 // Get returns the actual state for a group by fetching from the bridge.
 func (p *ActualProvider) Get(ctx context.Context, groupID string) (Actual, error) {
-	state, err := p.fetchGroupState(groupID)
+	id, err := strconv.Atoi(groupID)
 	if err != nil {
 		return Actual{}, err
 	}
 
-	return Actual{
-		AnyOn: state.AnyOn,
-		AllOn: state.AllOn,
-	}, nil
+	group, err := p.bridge.GetGroup(id)
+	if err != nil {
+		return Actual{}, err
+	}
+
+	actual := Actual{}
+
+	// Power state from GroupState
+	if group.GroupState != nil {
+		actual.AnyOn = group.GroupState.AnyOn
+		actual.AllOn = group.GroupState.AllOn
+	}
+
+	// Color/brightness state from State (the "action" field in API)
+	if group.State != nil {
+		actual.State = FromHuegoState(group.State)
+	}
+
+	return actual, nil
 }
 
-// fetchGroupState fetches group state directly from the bridge.
-func (p *ActualProvider) fetchGroupState(groupID string) (*huego.GroupState, error) {
+// GetGroup fetches the full huego.Group object for direct manipulation.
+// This is useful when we need to call methods on the group (SetStateContext, etc.)
+func (p *ActualProvider) GetGroup(ctx context.Context, groupID string) (*huego.Group, error) {
 	id, err := strconv.Atoi(groupID)
 	if err != nil {
 		return nil, err
 	}
 
-	group, err := p.bridge.GetGroup(id)
-	if err != nil {
-		return nil, err
-	}
-
-	if group.GroupState != nil {
-		return group.GroupState, nil
-	}
-
-	// Return empty state if nil
-	return &huego.GroupState{}, nil
+	return p.bridge.GetGroup(id)
 }

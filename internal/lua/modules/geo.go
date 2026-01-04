@@ -1,8 +1,6 @@
 package modules
 
 import (
-	"time"
-
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
@@ -11,17 +9,14 @@ import (
 
 // GeoModule provides geographical/astronomical functions to Lua
 type GeoModule struct {
-	defaultLocation string
-	defaultTimezone string
-	calculator      *geo.Calculator
+	calculator *geo.Calculator
 }
 
-// NewGeoModule creates a new geo module with a shared calculator
-func NewGeoModule(defaultLocation, defaultTimezone string, calculator *geo.Calculator) *GeoModule {
+// NewGeoModule creates a new geo module with a shared calculator.
+// The calculator already contains the resolved location.
+func NewGeoModule(calculator *geo.Calculator) *GeoModule {
 	return &GeoModule{
-		defaultLocation: defaultLocation,
-		defaultTimezone: defaultTimezone,
-		calculator:      calculator,
+		calculator: calculator,
 	}
 }
 
@@ -30,19 +25,24 @@ func (m *GeoModule) Loader(L *lua.LState) int {
 	mod := L.NewTable()
 
 	L.SetField(mod, "today", L.NewFunction(m.today))
+	L.SetField(mod, "location", L.NewFunction(m.location))
 
 	L.Push(mod)
 	return 1
 }
 
-// today(location?) -> {dawn, sunrise, noon, sunset, dusk, midnight}
-// Returns Unix timestamps for astronomical events
+// today() -> {dawn, sunrise, noon, sunset, dusk, midnight}
+// Returns Unix timestamps for astronomical events today
 func (m *GeoModule) today(L *lua.LState) int {
-	location := L.OptString(1, m.defaultLocation)
+	if !m.calculator.IsConfigured() {
+		log.Warn().Msg("geo.today() called but no location configured")
+		L.Push(lua.LNil)
+		return 1
+	}
 
-	times, err := m.calculator.GetTimesForToday(location, m.defaultTimezone)
+	times, err := m.calculator.GetTimesForToday()
 	if err != nil {
-		log.Error().Err(err).Str("location", location).Msg("Failed to calculate astronomical times")
+		log.Error().Err(err).Msg("Failed to calculate astronomical times")
 		L.Push(lua.LNil)
 		return 1
 	}
@@ -55,22 +55,25 @@ func (m *GeoModule) today(L *lua.LState) int {
 	L.SetField(result, "dusk", lua.LNumber(times.Dusk.Unix()))
 	L.SetField(result, "midnight", lua.LNumber(times.Midnight.Unix()))
 
-	// Also add formatted times for debugging
-	tz, _ := time.LoadLocation(m.defaultTimezone)
-	if tz == nil {
-		tz = time.UTC
-	}
-
-	log.Info().
-		Str("location", location).
-		Str("dawn", times.Dawn.In(tz).Format("15:04")).
-		Str("sunrise", times.Sunrise.In(tz).Format("15:04")).
-		Str("noon", times.Noon.In(tz).Format("15:04")).
-		Str("sunset", times.Sunset.In(tz).Format("15:04")).
-		Str("dusk", times.Dusk.In(tz).Format("15:04")).
-		Msg("Astronomical times calculated")
-
 	L.Push(result)
 	return 1
 }
 
+// location() -> {name, lat, lon, timezone} or nil
+// Returns the configured location information
+func (m *GeoModule) location(L *lua.LState) int {
+	loc := m.calculator.Location()
+	if loc == nil {
+		L.Push(lua.LNil)
+		return 1
+	}
+
+	result := L.NewTable()
+	L.SetField(result, "name", lua.LString(loc.Name))
+	L.SetField(result, "lat", lua.LNumber(loc.Latitude))
+	L.SetField(result, "lon", lua.LNumber(loc.Longitude))
+	L.SetField(result, "timezone", lua.LString(loc.Timezone))
+
+	L.Push(result)
+	return 1
+}

@@ -3,6 +3,8 @@ package light
 import (
 	"context"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/dokzlo13/lightd/internal/hue/reconcile"
 	"github.com/dokzlo13/lightd/internal/storage"
 )
@@ -50,7 +52,7 @@ func (r *Resource) Load(ctx context.Context) error {
 		return err
 	}
 
-	// Load actual state
+	// Load actual state from bridge
 	r.actualState, err = r.actual.Get(ctx, r.lightID)
 	if err != nil {
 		return err
@@ -61,96 +63,53 @@ func (r *Resource) Load(ctx context.Context) error {
 
 // NeedsReconcile returns true if actual != desired.
 func (r *Resource) NeedsReconcile() bool {
-	d := r.desired
-	a := r.actualState
-
-	// Power transitions
-	if d.Power != nil {
-		if *d.Power && !a.On {
-			return true // OFF -> ON
-		}
-		if !*d.Power && a.On {
-			return true // ON -> OFF
-		}
-	}
-
-	// Only check other properties if light is on (or being turned on)
-	if a.On || (d.Power != nil && *d.Power) {
-		if d.Bri != nil && *d.Bri != a.Bri {
-			return true
-		}
-		if d.Hue != nil && *d.Hue != a.Hue {
-			return true
-		}
-		if d.Sat != nil && *d.Sat != a.Sat {
-			return true
-		}
-		if d.Ct != nil && *d.Ct != a.Ct {
-			return true
-		}
-		if d.Xy != nil && !xyEqual(d.Xy, a.Xy) {
-			return true
-		}
-	}
-
-	return false
+	action := DetermineAction(r.desired, r.actualState)
+	return action != ActionNone
 }
 
-// ReconcileStep performs one transition step.
+// ReconcileStep performs one transition step using the FSM.
 func (r *Resource) ReconcileStep(ctx context.Context) (done bool, err error) {
-	d := r.desired
-	a := r.actualState
+	action := DetermineAction(r.desired, r.actualState)
 
-	switch {
-	case d.Power != nil && *d.Power && !a.On:
-		// OFF -> ON
-		// Apply all desired state at once (power + properties)
-		if err := r.applier.Apply(ctx, r.lightID, d); err != nil {
+	// Debug logging with full state info
+	log.Debug().
+		Str("light", r.lightID).
+		Interface("desired", r.desired).
+		Interface("actual", r.actualState).
+		Bool("reachable", r.actualState.Reachable).
+		Str("action", action.String()).
+		Msg("Light reconcile step")
+
+	if action == ActionNone {
+		return true, nil
+	}
+
+	return r.executeAction(ctx, action)
+}
+
+// executeAction executes the determined action.
+func (r *Resource) executeAction(ctx context.Context, action Action) (done bool, err error) {
+	switch action {
+	case ActionTurnOnWithState:
+		if err := r.applier.ApplyState(ctx, r.lightID, r.desired); err != nil {
 			return false, err
 		}
 		return true, nil
 
-	case d.Power != nil && !*d.Power && a.On:
-		// ON -> OFF
+	case ActionTurnOff:
 		if err := r.applier.TurnOff(ctx, r.lightID); err != nil {
 			return false, err
 		}
 		return true, nil
 
-	case a.On:
-		// Light is on, apply property changes
-		if r.needsPropertyUpdate() {
-			if err := r.applier.Apply(ctx, r.lightID, d); err != nil {
-				return false, err
-			}
+	case ActionApplyState:
+		if err := r.applier.ApplyState(ctx, r.lightID, r.desired); err != nil {
+			return false, err
 		}
 		return true, nil
 	}
 
-	return true, nil // Nothing to do
-}
-
-// needsPropertyUpdate checks if any property needs updating.
-func (r *Resource) needsPropertyUpdate() bool {
-	d := r.desired
-	a := r.actualState
-
-	if d.Bri != nil && *d.Bri != a.Bri {
-		return true
-	}
-	if d.Hue != nil && *d.Hue != a.Hue {
-		return true
-	}
-	if d.Sat != nil && *d.Sat != a.Sat {
-		return true
-	}
-	if d.Ct != nil && *d.Ct != a.Ct {
-		return true
-	}
-	if d.Xy != nil && !xyEqual(d.Xy, a.Xy) {
-		return true
-	}
-	return false
+	return true, nil
 }
 
 // DesiredVersion returns the version of the desired state.
@@ -158,24 +117,12 @@ func (r *Resource) DesiredVersion() int64 {
 	return r.desiredVersion
 }
 
-// xyEqual compares two XY coordinate slices.
-func xyEqual(a, b []float32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		// Use tolerance for float comparison
-		if abs32(a[i]-b[i]) > 0.001 {
-			return false
-		}
-	}
-	return true
+// GetDesired returns the current desired state (for external inspection).
+func (r *Resource) GetDesired() Desired {
+	return r.desired
 }
 
-func abs32(x float32) float32 {
-	if x < 0 {
-		return -x
-	}
-	return x
+// GetActual returns the current actual state (for external inspection).
+func (r *Resource) GetActual() Actual {
+	return r.actualState
 }
-

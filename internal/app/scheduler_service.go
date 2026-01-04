@@ -28,17 +28,18 @@ func NewSchedulerService(
 	l *storage.Ledger,
 	geoCalc *geo.Calculator,
 ) *SchedulerService {
-	enabled := cfg.Events.Scheduler.IsEnabled()
-	geoCfg := cfg.Events.Scheduler.Geo
+	schedCfg := cfg.Events.Scheduler
+	enabled := schedCfg.IsEnabled()
 
 	var sched *scheduler.Scheduler
 	if enabled {
-		if geoCfg.IsEnabled() {
+		if schedCfg.Geo.IsEnabled() {
 			// Full scheduler with astronomical time support
-			sched = scheduler.New(bus, l, geoCalc, geoCfg.Name, geoCfg.GetTimezone())
+			// geoCalc already contains the resolved location
+			sched = scheduler.New(bus, l, geoCalc, schedCfg.GetTimezone())
 		} else {
 			// Fixed-time only scheduler (no geo required)
-			sched = scheduler.NewWithFixedTimeOnly(bus, l, geoCfg.GetTimezone())
+			sched = scheduler.NewWithFixedTimeOnly(bus, l, schedCfg.GetTimezone())
 			log.Info().Msg("Scheduler geo is disabled - astronomical times (@dawn, @noon, @sunset, etc.) are not available")
 		}
 	}
@@ -59,9 +60,11 @@ func (s *SchedulerService) IsEnabled() bool {
 // Start begins the scheduler and related periodic tasks.
 func (s *SchedulerService) Start(ctx context.Context) {
 	if !s.enabled {
-		log.Info().Msg("Scheduler is disabled")
+		log.Info().Msg("Scheduler disabled")
 		return
 	}
+
+	log.Info().Msg("Scheduler enabled")
 
 	// Run boot recovery first
 	s.Scheduler.RunBootRecovery()
@@ -75,7 +78,13 @@ func (s *SchedulerService) Start(ctx context.Context) {
 
 	// Ledger cleanup (if ledger is enabled)
 	if s.cfg.Ledger.IsEnabled() {
+		log.Info().
+			Dur("retention", s.cfg.Ledger.GetRetentionPeriod()).
+			Dur("interval", s.cfg.Ledger.GetRetentionInterval()).
+			Msg("Ledger cleanup enabled")
 		go s.runLedgerCleanup(ctx)
+	} else {
+		log.Info().Msg("Ledger cleanup disabled")
 	}
 }
 

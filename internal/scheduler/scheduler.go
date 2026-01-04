@@ -36,12 +36,13 @@ type Scheduler struct {
 	reschedule chan struct{}
 }
 
-// New creates a new scheduler with full astronomical time support
+// New creates a new scheduler with full astronomical time support.
+// The geoCalc already contains the resolved location.
 func New(
 	bus *events.Bus,
 	l *storage.Ledger,
 	geoCalc *geo.Calculator,
-	location, timezone string,
+	timezone string,
 ) *Scheduler {
 	tz, err := time.LoadLocation(timezone)
 	if err != nil {
@@ -53,7 +54,7 @@ func New(
 		schedules:  make(map[string]Schedule),
 		bus:        bus,
 		ledger:     l,
-		evaluator:  NewAstroTimeEvaluator(geoCalc, location, timezone),
+		evaluator:  NewAstroTimeEvaluator(geoCalc, timezone),
 		tz:         tz,
 		reschedule: make(chan struct{}, 1),
 	}

@@ -58,7 +58,8 @@ func (a *HueApplier) TurnOnWithScene(ctx context.Context, groupID, sceneName str
 		return err
 	}
 
-	return group.Scene(scene.ID)
+	// Use scene activation which turns on the lights
+	return group.SceneContext(ctx, scene.ID)
 }
 
 // ApplyScene applies a scene to an already-on group.
@@ -83,11 +84,11 @@ func (a *HueApplier) ApplyScene(ctx context.Context, groupID, sceneName string) 
 		return err
 	}
 
-	return group.Scene(scene.ID)
+	return group.SceneContext(ctx, scene.ID)
 }
 
 // ApplyState applies color/brightness state to a group.
-// If desired.Power is set, it will also turn the group on/off.
+// Uses the State.ToHuegoState() conversion for clean API alignment.
 func (a *HueApplier) ApplyState(ctx context.Context, groupID string, desired Desired) error {
 	id, err := strconv.Atoi(groupID)
 	if err != nil {
@@ -99,50 +100,20 @@ func (a *HueApplier) ApplyState(ctx context.Context, groupID string, desired Des
 		return err
 	}
 
-	// Build state to apply
-	state := huego.State{}
-	hasChanges := false
+	// Convert our State to huego.State
+	state := desired.State.ToHuegoState()
 
-	// Handle power state - this is critical for turning on
-	if desired.Power != nil {
-		state.On = *desired.Power
-		hasChanges = true
+	// If On is explicitly set, include it
+	if desired.On != nil {
+		state.On = *desired.On
 	}
 
-	if desired.Bri != nil {
-		state.Bri = *desired.Bri
-		hasChanges = true
-	}
+	log.Info().
+		Str("group", groupID).
+		Interface("state", state).
+		Msg("Applying state to group")
 
-	if desired.Hue != nil {
-		state.Hue = *desired.Hue
-		hasChanges = true
-	}
-
-	if desired.Sat != nil {
-		state.Sat = *desired.Sat
-		hasChanges = true
-	}
-
-	if desired.Xy != nil {
-		state.Xy = desired.Xy
-		hasChanges = true
-	}
-
-	if desired.Ct != nil {
-		state.Ct = *desired.Ct
-		hasChanges = true
-	}
-
-	if hasChanges {
-		log.Info().
-			Str("group", groupID).
-			Interface("state", state).
-			Msg("Applying state to group")
-		return group.SetState(state)
-	}
-
-	return nil
+	return group.SetStateContext(ctx, state)
 }
 
 // TurnOff turns off a group.
@@ -161,5 +132,5 @@ func (a *HueApplier) TurnOff(ctx context.Context, groupID string) error {
 		return err
 	}
 
-	return group.Off()
+	return group.OffContext(ctx)
 }

@@ -20,15 +20,16 @@ type Config struct {
 	Events          EventsConfig      `yaml:"events"`
 	EventBus        EventBusConfig    `yaml:"eventbus"`
 	KV              KVConfig          `yaml:"kv"`
+	Clients         ClientsConfig     `yaml:"clients"`
 	Script          string            `yaml:"script"`
 	ShutdownTimeout Duration          `yaml:"shutdown_timeout"`
 }
 
 // Default top-level values
 const (
-	DefaultScript          = "main.lua"
-	DefaultShutdownTimeout = 5 * time.Second
-	DefaultGeoTimezone     = "UTC"
+	DefaultScript            = "main.lua"
+	DefaultShutdownTimeout   = 5 * time.Second
+	DefaultSchedulerTimezone = "UTC"
 )
 
 // GetScript returns the script path with default
@@ -83,8 +84,7 @@ func (c *HueConfig) GetTimeout() time.Duration {
 type GeoConfig struct {
 	Enabled     *bool    `yaml:"enabled"`
 	UseCache    *bool    `yaml:"use_cache"`
-	Name        string   `yaml:"name"`
-	Timezone    string   `yaml:"timezone"`
+	Location    string   `yaml:"location"`
 	Lat         float64  `yaml:"lat,omitempty"`
 	Lon         float64  `yaml:"lon,omitempty"`
 	HTTPTimeout Duration `yaml:"http_timeout"`
@@ -112,14 +112,6 @@ func (c *GeoConfig) GetHTTPTimeout() time.Duration {
 		return DefaultGeoHTTPTimeout
 	}
 	return c.HTTPTimeout.Duration()
-}
-
-// GetTimezone returns the timezone with default
-func (c *GeoConfig) GetTimezone() string {
-	if c.Timezone == "" {
-		return DefaultGeoTimezone
-	}
-	return c.Timezone
 }
 
 // DatabaseConfig contains database settings
@@ -338,8 +330,9 @@ func (c *SSEConfig) GetMaxReconnects() int {
 
 // SchedulerConfig contains scheduler settings
 type SchedulerConfig struct {
-	Enabled *bool     `yaml:"enabled"`
-	Geo     GeoConfig `yaml:"geo"`
+	Enabled  *bool     `yaml:"enabled"`
+	Timezone string    `yaml:"timezone"`
+	Geo      GeoConfig `yaml:"geo"`
 }
 
 // IsEnabled returns whether the scheduler is enabled (defaults to true if not set)
@@ -348,6 +341,14 @@ func (c *SchedulerConfig) IsEnabled() bool {
 		return true
 	}
 	return *c.Enabled
+}
+
+// GetTimezone returns the timezone with default (UTC)
+func (c *SchedulerConfig) GetTimezone() string {
+	if c.Timezone == "" {
+		return DefaultSchedulerTimezone
+	}
+	return c.Timezone
 }
 
 // EventBusConfig contains event bus settings
@@ -392,6 +393,98 @@ func (c *KVConfig) GetCleanupInterval() time.Duration {
 		return DefaultKVCleanupInterval
 	}
 	return c.CleanupInterval.Duration()
+}
+
+// ClientsConfig groups all external client configurations
+type ClientsConfig struct {
+	HTTP HTTPClientConfig `yaml:"http"`
+}
+
+// HTTPClientConfig contains HTTP client settings for Lua scripts
+type HTTPClientConfig struct {
+	Enabled            *bool    `yaml:"enabled"`
+	Timeout            Duration `yaml:"timeout"`
+	AllowDomains       string   `yaml:"allow_domains"` // Comma-separated, supports wildcards (*.example.com)
+	InsecureSkipVerify bool     `yaml:"insecure_skip_verify"`
+	MaxResponseSize    int64    `yaml:"max_response_size"`
+}
+
+// Default HTTP client values
+const (
+	DefaultHTTPClientTimeout         = 30 * time.Second
+	DefaultHTTPClientMaxResponseSize = 1 << 20 // 1 MB
+)
+
+// IsEnabled returns whether the HTTP client is enabled (defaults to true if not set)
+func (c *HTTPClientConfig) IsEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// GetTimeout returns the HTTP client timeout with default
+func (c *HTTPClientConfig) GetTimeout() time.Duration {
+	if c.Timeout == 0 {
+		return DefaultHTTPClientTimeout
+	}
+	return c.Timeout.Duration()
+}
+
+// GetMaxResponseSize returns the max response size with default
+func (c *HTTPClientConfig) GetMaxResponseSize() int64 {
+	if c.MaxResponseSize <= 0 {
+		return DefaultHTTPClientMaxResponseSize
+	}
+	return c.MaxResponseSize
+}
+
+// GetAllowDomains parses the comma-separated allow_domains string
+func (c *HTTPClientConfig) GetAllowDomains() []string {
+	if c.AllowDomains == "" {
+		return nil
+	}
+
+	var domains []string
+	for _, d := range strings.Split(c.AllowDomains, ",") {
+		d = strings.TrimSpace(d)
+		if d != "" {
+			domains = append(domains, d)
+		}
+	}
+	return domains
+}
+
+// IsDomainAllowed checks if a domain is allowed (empty list = all allowed)
+// Supports wildcards: *.example.com matches any subdomain of example.com
+func (c *HTTPClientConfig) IsDomainAllowed(domain string) bool {
+	allowedDomains := c.GetAllowDomains()
+	if len(allowedDomains) == 0 {
+		return true
+	}
+
+	domain = strings.ToLower(domain)
+
+	for _, pattern := range allowedDomains {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+
+		// Wildcard pattern: *.example.com
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := pattern[1:] // ".example.com"
+			// Match exact suffix or the base domain itself
+			if strings.HasSuffix(domain, suffix) || domain == pattern[2:] {
+				return true
+			}
+			continue
+		}
+
+		// Exact match or subdomain match
+		if domain == pattern || strings.HasSuffix(domain, "."+pattern) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Duration is a wrapper around time.Duration for YAML unmarshalling

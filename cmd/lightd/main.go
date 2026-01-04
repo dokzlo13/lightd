@@ -31,6 +31,11 @@ func main() {
 
 	log.Info().Str("config", configPath).Msg("Starting lightd")
 
+	// Validate configuration (fail-fast on invalid config)
+	if err := cfg.Validate(); err != nil {
+		log.Fatal().Err(err).Msg("Invalid configuration")
+	}
+
 	// Create application
 	application, err := app.New(cfg)
 	if err != nil {

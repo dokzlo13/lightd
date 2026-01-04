@@ -141,9 +141,8 @@ func (r *Runtime) registerModules() {
 	logModule := modules.NewLogModule()
 	r.L.PreloadModule("log", logModule.Loader)
 
-	// Geo module (uses shared calculator to avoid duplicate geocoding)
-	geoCfg := r.deps.Config.Events.Scheduler.Geo
-	geoModule := modules.NewGeoModule(geoCfg.Name, geoCfg.Timezone, r.deps.GeoCalc)
+	// Geo module (uses shared calculator, location already resolved at boot)
+	geoModule := modules.NewGeoModule(r.deps.GeoCalc)
 	r.L.PreloadModule("geo", geoModule.Loader)
 
 	// Action module
@@ -169,6 +168,10 @@ func (r *Runtime) registerModules() {
 	// Utils module (sleep, etc.)
 	utilsModule := modules.NewUtilsModule()
 	r.L.PreloadModule("utils", utilsModule.Loader)
+
+	// HTTP client module
+	httpModule := modules.NewHTTPModule(&r.deps.Config.Clients.HTTP)
+	r.L.PreloadModule("clients.http", httpModule.Loader)
 
 	// Event source modules with dotted namespace
 	// SSE module (Hue event stream events: button, rotary, connectivity)

@@ -60,14 +60,25 @@ events:
 
   scheduler:
     enabled: ${SCHEDULER_ENABLED:true}
+    timezone: "${TZ}"
     geo:
       enabled: ${GEO_ENABLED:false}
       use_cache: ${GEO_USE_CACHE:true}
-      name: "${GEO_LOCATION}"
-      timezone: "${TZ}"
+      location: "${GEO_LOCATION}"
       http_timeout: "${GEO_HTTP_TIMEOUT:10s}"
       lat: ${GEO_LAT}
       lon: ${GEO_LON}
+
+# =============================================================================
+# CLIENTS
+# =============================================================================
+clients:
+  http:
+    enabled: ${HTTP_CLIENT_ENABLED:true}
+    timeout: "${HTTP_CLIENT_TIMEOUT:30s}"
+    allow_domains: "${HTTP_CLIENT_ALLOW_DOMAINS:}"  # Comma-separated, e.g. "*.home.local,api.example.com"
+    insecure_skip_verify: ${HTTP_CLIENT_INSECURE:false}
+    max_response_size: ${HTTP_CLIENT_MAX_RESPONSE:1048576}
 
 # Path to Lua script - mount your scripts to /app/config/
 script: "${SCRIPT_PATH:/app/config/lightd.lua}"

@@ -10,8 +10,7 @@ import (
 
 // Applier applies desired state to lights.
 type Applier interface {
-	Apply(ctx context.Context, lightID string, desired Desired) error
-	TurnOn(ctx context.Context, lightID string) error
+	ApplyState(ctx context.Context, lightID string, desired Desired) error
 	TurnOff(ctx context.Context, lightID string) error
 }
 
@@ -27,8 +26,9 @@ func NewHueApplier(bridge *huego.Bridge) *HueApplier {
 	}
 }
 
-// Apply applies the desired state to a light.
-func (a *HueApplier) Apply(ctx context.Context, lightID string, desired Desired) error {
+// ApplyState applies the desired state to a light.
+// Uses the State.ToHuegoState() conversion for clean API alignment.
+func (a *HueApplier) ApplyState(ctx context.Context, lightID string, desired Desired) error {
 	id, err := strconv.Atoi(lightID)
 	if err != nil {
 		return err
@@ -39,65 +39,20 @@ func (a *HueApplier) Apply(ctx context.Context, lightID string, desired Desired)
 		return err
 	}
 
-	// Build state to apply
-	state := huego.State{}
-	hasChanges := false
+	// Convert our State to huego.State
+	state := desired.ToHuegoState()
 
-	if desired.Power != nil {
-		state.On = *desired.Power
-		hasChanges = true
+	// Ensure On is set if we have color properties
+	if hasColorProperties(desired) && desired.On == nil {
+		state.On = true
 	}
 
-	if desired.Bri != nil {
-		state.Bri = *desired.Bri
-		hasChanges = true
-	}
+	log.Info().
+		Str("light", lightID).
+		Interface("state", state).
+		Msg("Applying state to light")
 
-	if desired.Hue != nil {
-		state.Hue = *desired.Hue
-		hasChanges = true
-	}
-
-	if desired.Sat != nil {
-		state.Sat = *desired.Sat
-		hasChanges = true
-	}
-
-	if desired.Xy != nil {
-		state.Xy = desired.Xy
-		hasChanges = true
-	}
-
-	if desired.Ct != nil {
-		state.Ct = *desired.Ct
-		hasChanges = true
-	}
-
-	if hasChanges {
-		log.Info().
-			Str("light", lightID).
-			Interface("state", state).
-			Msg("Applying state to light")
-		return light.SetState(state)
-	}
-
-	return nil
-}
-
-// TurnOn turns on a light.
-func (a *HueApplier) TurnOn(ctx context.Context, lightID string) error {
-	id, err := strconv.Atoi(lightID)
-	if err != nil {
-		return err
-	}
-
-	light, err := a.bridge.GetLight(id)
-	if err != nil {
-		return err
-	}
-
-	log.Info().Str("light", lightID).Msg("Turning on light")
-	return light.On()
+	return light.SetStateContext(ctx, state)
 }
 
 // TurnOff turns off a light.
@@ -113,6 +68,5 @@ func (a *HueApplier) TurnOff(ctx context.Context, lightID string) error {
 	}
 
 	log.Info().Str("light", lightID).Msg("Turning off light")
-	return light.Off()
+	return light.OffContext(ctx)
 }
-

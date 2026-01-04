@@ -81,7 +81,7 @@ func (c *Context) RunAction(name string, args map[string]any) error {
 // SetPower sets the desired power state for a group
 func (c *Context) SetPower(groupID string, on bool) error {
 	return c.desired.Update(groupID, func(current group.Desired) group.Desired {
-		current.Power = &on
+		current.On = &on
 		return current
 	})
 }

@@ -71,11 +71,13 @@ func (r *Resource) NeedsReconcile() bool {
 func (r *Resource) ReconcileStep(ctx context.Context) (done bool, err error) {
 	action := DetermineAction(r.desired, r.actualState)
 
-	// Debug logging
+	// Debug logging with full state info
 	log.Debug().
 		Str("group", r.groupID).
 		Interface("desired", r.desired).
-		Interface("actual", r.actualState).
+		Bool("actual_any_on", r.actualState.AnyOn).
+		Bool("actual_all_on", r.actualState.AllOn).
+		Interface("actual_state", r.actualState.State).
 		Str("action", action.String()).
 		Msg("Group reconcile step")
 
@@ -126,4 +128,14 @@ func (r *Resource) executeAction(ctx context.Context, action Action) (done bool,
 // DesiredVersion returns the version of the desired state.
 func (r *Resource) DesiredVersion() int64 {
 	return r.desiredVersion
+}
+
+// GetDesired returns the current desired state (for external inspection).
+func (r *Resource) GetDesired() Desired {
+	return r.desired
+}
+
+// GetActual returns the current actual state (for external inspection).
+func (r *Resource) GetActual() Actual {
+	return r.actualState
 }

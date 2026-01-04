@@ -83,8 +83,8 @@ func (m *DesiredModule) Flush() error {
 	for id, b := range m.pendingGroups {
 		err := m.groupStore.Update(id, func(current group.Desired) group.Desired {
 			// Merge builder state into current state
-			if b.state.Power != nil {
-				current.Power = b.state.Power
+			if b.state.On != nil {
+				current.On = b.state.On
 			}
 			if b.state.SceneName != "" {
 				current.SceneName = b.state.SceneName
@@ -115,8 +115,8 @@ func (m *DesiredModule) Flush() error {
 	for id, b := range m.pendingLights {
 		err := m.lightStore.Update(id, func(current light.Desired) light.Desired {
 			// Merge builder state into current state
-			if b.state.Power != nil {
-				current.Power = b.state.Power
+			if b.state.On != nil {
+				current.On = b.state.On
 			}
 			if b.state.Bri != nil {
 				current.Bri = b.state.Bri

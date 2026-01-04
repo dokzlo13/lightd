@@ -153,7 +153,8 @@ flowchart TD
 | `geo` | Astronomical time calculations |
 | `log` | Structured logging |
 | `collect` | Event aggregation middleware |
-| `utils` | Utilities (sleep, etc.) |
+| `utils` | Utilities (sleep, JSON, time, math, string, table) |
+| `clients.http` | HTTP client for external API calls |
 
 For the complete Lua API reference, see [MANUAL.md](MANUAL.md).
 
@@ -347,11 +348,11 @@ events:
   # ---------------------------------------------------------------------------
   scheduler:
     enabled: true             # Set false to disable all schedules
+    timezone: "Europe/Amsterdam"  # Timezone for all schedule times
     geo:
       enabled: true           # Enable astronomical times (@sunrise, @sunset)
       use_cache: true         # Cache geocoded coordinates in SQLite
-      name: "Amsterdam"       # City name for geocoding (uses Nominatim API)
-      timezone: "Europe/Amsterdam"
+      location: "Amsterdam"   # City name for geocoding (uses Nominatim API)
       http_timeout: "10s"     # Timeout for geocoding HTTP requests
       # lat: 52.3676          # Optional: provide coords to skip geocoding
       # lon: 4.9041
@@ -405,6 +406,11 @@ The Docker image maps environment variables to config values. All variables are 
 | `LEDGER_RETENTION_INTERVAL` | Ledger cleanup interval | 24h |
 | `KV_CLEANUP_INTERVAL` | KV expired entry cleanup | 5m |
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown timeout | 5s |
+| `HTTP_CLIENT_ENABLED` | Enable HTTP client module | true |
+| `HTTP_CLIENT_TIMEOUT` | HTTP client default timeout | 30s |
+| `HTTP_CLIENT_ALLOW_DOMAINS` | Domain whitelist (comma-separated, supports `*.example.com`) | - |
+| `HTTP_CLIENT_INSECURE` | Skip TLS certificate verification | false |
+| `HTTP_CLIENT_MAX_RESPONSE` | Max response body size (bytes) | 1048576 |
 
 See [`config.docker.yaml`](./config.docker.yaml) for the full mapping.
 

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/amimof/huego"
-	"github.com/rs/zerolog/log"
 
 	v2 "github.com/dokzlo13/lightd/internal/hue/v2"
 )
@@ -64,7 +63,6 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
-	log.Info().Str("address", c.v2.Address()).Msg("Connected to Hue bridge")
 	return nil
 }
 

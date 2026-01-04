@@ -60,7 +60,7 @@ func checkGroupBuilder(L *lua.LState) (*GroupDesiredBuilder, *lua.LUserData) {
 func groupBuilderOn(L *lua.LState) int {
 	builder, ud := checkGroupBuilder(L)
 	on := true
-	builder.state.Power = &on
+	builder.state.On = &on
 	builder.module.markGroupPending(builder)
 	L.Push(ud)
 	return 1
@@ -70,7 +70,7 @@ func groupBuilderOn(L *lua.LState) int {
 func groupBuilderOff(L *lua.LState) int {
 	builder, ud := checkGroupBuilder(L)
 	off := false
-	builder.state.Power = &off
+	builder.state.On = &off
 	builder.module.markGroupPending(builder)
 	L.Push(ud)
 	return 1
@@ -83,13 +83,13 @@ func groupBuilderToggle(L *lua.LState) int {
 	builder, ud := checkGroupBuilder(L)
 	// For toggle, we need to fetch actual state and decide
 	// For now, we'll just flip the current desired power if set, otherwise turn on
-	if builder.state.Power != nil {
-		newPower := !*builder.state.Power
-		builder.state.Power = &newPower
+	if builder.state.On != nil {
+		newPower := !*builder.state.On
+		builder.state.On = &newPower
 	} else {
 		// Default to on if no power state is set
 		on := true
-		builder.state.Power = &on
+		builder.state.On = &on
 	}
 	builder.module.markGroupPending(builder)
 	L.Push(ud)

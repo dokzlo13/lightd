@@ -26,6 +26,7 @@ func NewHealthService(cfg *config.Config) *HealthService {
 // Start begins the health check server if enabled.
 func (s *HealthService) Start(ctx context.Context) {
 	if !s.cfg.Healthcheck.Enabled {
+		log.Info().Msg("Health check server disabled")
 		return
 	}
 
@@ -56,7 +57,7 @@ func (s *HealthService) run(ctx context.Context) {
 		Handler: mux,
 	}
 
-	log.Info().Str("addr", addr).Msg("Starting health check server")
+	log.Info().Str("addr", addr).Msg("Health check server enabled")
 
 	go func() {
 		<-ctx.Done()

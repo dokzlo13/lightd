@@ -209,23 +209,20 @@ type TimeEvaluator interface {
 
 // AstroTimeEvaluator evaluates time expressions with full astronomical support
 type AstroTimeEvaluator struct {
-	geo      *geo.Calculator
-	location string
-	timezone string
-	tz       *time.Location
+	geo *geo.Calculator
+	tz  *time.Location
 }
 
-// NewAstroTimeEvaluator creates a new evaluator with astronomical time support
-func NewAstroTimeEvaluator(geoCalc *geo.Calculator, location, timezone string) *AstroTimeEvaluator {
+// NewAstroTimeEvaluator creates a new evaluator with astronomical time support.
+// The geoCalc already contains the location and timezone.
+func NewAstroTimeEvaluator(geoCalc *geo.Calculator, timezone string) *AstroTimeEvaluator {
 	tz, err := time.LoadLocation(timezone)
 	if err != nil {
 		tz = time.UTC
 	}
 	return &AstroTimeEvaluator{
-		geo:      geoCalc,
-		location: location,
-		timezone: timezone,
-		tz:       tz,
+		geo: geoCalc,
+		tz:  tz,
 	}
 }
 
@@ -237,7 +234,7 @@ func (e *AstroTimeEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time
 
 	if !expr.IsFixed() {
 		var err error
-		astro, err = e.geo.GetTimes(e.location, date, e.timezone)
+		astro, err = e.geo.GetTimes(date)
 		if err != nil {
 			return time.Time{}, false
 		}

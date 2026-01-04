@@ -22,6 +22,7 @@ This document is the complete reference for the Lua scripting API in Lightd.
 5. [Utilities](#utilities)
    - [Logging](#logging)
    - [Utils](#utils)
+   - [HTTP Client](#http-client)
    - [Geo](#geo)
 6. [API Reference](#api-reference)
 
@@ -462,17 +463,17 @@ sched.print({ format = "tomorrow" })   -- tomorrow's schedule
 events:
   scheduler:
     enabled: true             # Set false to disable all schedules
+    timezone: "Europe/Amsterdam"  # Timezone for all schedule times
     geo:
       enabled: true           # Enable astronomical times (@sunrise, @sunset)
       use_cache: true         # Cache geocoded coordinates in SQLite
-      name: "Amsterdam"       # City name for geocoding (uses Nominatim API)
-      timezone: "Europe/Amsterdam"
+      location: "Amsterdam"   # City name for geocoding (uses Nominatim API)
       http_timeout: "10s"     # Timeout for geocoding requests
       # lat: 52.3676          # Optional: provide coords to skip geocoding
       # lon: 4.9041
 ```
 
-When `scheduler.enabled: false`, `sched.define()` and `sched.periodic()` won't trigger. Astronomical times (`@sunrise`, `@sunset`, etc.) require `geo.enabled: true`.
+When `scheduler.enabled: false`, `sched.define()` and `sched.periodic()` won't trigger. Astronomical times (`@sunrise`, `@sunset`, etc.) require `geo.enabled: true`. The `timezone` setting is used for all schedule time expressions.
 
 ### Webhooks
 
@@ -707,10 +708,248 @@ The `utils` module provides utility functions:
 
 ```lua
 local utils = require("utils")
+```
 
+#### Time Functions
+
+```lua
 -- Sleep (blocks Lua execution)
 utils.sleep(500)  -- milliseconds
+
+-- Current Unix timestamp (seconds)
+local ts = utils.time_now()
+
+-- Current Unix timestamp (milliseconds)
+local ms = utils.time_ms()
+
+-- Format timestamp to string (Go time format)
+utils.time_format(ts, "2006-01-02 15:04:05")  -- "2024-01-15 14:30:00"
+utils.time_format(ts, "15:04")                 -- "14:30"
+utils.time_format(ts, "Mon Jan 2")             -- "Mon Jan 15"
+utils.time_format(nil, "15:04")                -- current time formatted
 ```
+
+#### JSON Functions
+
+```lua
+-- Encode table to JSON string
+local json_str, err = utils.json_encode({ name = "test", value = 42 })
+-- Returns: '{"name":"test","value":42}', nil
+
+-- Decode JSON string to table
+local tbl, err = utils.json_decode('{"foo": "bar", "num": 123}')
+-- Returns: { foo = "bar", num = 123 }, nil
+```
+
+#### Math Functions
+
+```lua
+-- Clamp value between min and max
+utils.clamp(300, 1, 254)   -- 254
+utils.clamp(-10, 0, 100)   -- 0
+
+-- Round to decimal places (default: 0)
+utils.round(3.14159)       -- 3
+utils.round(3.14159, 2)    -- 3.14
+
+-- Linear interpolation
+utils.lerp(0, 100, 0.5)    -- 50
+utils.lerp(0, 254, 0.75)   -- 190.5
+
+-- Map value from one range to another
+utils.map_range(50, 0, 100, 0, 254)  -- 127 (percentage to brightness)
+utils.map_range(127, 0, 254, 0, 100) -- 50 (brightness to percentage)
+```
+
+#### String Functions
+
+```lua
+-- Split string by separator
+utils.split("a,b,c", ",")        -- {"a", "b", "c"}
+utils.split("hello world", " ")  -- {"hello", "world"}
+
+-- Trim whitespace
+utils.trim("  hello  ")          -- "hello"
+
+-- Join array with separator
+utils.join({"a", "b", "c"}, ",")     -- "a,b,c"
+utils.join({"hello", "world"}, " ")  -- "hello world"
+
+-- String prefix/suffix checks
+utils.starts_with("/api/lights", "/api/")  -- true
+utils.ends_with("config.json", ".json")    -- true
+```
+
+#### Table Functions
+
+```lua
+-- Get table keys as array
+local t = { a = 1, b = 2, c = 3 }
+utils.keys(t)    -- {"a", "b", "c"} (order not guaranteed)
+
+-- Get table values as array
+utils.values(t)  -- {1, 2, 3} (order not guaranteed)
+
+-- Deep copy a table
+local original = { nested = { value = 42 } }
+local copy = utils.deep_copy(original)
+copy.nested.value = 100
+-- original.nested.value is still 42
+
+-- Merge tables (t2 overrides t1)
+local defaults = { timeout = 30, retries = 3 }
+local config = { timeout = 60 }
+local merged = utils.merge(defaults, config)
+-- merged = { timeout = 60, retries = 3 }
+```
+
+#### Other Functions
+
+```lua
+-- Generate UUID v4
+local id = utils.uuid()  -- "550e8400-e29b-41d4-a716-446655440000"
+
+-- Get environment variable (nil if not set)
+local token = utils.env("HUE_TOKEN")
+local debug = utils.env("DEBUG") or "false"
+```
+
+### HTTP Client
+
+The `clients.http` module provides an HTTP client for making external API requests.
+
+```lua
+local http = require("clients.http")
+```
+
+#### Making Requests
+
+```lua
+-- GET request
+local resp, err = http.get("https://api.example.com/data")
+if err then
+    log.error("Request failed: " .. err)
+    return
+end
+
+-- POST request with JSON body
+local resp, err = http.post("https://api.example.com/data", '{"key": "value"}', {
+    headers = { ["Content-Type"] = "application/json" }
+})
+
+-- PUT request
+local resp, err = http.put("https://api.example.com/resource/1", '{"updated": true}', {
+    headers = { ["Content-Type"] = "application/json" }
+})
+
+-- DELETE request
+local resp, err = http.delete("https://api.example.com/resource/1")
+
+-- PATCH request
+local resp, err = http.patch("https://api.example.com/resource/1", '{"field": "new"}')
+
+-- Generic request (for full control)
+local resp, err = http.request("OPTIONS", "https://api.example.com/resource")
+```
+
+#### Request Options
+
+```lua
+local resp, err = http.get("https://api.example.com/data", {
+    headers = {
+        ["Authorization"] = "Bearer token123",
+        ["Accept"] = "application/json",
+    },
+    timeout = 5000,  -- timeout in milliseconds (overrides default)
+})
+```
+
+#### Response Structure
+
+```lua
+local resp, err = http.get("https://api.example.com/users/1")
+
+if err then
+    log.error("Request failed: " .. err)
+    return
+end
+
+-- Response fields:
+resp.status       -- HTTP status code (number, e.g., 200)
+resp.status_text  -- Full status line (string, e.g., "200 OK")
+resp.ok           -- true if status is 2xx (boolean)
+resp.body         -- Response body as string
+resp.json         -- Parsed JSON if Content-Type is application/json (table or nil)
+resp.headers      -- Response headers (table)
+
+-- Example: Check status and use JSON
+if resp.ok and resp.json then
+    log.info("User name: " .. resp.json.name)
+end
+
+-- Example: Access headers
+local content_type = resp.headers["Content-Type"]
+```
+
+#### Home Assistant Integration Example
+
+```lua
+local http = require("clients.http")
+local utils = require("utils")
+
+-- Call Home Assistant REST API
+action.define("notify_ha", function(ctx, args)
+    local ha_url = utils.env("HA_URL") or "http://homeassistant.local:8123"
+    local ha_token = utils.env("HA_TOKEN")
+    
+    local body = utils.json_encode({
+        entity_id = "light.living_room",
+        brightness = 255
+    })
+    
+    local resp, err = http.post(ha_url .. "/api/services/light/turn_on", body, {
+        headers = {
+            ["Authorization"] = "Bearer " .. ha_token,
+            ["Content-Type"] = "application/json"
+        }
+    })
+    
+    if err then
+        log.error("HA request failed: " .. err)
+        return
+    end
+    
+    if resp.ok then
+        log.info("Home Assistant notified successfully")
+    else
+        log.error("HA returned error: " .. resp.status)
+    end
+end)
+```
+
+#### Configuration
+
+```yaml
+clients:
+  http:
+    enabled: true                 # Enable/disable HTTP client module
+    timeout: "30s"                # Default request timeout
+    allow_domains: ""             # Comma-separated whitelist (empty = all allowed)
+                                  # Example: "*.home-assistant.io,homeassistant.local"
+    insecure_skip_verify: false   # Skip TLS certificate verification
+    max_response_size: 1048576    # Max response body size in bytes (1MB)
+```
+
+**Domain Wildcards:**
+- `*.example.com` - matches `api.example.com`, `foo.bar.example.com`, and `example.com`
+- `example.com` - matches `example.com` and any subdomain like `api.example.com`
+
+**Docker environment variable:**
+```bash
+HTTP_CLIENT_ALLOW_DOMAINS="*.home-assistant.io,homeassistant.local,192.168.1.100"
+```
+
+When `enabled: false`, `require("clients.http")` will raise an error and the module won't be available.
 
 ### Geo
 
@@ -720,6 +959,7 @@ The `geo` module provides astronomical time calculations:
 local geo = require("geo")
 
 -- Get today's astronomical times (Unix timestamps)
+-- Uses the location configured in scheduler.geo
 local times = geo.today()
 if times then
     local dawn = times.dawn
@@ -730,8 +970,14 @@ if times then
     local midnight = times.midnight
 end
 
--- With custom location
-local times = geo.today("New York")
+-- Get configured location info
+local loc = geo.location()
+if loc then
+    print(loc.name)       -- "Amsterdam, ..."
+    print(loc.lat)        -- 60.17
+    print(loc.lon)        -- 24.94
+    print(loc.timezone)   -- "Europe/Amsterdam"
+end
 ```
 
 ---
@@ -851,12 +1097,55 @@ local times = geo.today("New York")
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `sleep` | `utils.sleep(ms)` | Sleep for milliseconds |
+| `time_now` | `utils.time_now()` | Current Unix timestamp (seconds) |
+| `time_ms` | `utils.time_ms()` | Current Unix timestamp (milliseconds) |
+| `time_format` | `utils.time_format(ts?, fmt?)` | Format timestamp to string |
+| `json_encode` | `utils.json_encode(table)` | Table to JSON string |
+| `json_decode` | `utils.json_decode(string)` | JSON string to table |
+| `clamp` | `utils.clamp(val, min, max)` | Clamp value to range |
+| `round` | `utils.round(val, decimals?)` | Round to decimal places |
+| `lerp` | `utils.lerp(a, b, t)` | Linear interpolation |
+| `map_range` | `utils.map_range(v, in_min, in_max, out_min, out_max)` | Map value between ranges |
+| `split` | `utils.split(str, sep?)` | Split string to array |
+| `trim` | `utils.trim(str)` | Trim whitespace |
+| `join` | `utils.join(arr, sep?)` | Join array to string |
+| `starts_with` | `utils.starts_with(str, prefix)` | Check string prefix |
+| `ends_with` | `utils.ends_with(str, suffix)` | Check string suffix |
+| `keys` | `utils.keys(table)` | Get table keys as array |
+| `values` | `utils.values(table)` | Get table values as array |
+| `deep_copy` | `utils.deep_copy(table)` | Deep copy a table |
+| `merge` | `utils.merge(t1, t2)` | Merge tables (t2 overrides t1) |
+| `uuid` | `utils.uuid()` | Generate UUID v4 |
+| `env` | `utils.env(name)` | Get environment variable |
+
+### clients.http
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `get` | `http.get(url, opts?)` | HTTP GET request |
+| `post` | `http.post(url, body?, opts?)` | HTTP POST request |
+| `put` | `http.put(url, body?, opts?)` | HTTP PUT request |
+| `delete` | `http.delete(url, opts?)` | HTTP DELETE request |
+| `patch` | `http.patch(url, body?, opts?)` | HTTP PATCH request |
+| `request` | `http.request(method, url, body?, opts?)` | Generic HTTP request |
+
+#### clients.http response
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | number | HTTP status code (e.g., 200) |
+| `status_text` | string | Full status line (e.g., "200 OK") |
+| `ok` | boolean | True if status is 2xx |
+| `body` | string | Response body |
+| `json` | table/nil | Parsed JSON if Content-Type is application/json |
+| `headers` | table | Response headers |
 
 ### geo
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `today` | `geo.today(location?)` | Get astronomical times |
+| `today` | `geo.today()` | Get today's astronomical times (uses configured location) |
+| `location` | `geo.location()` | Get configured location info (name, lat, lon, timezone) |
 
 ### ctx (Action Context)
 

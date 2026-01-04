@@ -59,7 +59,7 @@ func checkLightBuilder(L *lua.LState) (*LightDesiredBuilder, *lua.LUserData) {
 func lightBuilderOn(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
 	on := true
-	builder.state.Power = &on
+	builder.state.On = &on
 	builder.module.markLightPending(builder)
 	L.Push(ud)
 	return 1
@@ -69,7 +69,7 @@ func lightBuilderOn(L *lua.LState) int {
 func lightBuilderOff(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
 	off := false
-	builder.state.Power = &off
+	builder.state.On = &off
 	builder.module.markLightPending(builder)
 	L.Push(ud)
 	return 1
@@ -79,12 +79,12 @@ func lightBuilderOff(L *lua.LState) int {
 func lightBuilderToggle(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
 	// For toggle, flip the current desired power if set, otherwise turn on
-	if builder.state.Power != nil {
-		newPower := !*builder.state.Power
-		builder.state.Power = &newPower
+	if builder.state.On != nil {
+		newPower := !*builder.state.On
+		builder.state.On = &newPower
 	} else {
 		on := true
-		builder.state.Power = &on
+		builder.state.On = &on
 	}
 	builder.module.markLightPending(builder)
 	L.Push(ud)

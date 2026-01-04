@@ -34,9 +34,14 @@ func (s *WebhookService) SetPathMatcher(matcher webhook.PathMatcher) {
 // Start begins the webhook server if enabled.
 func (s *WebhookService) Start(ctx context.Context) {
 	if !s.cfg.Events.Webhook.Enabled {
-		log.Debug().Msg("Webhook server disabled")
+		log.Info().Msg("Webhook server disabled")
 		return
 	}
+
+	log.Info().
+		Str("host", s.cfg.Events.Webhook.GetHost()).
+		Int("port", s.cfg.Events.Webhook.GetPort()).
+		Msg("Webhook server enabled")
 
 	go func() {
 		if err := s.server.Run(ctx, s.cfg.GetShutdownTimeout()); err != nil {

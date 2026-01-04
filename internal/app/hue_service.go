@@ -113,6 +113,7 @@ func (s *HueService) Start(ctx context.Context) error {
 func (s *HueService) StartBackground(ctx context.Context, onFatalError func(error)) {
 	// Start event stream listener only if SSE is enabled
 	if s.cfg.Events.SSE.IsEnabled() {
+		log.Info().Msg("SSE event stream enabled")
 		go func() {
 			if err := s.EventStream.Run(ctx, s.Bus); err != nil {
 				if err == v2.ErrMaxReconnectsExceeded {
@@ -129,12 +130,17 @@ func (s *HueService) StartBackground(ctx context.Context, onFatalError func(erro
 		log.Info().Msg("SSE event stream disabled")
 	}
 
-	// Start orchestrator
-	go func() {
-		if err := s.Orchestrator.Run(ctx); err != nil {
-			log.Error().Err(err).Msg("Orchestrator error")
-		}
-	}()
+	// Start reconciler/orchestrator
+	if s.cfg.Reconciler.IsEnabled() {
+		log.Info().Msg("Reconciler enabled")
+		go func() {
+			if err := s.Orchestrator.Run(ctx); err != nil {
+				log.Error().Err(err).Msg("Orchestrator error")
+			}
+		}()
+	} else {
+		log.Info().Msg("Reconciler disabled")
+	}
 }
 
 // Close releases all resources.
