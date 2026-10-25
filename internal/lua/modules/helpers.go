@@ -2,54 +2,23 @@ package modules
 
 import (
 	"fmt"
+	"github.com/dokzlo13/lightd/internal/lua/exec"
 
 	lua "github.com/yuin/gopher-lua"
 )
 
 // LuaToGo converts a Lua value to a Go value
-func LuaToGo(v lua.LValue) interface{} {
-	switch val := v.(type) {
-	case lua.LString:
-		return string(val)
-	case lua.LNumber:
-		return float64(val)
-	case lua.LBool:
-		return bool(val)
-	case *lua.LTable:
-		// Check if it's an array or object
-		isArray := true
-		maxIdx := 0
-		val.ForEach(func(k, _ lua.LValue) {
-			if num, ok := k.(lua.LNumber); ok {
-				idx := int(num)
-				if idx > maxIdx {
-					maxIdx = idx
-				}
-			} else {
-				isArray = false
-			}
-		})
+func CheckedLuaToGo(v lua.LValue) (any, error) { return exec.ToGo(v) }
 
-		if isArray && maxIdx > 0 {
-			arr := make([]interface{}, maxIdx)
-			val.ForEach(func(k, v lua.LValue) {
-				if num, ok := k.(lua.LNumber); ok {
-					arr[int(num)-1] = LuaToGo(v)
-				}
-			})
-			return arr
-		}
+type invalidLuaValue struct{ err error }
 
-		obj := make(map[string]interface{})
-		val.ForEach(func(k, v lua.LValue) {
-			obj[lua.LVAsString(k)] = LuaToGo(v)
-		})
-		return obj
-	case *lua.LNilType:
-		return nil
-	default:
-		return v.String()
+func (v invalidLuaValue) MarshalJSON() ([]byte, error) { return nil, v.err }
+func LuaToGo(v lua.LValue) any {
+	out, err := CheckedLuaToGo(v)
+	if err != nil {
+		return invalidLuaValue{err}
 	}
+	return out
 }
 
 // GoToLuaValue converts a Go value to a Lua value
@@ -104,3 +73,16 @@ func LuaTableToMap(tbl *lua.LTable) map[string]any {
 	return m
 }
 
+func RequireLuaMap(L *lua.LState, t *lua.LTable) map[string]any {
+	v, err := CheckedLuaToGo(t)
+	if err != nil {
+		L.RaiseError("invalid arguments: %s", err)
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		L.RaiseError("arguments must be an object table")
+		return nil
+	}
+	return m
+}

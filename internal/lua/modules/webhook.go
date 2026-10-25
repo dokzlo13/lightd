@@ -43,7 +43,7 @@ func (m *WebhookModule) define(L *glua.LState) int {
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := LuaTableToMap(argsTable)
+	args := RequireLuaMap(L, argsTable)
 
 	// Extract collector factory from middleware field
 	var factory *collect.CollectorFactory

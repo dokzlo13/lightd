@@ -80,6 +80,7 @@ func (m *KVModule) delete(L *lua.LState) int {
 
 	deleted, err := m.manager.Delete(name)
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).Str("bucket", name).Msg("Failed to delete bucket")
 		L.Push(lua.LFalse)
 		return 1
@@ -95,6 +96,7 @@ func (m *KVModule) list(L *lua.LState) int {
 
 	names, err := m.manager.List()
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).Msg("Failed to list buckets")
 		L.Push(L.NewTable())
 		return 1
@@ -134,7 +136,11 @@ func checkBucket(L *lua.LState, pos int) kv.Bucket {
 func bucketStore(L *lua.LState) int {
 	bucket := checkBucket(L, 1)
 	key := L.CheckString(2)
-	value := LuaToGo(L.Get(3))
+	value, convErr := CheckedLuaToGo(L.Get(3))
+	if convErr != nil {
+		L.RaiseError("kv value: %s", convErr)
+		return 0
+	}
 
 	// Parse options
 	var opts *kv.StoreOptions
@@ -142,12 +148,13 @@ func bucketStore(L *lua.LState) int {
 		opts = &kv.StoreOptions{}
 		if ttl := L.GetField(optsTable, "ttl"); ttl != lua.LNil {
 			if ttlNum, ok := ttl.(lua.LNumber); ok {
-				opts.TTL = time.Duration(ttlNum) * time.Second
+				opts.TTL = time.Duration(float64(ttlNum) * float64(time.Second))
 			}
 		}
 	}
 
 	if err := bucket.Store(key, value, opts); err != nil {
+		L.RaiseError("KV store failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Str("key", key).
@@ -164,6 +171,7 @@ func bucketGet(L *lua.LState) int {
 
 	value, err := bucket.Get(key)
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Str("key", key).
@@ -188,6 +196,7 @@ func bucketExists(L *lua.LState) int {
 
 	exists, err := bucket.Exists(key)
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Str("key", key).
@@ -207,6 +216,7 @@ func bucketDelete(L *lua.LState) int {
 
 	deleted, err := bucket.Delete(key)
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Str("key", key).
@@ -225,6 +235,7 @@ func bucketKeys(L *lua.LState) int {
 
 	keys, err := bucket.Keys()
 	if err != nil {
+		L.RaiseError("KV operation failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Msg("Failed to list keys")
@@ -246,6 +257,7 @@ func bucketClear(L *lua.LState) int {
 	bucket := checkBucket(L, 1)
 
 	if err := bucket.Clear(); err != nil {
+		L.RaiseError("KV clear failed: %s", err)
 		log.Warn().Err(err).
 			Str("bucket", bucket.Name()).
 			Msg("Failed to clear bucket")
@@ -253,4 +265,3 @@ func bucketClear(L *lua.LState) int {
 
 	return 0
 }
-

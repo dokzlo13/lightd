@@ -3,9 +3,13 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -24,6 +28,9 @@ type Server struct {
 	bus         *events.Bus
 	httpServer  *http.Server
 	pathMatcher PathMatcher
+	mu          sync.Mutex
+	done        chan struct{}
+	serveErr    error
 }
 
 // NewServer creates a new webhook server.
@@ -40,35 +47,71 @@ func (s *Server) SetPathMatcher(matcher PathMatcher) {
 	s.pathMatcher = matcher
 }
 
-// Run starts the webhook server. It blocks until the context is cancelled.
-func (s *Server) Run(ctx context.Context, shutdownTimeout time.Duration) error {
-	mux := http.NewServeMux()
-
-	// Catch-all handler for all webhook requests
-	mux.HandleFunc("/", s.handleWebhook)
-
-	s.httpServer = &http.Server{
-		Addr:    s.addr,
-		Handler: mux,
+// Start binds synchronously: failure cannot leave the application reporting ready.
+func (s *Server) Start(ctx context.Context, shutdownTimeout time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.httpServer != nil {
+		return fmt.Errorf("webhook already started")
 	}
-
-	log.Info().Str("addr", s.addr).Msg("Starting webhook server")
-
-	// Handle graceful shutdown
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-			log.Error().Err(err).Msg("Webhook server shutdown error")
-		}
-	}()
-
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
 		return err
 	}
-
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleWebhook)
+	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 64 << 10}
+	s.done = make(chan struct{})
+	go func() {
+		err := s.httpServer.Serve(listener)
+		s.mu.Lock()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.serveErr = err
+		}
+		s.mu.Unlock()
+		close(s.done)
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			defer cancel()
+			_ = s.Close(closeCtx)
+		case <-s.done:
+		}
+	}()
 	return nil
+}
+func (s *Server) Close(ctx context.Context) error {
+	s.mu.Lock()
+	server := s.httpServer
+	done := s.done
+	s.mu.Unlock()
+	if server == nil {
+		return nil
+	}
+	err := server.Shutdown(ctx)
+	if err != nil {
+		_ = server.Close()
+	}
+	select {
+	case <-done:
+		s.mu.Lock()
+		serveErr := s.serveErr
+		s.mu.Unlock()
+		return errors.Join(err, serveErr)
+	case <-ctx.Done():
+		return errors.Join(err, ctx.Err())
+	}
+}
+func (s *Server) Run(ctx context.Context, timeout time.Duration) error {
+	if err := s.Start(ctx, timeout); err != nil {
+		return err
+	}
+	<-s.done
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serveErr
 }
 
 // handleWebhook processes incoming webhook requests and publishes them to the event bus.
@@ -87,11 +130,17 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read request body
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to read webhook request body")
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
+		var sizeErr *http.MaxBytesError
+		if errors.As(err, &sizeErr) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
 		w.Write([]byte(`{"error":"failed to read request body"}`))
 		return
 	}
@@ -117,7 +166,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate unique event ID
-	eventID := fmt.Sprintf("webhook-%s-%d", r.URL.Path, time.Now().UnixNano())
+	eventID := "webhook-" + uuid.NewString()
 
 	log.Debug().
 		Str("method", r.Method).
@@ -127,7 +176,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		Msg("Received webhook request")
 
 	// Publish event to bus
-	s.bus.Publish(events.Event{
+	if err := s.bus.Publish(events.Event{
 		Type: events.EventTypeWebhook,
 		Data: map[string]interface{}{
 			"method":   r.Method,
@@ -137,10 +186,15 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			"headers":  headers,
 			"event_id": eventID,
 		},
-	})
+	}); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "action admission rejected", "event_id": eventID})
+		return
+	}
 
-	// Respond with 200 OK - request accepted
+	// Accepted only after downstream admission.
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"status":"accepted"}`))
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "accepted", "event_id": eventID})
 }

@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"os"
@@ -68,7 +69,21 @@ func (m *UtilsModule) Loader(L *lua.LState) int {
 // This blocks the Lua execution but runs in Go's scheduler
 func (m *UtilsModule) sleep(L *lua.LState) int {
 	ms := L.CheckInt(1)
-	time.Sleep(time.Duration(ms) * time.Millisecond)
+	if ms < 0 {
+		L.ArgError(1, "sleep must be nonnegative")
+		return 0
+	}
+	ctx := L.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		L.RaiseError("sleep cancelled: %s", ctx.Err())
+	}
 	return 0
 }
 
@@ -115,7 +130,12 @@ func (m *UtilsModule) timeFormat(L *lua.LState) int {
 // Converts a Lua table to JSON string
 func (m *UtilsModule) jsonEncode(L *lua.LState) int {
 	value := L.Get(1)
-	goValue := LuaToGo(value)
+	goValue, convErr := CheckedLuaToGo(value)
+	if convErr != nil {
+		L.Push(lua.LNil)
+		L.Push(lua.LString(convErr.Error()))
+		return 2
+	}
 
 	jsonBytes, err := json.Marshal(goValue)
 	if err != nil {
@@ -315,8 +335,12 @@ func (m *UtilsModule) values(L *lua.LState) int {
 // Creates a deep copy of a table
 func (m *UtilsModule) deepCopy(L *lua.LState) int {
 	tbl := L.CheckTable(1)
-	result := m.deepCopyTable(L, tbl)
-	L.Push(result)
+	value, err := CheckedLuaToGo(tbl)
+	if err != nil {
+		L.RaiseError("deep_copy: %s", err)
+		return 0
+	}
+	L.Push(GoToLuaValue(L, value))
 	return 1
 }
 

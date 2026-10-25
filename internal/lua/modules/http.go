@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -39,6 +40,15 @@ func NewHTTPModule(cfg *config.HTTPClientConfig) *HTTPModule {
 		client = &http.Client{
 			Timeout:   cfg.GetTimeout(),
 			Transport: transport,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("too many redirects")
+				}
+				if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || !cfg.IsDomainAllowed(req.URL.Hostname()) {
+					return fmt.Errorf("redirect destination not allowed")
+				}
+				return nil
+			},
 		}
 
 		log.Info().
@@ -141,6 +151,11 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 		return 2
 	}
 
+	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+		L.Push(lua.LNil)
+		L.Push(lua.LString("URL must use http or https"))
+		return 2
+	}
 	// Check domain allowlist
 	if !m.cfg.IsDomainAllowed(parsedURL.Hostname()) {
 		L.Push(lua.LNil)
@@ -154,7 +169,11 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 		bodyReader = strings.NewReader(body)
 	}
 
-	req, err := http.NewRequest(method, urlStr, bodyReader)
+	ctx := L.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, bodyReader)
 	if err != nil {
 		L.Push(lua.LNil)
 		L.Push(lua.LString(fmt.Sprintf("failed to create request: %s", err.Error())))
@@ -181,6 +200,11 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 		// Parse timeout override (in milliseconds)
 		if timeoutVal := opts.RawGetString("timeout"); timeoutVal != lua.LNil {
 			if timeoutMs, ok := timeoutVal.(lua.LNumber); ok {
+				if timeoutMs <= 0 || timeoutMs > 300000 {
+					L.Push(lua.LNil)
+					L.Push(lua.LString("timeout must be 1..300000 milliseconds"))
+					return 2
+				}
 				timeout = time.Duration(timeoutMs) * time.Millisecond
 			}
 		}
@@ -190,14 +214,15 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 	client := m.client
 	if timeout != m.cfg.GetTimeout() {
 		client = &http.Client{
-			Timeout:   timeout,
-			Transport: m.client.Transport,
+			Timeout:       timeout,
+			Transport:     m.client.Transport,
+			CheckRedirect: m.client.CheckRedirect,
 		}
 	}
 
 	log.Debug().
 		Str("method", method).
-		Str("url", urlStr).
+		Str("host", parsedURL.Hostname()).
 		Dur("timeout", timeout).
 		Msg("HTTP request")
 
@@ -211,7 +236,7 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 	defer resp.Body.Close()
 
 	// Read response body with size limit
-	limitedReader := io.LimitReader(resp.Body, m.maxResponseSize)
+	limitedReader := io.LimitReader(resp.Body, m.maxResponseSize+1)
 	respBody, err := io.ReadAll(limitedReader)
 	if err != nil {
 		L.Push(lua.LNil)
@@ -219,6 +244,11 @@ func (m *HTTPModule) doRequest(L *lua.LState, method, urlStr, body string, opts 
 		return 2
 	}
 
+	if int64(len(respBody)) > m.maxResponseSize {
+		L.Push(lua.LNil)
+		L.Push(lua.LString("HTTP response exceeds size limit"))
+		return 2
+	}
 	// Build response table
 	respTable := L.NewTable()
 

@@ -2,168 +2,92 @@ package webhook
 
 import (
 	"context"
-	"sync"
-
-	"github.com/rs/zerolog/log"
-
+	"fmt"
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/events/middleware"
 	luactx "github.com/dokzlo13/lightd/internal/lua/context"
 	"github.com/dokzlo13/lightd/internal/lua/exec"
+	"sync"
 )
 
-// HandlerRegistry provides handler lookup functions
 type HandlerRegistry interface {
-	FindHandler(method, path string) *MatchResult
+	FindHandler(string, string) *MatchResult
 }
 
-// RegisterHandlers subscribes to webhook events on the event bus and dispatches to handlers
-func RegisterHandlers(
-	ctx context.Context,
-	registry HandlerRegistry,
-	bus *events.Bus,
-	invoker *actions.Invoker,
-	luaExec exec.Executor,
-) {
-	collectors := make(map[string]middleware.Collector)
+func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i *actions.Invoker, x exec.Executor) {
 	var mu sync.Mutex
-
-	bus.Subscribe(events.EventTypeWebhook, func(event events.Event) {
-		method, _ := event.Data["method"].(string)
-		path, _ := event.Data["path"].(string)
-		body, _ := event.Data["body"].(string)
-		jsonData, _ := event.Data["json"].(map[string]interface{})
-		headers, _ := event.Data["headers"].(map[string]interface{})
-		eventID, _ := event.Data["event_id"].(string)
-
-		match := registry.FindHandler(method, path)
-		if match == nil {
-			log.Debug().
-				Str("method", method).
-				Str("path", path).
-				Msg("No webhook handler found for request")
-			return
-		}
-
-		log.Info().
-			Str("trigger", "webhook").
-			Str("method", method).
-			Str("path", path).
-			Str("action", match.Handler.ActionName).
-			Interface("path_params", match.PathParams).
-			Msg("Action triggered by webhook request")
-
-		// Build collector key from method and registered path pattern
-		collectorKey := match.Handler.Method + ":" + match.Handler.Path
-
+	collectors := map[string]middleware.Collector{}
+	context.AfterFunc(ctx, func() {
 		mu.Lock()
-		collector, ok := collectors[collectorKey]
-		if !ok {
-			collector = createWebhookCollector(ctx, match.Handler, invoker, luaExec)
-			collectors[collectorKey] = collector
+		defer mu.Unlock()
+		for _, c := range collectors {
+			c.Close()
 		}
-		mu.Unlock()
-
-		// Convert headers to map[string]any for collector
-		headersAny := make(map[string]any)
-		for k, v := range headers {
-			headersAny[k] = v
+	})
+	bus.SubscribeAck(events.EventTypeWebhook, func(e events.Event) error {
+		method, _ := e.Data["method"].(string)
+		path, _ := e.Data["path"].(string)
+		match := r.FindHandler(method, path)
+		if match == nil {
+			return fmt.Errorf("webhook handler not found")
 		}
-
-		// Convert json to map[string]any for collector
-		jsonAny := make(map[string]any)
-		for k, v := range jsonData {
-			jsonAny[k] = v
+		data := map[string]any{}
+		for k, v := range e.Data {
+			data[k] = v
 		}
-
-		collector.AddEvent(map[string]any{
-			"method":      method,
-			"path":        path,
-			"body":        body,
-			"json":        jsonAny,
-			"headers":     headersAny,
-			"path_params": match.PathParams,
-			"event_id":    eventID,
-		})
+		data["path_params"] = match.PathParams
+		key := method + ":" + match.Handler.Path
+		mu.Lock()
+		defer mu.Unlock()
+		collector := collectors[key]
+		if collector == nil {
+			collector = createWebhookCollector(ctx, match.Handler, i, x)
+			collectors[key] = collector
+		}
+		return collector.AddEvent(data)
 	})
 }
-
-// createWebhookCollector creates a collector for webhook events
-func createWebhookCollector(
-	ctx context.Context,
-	handler *Handler,
-	invoker *actions.Invoker,
-	luaExec exec.Executor,
-) middleware.Collector {
-	onFlush := func(events []map[string]any) {
-		luaExec.Do(ctx, func(workCtx context.Context) {
+func createWebhookCollector(ctx context.Context, h *Handler, i *actions.Invoker, x exec.Executor) middleware.Collector {
+	flush := func(batch []map[string]any) error {
+		first := batch[0]
+		method, _ := first["method"].(string)
+		path, _ := first["path"].(string)
+		body, _ := first["body"].(string)
+		data, _ := first["json"].(map[string]any)
+		headers, _ := first["headers"].(map[string]any)
+		params, _ := first["path_params"].(map[string]string)
+		req := &luactx.RequestData{Method: method, Path: path, Body: body, JSON: data, Headers: headers, PathParams: params}
+		workCtx := context.WithValue(ctx, luactx.RequestContextKey, req)
+		key := ""
+		for _, ev := range batch {
+			key += fmt.Sprint(ev["event_id"]) + "/"
+		}
+		return i.QueuePrepared(workCtx, x, h.ActionName, key, "webhook", h.Method+":"+h.Path, func(context.Context) (map[string]any, error) {
 			var args map[string]any
-
-			if handler.CollectorFactory != nil && handler.CollectorFactory.Reducer != nil {
-				// Safe to call LState() here - we're inside Do() callback on Lua worker
-				args = exec.CallReducer(luaExec.LState(), handler.CollectorFactory.Reducer, events)
-			} else if len(events) > 0 {
-				args = events[0]
+			if h.CollectorFactory != nil && h.CollectorFactory.Reducer != nil {
+				var err error
+				args, err = exec.CallReducer(x.LState(), h.CollectorFactory.Reducer, batch)
+				if err != nil {
+					return nil, err
+				}
 			} else {
-				args = make(map[string]any)
+				args = map[string]any{}
+				for k, v := range first {
+					args[k] = v
+				}
 			}
-
-			// Merge with static action args
-			for k, v := range handler.ActionArgs {
+			for _, k := range []string{"method", "path", "body", "json", "headers", "path_params", "event_id"} {
+				delete(args, k)
+			}
+			for k, v := range h.ActionArgs {
 				args[k] = v
 			}
-
-			// Extract request data for context
-			method, _ := args["method"].(string)
-			path, _ := args["path"].(string)
-			body, _ := args["body"].(string)
-			jsonData, _ := args["json"].(map[string]any)
-			headers, _ := args["headers"].(map[string]any)
-			pathParams, _ := args["path_params"].(map[string]string)
-			eventID, _ := args["event_id"].(string)
-
-			// Remove event metadata from args
-			delete(args, "method")
-			delete(args, "path")
-			delete(args, "body")
-			delete(args, "json")
-			delete(args, "headers")
-			delete(args, "path_params")
-			delete(args, "event_id")
-
-			// Convert headers back to map[string]interface{}
-			headersIface := make(map[string]interface{})
-			for k, v := range headers {
-				headersIface[k] = v
-			}
-
-			// Convert json back to map[string]interface{}
-			jsonIface := make(map[string]interface{})
-			for k, v := range jsonData {
-				jsonIface[k] = v
-			}
-
-			// Create request data to pass through context
-			requestData := &luactx.RequestData{
-				Method:     method,
-				Path:       path,
-				Body:       body,
-				JSON:       jsonIface,
-				Headers:    headersIface,
-				PathParams: pathParams,
-			}
-
-			// Inject request data into context for the RequestModule to extract
-			ctxWithRequest := context.WithValue(workCtx, luactx.RequestContextKey, requestData)
-			if err := invoker.Invoke(ctxWithRequest, handler.ActionName, args, eventID); err != nil {
-				log.Error().Err(err).Str("action", handler.ActionName).Msg("Failed to invoke webhook action")
-			}
+			return args, nil
 		})
 	}
-
-	if handler.CollectorFactory != nil {
-		return handler.CollectorFactory.Create(onFlush)
+	if h.CollectorFactory != nil {
+		return h.CollectorFactory.Create(flush)
 	}
-	return middleware.NewImmediateCollector(onFlush)
+	return middleware.NewImmediateCollector(flush)
 }

@@ -58,6 +58,10 @@ func (m *Module) Loader(L *lua.LState) int {
 // collect.quiet(ms, reducer) - Flush after ms of no new events
 func (m *Module) quiet(L *lua.LState) int {
 	ms := L.CheckInt(1)
+	if ms < 1 || ms > 60000 {
+		L.ArgError(1, "interval must be 1..60000 ms")
+		return 0
+	}
 	reducer := L.CheckFunction(2)
 
 	factory := &CollectorFactory{
@@ -76,11 +80,15 @@ func (m *Module) quiet(L *lua.LState) int {
 // collect.count(n, reducer) - Flush after n events
 func (m *Module) count(L *lua.LState) int {
 	n := L.CheckInt(1)
+	if n < 1 || n > middleware.MaxCollectedEvents {
+		L.ArgError(1, "count must be 1..256")
+		return 0
+	}
 	reducer := L.CheckFunction(2)
 
 	factory := &CollectorFactory{
-		Type:  "count",
-		Count: n,
+		Type:    "count",
+		Count:   n,
 		Reducer: reducer,
 	}
 
@@ -94,6 +102,10 @@ func (m *Module) count(L *lua.LState) int {
 // collect.interval(ms, reducer) - Flush every ms
 func (m *Module) interval(L *lua.LState) int {
 	ms := L.CheckInt(1)
+	if ms < 1 || ms > 60000 {
+		L.ArgError(1, "interval must be 1..60000 ms")
+		return 0
+	}
 	reducer := L.CheckFunction(2)
 
 	factory := &CollectorFactory{
@@ -118,4 +130,3 @@ func ExtractFactory(v lua.LValue) *CollectorFactory {
 	}
 	return nil
 }
-

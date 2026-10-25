@@ -2,6 +2,7 @@ package context
 
 import (
 	lua "github.com/yuin/gopher-lua"
+	"math"
 
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/light"
 )
@@ -13,6 +14,8 @@ const lightBuilderTypeName = "desired.light"
 type LightDesiredBuilder struct {
 	lightID string
 	state   light.Desired
+	extra   map[string]any
+	clear   []string
 	module  *DesiredModule // reference back for pending tracking
 }
 
@@ -23,23 +26,37 @@ func RegisterLightBuilderType(L *lua.LState) {
 }
 
 var lightBuilderMethods = map[string]lua.LGFunction{
-	"on":        lightBuilderOn,
-	"off":       lightBuilderOff,
-	"toggle":    lightBuilderToggle,
-	"set_bri":   lightBuilderSetBri,
-	"set_color": lightBuilderSetColorXY,
-	"set_ct":    lightBuilderSetCt,
-	"set_hue":   lightBuilderSetHue,
-	"set_sat":   lightBuilderSetSat,
+	"on":             lightBuilderOn,
+	"off":            lightBuilderOff,
+	"toggle":         lightBuilderToggle,
+	"set_brightness": lightBuilderSetBrightness,
+	"set_transition": lightBuilderSetTransition,
+	"preserve_power": lightBuilderPreservePower,
+	"next_on":        lightBuilderNextOn,
+	"clear_scene":    lightBuilderClearScene,
+	"set_bri":        lightBuilderSetBri,
+	"set_color":      lightBuilderSetColorXY,
+	"set_ct":         lightBuilderSetCt,
+	"set_hue":        lightBuilderSetHue,
+	"set_sat":        lightBuilderSetSat,
 }
 
 // pushLightBuilder creates a new LightDesiredBuilder userdata and pushes it onto the stack.
 func pushLightBuilder(L *lua.LState, lightID string, module *DesiredModule) {
+	if module.closed {
+		L.RaiseError("desired builder belongs to a finished action")
+		return
+	}
 	ud := L.NewUserData()
-	ud.Value = &LightDesiredBuilder{
-		lightID: lightID,
-		state:   light.Desired{},
-		module:  module,
+	if existing, ok := module.pendingLights[lightID]; ok {
+		ud.Value = existing
+	} else {
+		ud.Value = &LightDesiredBuilder{
+			lightID: lightID,
+			state:   light.Desired{},
+			extra:   map[string]any{},
+			module:  module,
+		}
 	}
 	L.SetMetatable(ud, L.GetTypeMetatable(lightBuilderTypeName))
 	L.Push(ud)
@@ -49,6 +66,10 @@ func pushLightBuilder(L *lua.LState, lightID string, module *DesiredModule) {
 func checkLightBuilder(L *lua.LState) (*LightDesiredBuilder, *lua.LUserData) {
 	ud := L.CheckUserData(1)
 	if v, ok := ud.Value.(*LightDesiredBuilder); ok {
+		if v.module.closed {
+			L.RaiseError("desired builder belongs to a finished action")
+			return nil, nil
+		}
 		return v, ud
 	}
 	L.ArgError(1, "desired.light expected")
@@ -58,6 +79,7 @@ func checkLightBuilder(L *lua.LState) (*LightDesiredBuilder, *lua.LUserData) {
 // lightBuilderOn sets power to on (chainable).
 func lightBuilderOn(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.extra["power_mode"] = "enforce"
 	on := true
 	builder.state.On = &on
 	builder.module.markLightPending(builder)
@@ -68,6 +90,7 @@ func lightBuilderOn(L *lua.LState) int {
 // lightBuilderOff sets power to off (chainable).
 func lightBuilderOff(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.extra["power_mode"] = "enforce"
 	off := false
 	builder.state.On = &off
 	builder.module.markLightPending(builder)
@@ -78,22 +101,29 @@ func lightBuilderOff(L *lua.LState) int {
 // lightBuilderToggle toggles power based on current state.
 func lightBuilderToggle(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
-	// For toggle, flip the current desired power if set, otherwise turn on
-	if builder.state.On != nil {
-		newPower := !*builder.state.On
-		builder.state.On = &newPower
+	if builder.state.On == nil {
+		actual, err := builder.module.actualLight.Get(L.Context(), builder.lightID)
+		if err != nil {
+			L.RaiseError("read power for toggle: %s", err)
+			return 0
+		}
+		on := !(actual.On != nil && *actual.On)
+		builder.state.On = &on
 	} else {
-		on := true
+		on := !*builder.state.On
 		builder.state.On = &on
 	}
+	builder.extra["power_mode"] = "enforce"
 	builder.module.markLightPending(builder)
 	L.Push(ud)
 	return 1
+
 }
 
 // lightBuilderSetBri sets brightness (chainable).
 func lightBuilderSetBri(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.clear = append(builder.clear, "scene_name")
 	bri := L.CheckInt(2)
 
 	// Clamp to valid range
@@ -114,6 +144,11 @@ func lightBuilderSetBri(L *lua.LState) int {
 // lightBuilderSetColorXY sets CIE xy color coordinates (chainable).
 func lightBuilderSetColorXY(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.clear = append(builder.clear, "scene_name")
+	builder.state.Ct = nil
+	builder.state.Hue = nil
+	builder.state.Sat = nil
+	builder.clear = append(builder.clear, "ct", "hue", "sat")
 	x := float32(L.CheckNumber(2))
 	y := float32(L.CheckNumber(3))
 
@@ -126,6 +161,11 @@ func lightBuilderSetColorXY(L *lua.LState) int {
 // lightBuilderSetCt sets color temperature in mirek (chainable).
 func lightBuilderSetCt(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.clear = append(builder.clear, "scene_name")
+	builder.state.Xy = nil
+	builder.state.Hue = nil
+	builder.state.Sat = nil
+	builder.clear = append(builder.clear, "xy", "hue", "sat")
 	ct := L.CheckInt(2)
 
 	// Clamp to valid range
@@ -146,6 +186,10 @@ func lightBuilderSetCt(L *lua.LState) int {
 // lightBuilderSetHue sets hue value (chainable).
 func lightBuilderSetHue(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.clear = append(builder.clear, "scene_name")
+	builder.state.Ct = nil
+	builder.state.Xy = nil
+	builder.clear = append(builder.clear, "ct", "xy")
 	hue := L.CheckInt(2)
 
 	// Clamp to valid range
@@ -166,6 +210,10 @@ func lightBuilderSetHue(L *lua.LState) int {
 // lightBuilderSetSat sets saturation (chainable).
 func lightBuilderSetSat(L *lua.LState) int {
 	builder, ud := checkLightBuilder(L)
+	builder.clear = append(builder.clear, "scene_name")
+	builder.state.Ct = nil
+	builder.state.Xy = nil
+	builder.clear = append(builder.clear, "ct", "xy")
 	sat := L.CheckInt(2)
 
 	// Clamp to valid range
@@ -179,6 +227,60 @@ func lightBuilderSetSat(L *lua.LState) int {
 	satVal := uint8(sat)
 	builder.state.Sat = &satVal
 	builder.module.markLightPending(builder)
+	L.Push(ud)
+	return 1
+}
+
+func lightBuilderSetBrightness(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	v := float64(L.CheckNumber(2))
+	if v < 0 || v > 100 || math.IsNaN(v) || math.IsInf(v, 0) {
+		L.ArgError(2, "brightness must be finite 0..100 percent")
+		return 0
+	}
+	b.extra["brightness"] = v
+	b.state.Bri = nil
+	b.clear = append(b.clear, "bri", "scene_name")
+	b.module.markLightPending(b)
+	L.Push(ud)
+	return 1
+}
+func lightBuilderSetTransition(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	v := L.CheckInt(2)
+	if v < 0 || v > 86400000 {
+		L.ArgError(2, "transition must be 0..86400000 ms")
+		return 0
+	}
+	b.extra["duration"] = v
+	b.state.TransitionTime = nil
+	b.clear = append(b.clear, "transitiontime")
+	b.module.markLightPending(b)
+	L.Push(ud)
+	return 1
+}
+func lightBuilderPreservePower(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	b.state.On = nil
+	b.clear = append(b.clear, "on")
+	b.extra["power_mode"] = "preserve"
+	b.module.markLightPending(b)
+	L.Push(ud)
+	return 1
+}
+func lightBuilderNextOn(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	b.state.On = nil
+	b.clear = append(b.clear, "on")
+	b.extra["power_mode"] = "next_on"
+	b.module.markLightPending(b)
+	L.Push(ud)
+	return 1
+}
+func lightBuilderClearScene(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	b.clear = append(b.clear, "scene_name")
+	b.module.markLightPending(b)
 	L.Push(ud)
 	return 1
 }

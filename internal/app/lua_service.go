@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"time"
 
 	luastate "github.com/yuin/gopher-lua"
 
@@ -68,3 +69,7 @@ func (s *LuaService) Close() {
 func (s *LuaService) LState() *luastate.LState {
 	return s.Runtime.L
 }
+
+func (s *LuaService) Stop(ctx context.Context) error   { return s.Runtime.Stop(ctx) }
+func (s *LuaService) Status() lua.RuntimeStatus        { return s.Runtime.Status() }
+func (s *LuaService) SetActionTimeout(d time.Duration) { s.Runtime.SetActionTimeout(d) }

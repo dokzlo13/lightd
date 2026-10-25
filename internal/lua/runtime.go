@@ -2,137 +2,212 @@ package lua
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sync"
-
-	"github.com/rs/zerolog/log"
-	lua "github.com/yuin/gopher-lua"
-
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/lua/modules"
 	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
+	"github.com/rs/zerolog/log"
+	lua "github.com/yuin/gopher-lua"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
 )
 
-// ErrRuntimeClosed is returned when the Lua runtime is closed
-var ErrRuntimeClosed = fmt.Errorf("lua runtime closed")
+var ErrRuntimeClosed = errors.New("lua runtime closed")
+var ErrQueueFull = errors.New("lua work queue full")
 
-// LuaWork represents work to be executed on the Lua VM
-// All Lua execution MUST go through this to ensure thread safety
-type LuaWork func(ctx context.Context)
-
-// Runtime manages the Lua VM with single-threaded execution
+type LuaWork func(context.Context)
+type queuedWork struct {
+	ctx  context.Context
+	run  func(context.Context) error
+	done chan error
+}
+type RuntimeStatus struct {
+	Ready     bool   `json:"ready"`
+	Queued    int    `json:"queued"`
+	Running   bool   `json:"running"`
+	LastError string `json:"last_error,omitempty"`
+}
 type Runtime struct {
-	L    *lua.LState
-	deps RuntimeDeps
-
-	// Modules
+	L             *lua.LState
+	deps          RuntimeDeps
 	actionModule  *modules.ActionModule
 	schedModule   *modules.SchedModule
 	hueModule     *modules.HueModule
 	kvModule      *modules.KVModule
 	sseModule     *modules.SSEModule
 	webhookModule *modules.WebhookModule
-
-	// Work queue for thread-safe Lua execution
-	workQueue chan LuaWork
-
-	// Shutdown signaling - closing this channel signals senders to stop
-	// Using a channel in select is race-free (unlike mutex + bool)
-	closing   chan struct{}
-	closeOnce sync.Once
+	mu            sync.Mutex
+	workQueue     chan queuedWork
+	space         chan struct{}
+	done          chan struct{}
+	finishOnce    sync.Once
+	closed        bool
+	started       bool
+	running       bool
+	cancel        context.CancelFunc
+	actionTimeout time.Duration
+	lastError     string
 }
 
-// NewRuntime creates a new Lua runtime
 func NewRuntime(deps RuntimeDeps) *Runtime {
-	L := lua.NewState()
-
-	r := &Runtime{
-		L:         L,
-		deps:      deps,
-		workQueue: make(chan LuaWork, 100),
-		closing:   make(chan struct{}),
-	}
-
+	r := &Runtime{L: lua.NewState(), deps: deps, workQueue: make(chan queuedWork, 100), space: make(chan struct{}, 1), done: make(chan struct{}), actionTimeout: 30 * time.Second}
 	r.registerModules()
-
 	return r
 }
-
-// Close signals the runtime to stop accepting new work and closes the Lua state.
-// This is safe to call concurrently with Do/DoSync - they will see the closing signal.
-func (r *Runtime) Close() {
-	r.closeOnce.Do(func() {
-		close(r.closing)
-	})
-	// Note: We don't close workQueue to avoid send-on-closed-channel panics.
-	// The channel will be garbage collected when no longer referenced.
-	// Run() will exit when it sees the closing signal.
-	r.L.Close()
+func (r *Runtime) SetActionTimeout(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if d > 0 {
+		r.actionTimeout = d
+	}
 }
-
-// Do queues work to be executed on the Lua VM (thread-safe, non-blocking)
-// Returns false if the runtime is closing, queue is full, or context is cancelled.
-// Uses channel-based signaling for race-free shutdown detection.
+func (r *Runtime) Status() RuntimeStatus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return RuntimeStatus{Ready: r.started && !r.closed, Queued: len(r.workQueue), Running: r.running, LastError: r.lastError}
+}
 func (r *Runtime) Do(ctx context.Context, work LuaWork) bool {
-	select {
-	case <-r.closing:
-		log.Warn().Msg("Lua runtime closing, dropping work")
-		return false
-	case <-ctx.Done():
-		log.Warn().Msg("Context cancelled, dropping Lua work")
-		return false
-	case r.workQueue <- work:
-		return true
-	default:
-		log.Warn().Msg("Lua work queue full, dropping work")
-		return false
-	}
+	return r.enqueue(ctx, queuedWork{ctx: ctx, run: func(c context.Context) error { work(c); return nil }}, false) == nil
 }
-
-// DoSync queues work and blocks until there's space (thread-safe, blocking)
-// Returns error if the runtime is closing or context is cancelled.
-// Uses channel-based signaling for race-free shutdown detection.
 func (r *Runtime) DoSync(ctx context.Context, work LuaWork) error {
-	select {
-	case <-r.closing:
-		return ErrRuntimeClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	case r.workQueue <- work:
-		return nil
-	}
+	return r.enqueue(ctx, queuedWork{ctx: ctx, run: func(c context.Context) error { work(c); return nil }}, true)
 }
-
-// DoSyncWithResult queues work, waits for space, and waits for the result.
-// This is used by the scheduler to invoke actions synchronously through the Lua worker.
-// Uses channel-based signaling for race-free shutdown detection.
 func (r *Runtime) DoSyncWithResult(ctx context.Context, work func(context.Context) error) error {
-	done := make(chan error, 1)
-	wrappedWork := LuaWork(func(c context.Context) {
-		done <- work(c)
-	})
-
-	// Queue the work
-	select {
-	case <-r.closing:
-		return ErrRuntimeClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	case r.workQueue <- wrappedWork:
-		// Successfully queued
-	}
-
-	// Wait for result
-	select {
-	case <-r.closing:
-		return ErrRuntimeClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-done:
+	item := queuedWork{ctx: ctx, run: work, done: make(chan error, 1)}
+	if err := r.enqueue(ctx, item, true); err != nil {
 		return err
 	}
+	select {
+	case err := <-item.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (r *Runtime) enqueue(ctx context.Context, item queuedWork, wait bool) error {
+	for {
+		r.mu.Lock()
+		if r.closed {
+			r.mu.Unlock()
+			return ErrRuntimeClosed
+		}
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+		select {
+		case r.workQueue <- item:
+			r.mu.Unlock()
+			return nil
+		default:
+			r.mu.Unlock()
+		}
+		if !wait {
+			return ErrQueueFull
+		}
+		select {
+		case <-r.space:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.done:
+			return ErrRuntimeClosed
+		}
+	}
+}
+func (r *Runtime) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.Stop(ctx); err != nil {
+		log.Error().Err(err).Msg("Lua shutdown incomplete")
+	}
+}
+func (r *Runtime) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	if !r.closed {
+		r.closed = true
+		close(r.workQueue)
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
+	started := r.started
+	r.mu.Unlock()
+	if !started {
+		r.finish()
+	}
+	select {
+	case <-r.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func (r *Runtime) finish() { r.finishOnce.Do(func() { r.L.Close(); close(r.done) }) }
+func (r *Runtime) Run(parent context.Context) {
+	r.mu.Lock()
+	if r.started || r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.started = true
+	ctx, cancel := context.WithCancel(parent)
+	r.cancel = cancel
+	r.mu.Unlock()
+	defer cancel()
+	defer r.finish()
+	stop := context.AfterFunc(ctx, func() {
+		r.mu.Lock()
+		if !r.closed {
+			r.closed = true
+			close(r.workQueue)
+		}
+		r.mu.Unlock()
+	})
+	defer stop()
+	for item := range r.workQueue {
+		select {
+		case r.space <- struct{}{}:
+		default:
+		}
+		r.executeWork(ctx, item)
+	}
+}
+func (r *Runtime) executeWork(runtimeCtx context.Context, item queuedWork) {
+	r.mu.Lock()
+	r.running = true
+	timeout := r.actionTimeout
+	r.mu.Unlock()
+	ctx, cancel := context.WithTimeout(item.ctx, timeout)
+	stop := context.AfterFunc(runtimeCtx, cancel)
+	if runtimeCtx.Err() != nil {
+		cancel()
+	}
+	defer cancel()
+	defer stop()
+	var err error
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("Lua work panic: %v", p)
+		}
+		r.mu.Lock()
+		r.running = false
+		if err != nil {
+			r.lastError = err.Error()
+		}
+		r.mu.Unlock()
+		if item.done != nil {
+			item.done <- err
+		}
+		if err != nil {
+			log.Error().Err(err).Msg("Lua work failed")
+		}
+	}()
+	r.L.SetContext(ctx)
+	// Invoke callbacks even when cancelled so accepted receipts receive a terminal outcome.
+	err = item.run(ctx)
 }
 
 // registerModules registers all Lua modules
@@ -147,6 +222,7 @@ func (r *Runtime) registerModules() {
 
 	// Action module
 	r.actionModule = modules.NewActionModule(r.deps.Registry, r.deps.Bridge, r.deps.Stores, r.deps.Orchestrator)
+	r.actionModule.SetInvoker(r.deps.Invoker)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Sched module
@@ -183,50 +259,6 @@ func (r *Runtime) registerModules() {
 	r.L.PreloadModule("events.webhook", r.webhookModule.Loader)
 }
 
-// Run starts the Lua worker goroutine - this is the ONLY goroutine that touches Lua
-// It includes panic recovery to prevent crashes from killing the worker.
-// Exits when context is cancelled or runtime is closed.
-func (r *Runtime) Run(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			r.drainQueue(ctx)
-			return
-		case <-r.closing:
-			r.drainQueue(ctx)
-			return
-		case work := <-r.workQueue:
-			r.executeWork(ctx, work)
-		}
-	}
-}
-
-// drainQueue processes any remaining work in the queue before exiting
-func (r *Runtime) drainQueue(ctx context.Context) {
-	for {
-		select {
-		case work := <-r.workQueue:
-			r.executeWork(ctx, work)
-		default:
-			return
-		}
-	}
-}
-
-// executeWork runs a single work item with panic recovery
-func (r *Runtime) executeWork(ctx context.Context, work LuaWork) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Error().
-				Interface("panic", rec).
-				Msg("Lua work panicked - worker continuing")
-		}
-	}()
-	// Set context on LState so modules can access it via L.Context()
-	r.L.SetContext(ctx)
-	work(ctx)
-}
-
 // LoadScript loads and executes a Lua script (must be called before Run)
 func (r *Runtime) LoadScript(path string) error {
 	// Resolve path relative to config file
@@ -239,6 +271,9 @@ func (r *Runtime) LoadScript(path string) error {
 
 	log.Info().Str("path", path).Msg("Loading Lua script")
 
+	ctx, cancel := context.WithTimeout(context.Background(), r.actionTimeout)
+	defer cancel()
+	r.L.SetContext(ctx)
 	if err := r.L.DoFile(path); err != nil {
 		return fmt.Errorf("failed to execute Lua script: %w", err)
 	}

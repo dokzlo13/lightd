@@ -243,3 +243,30 @@ func (l *Ledger) SaveCursor(id string, at time.Time) error {
 	_, err := l.db.Exec(`INSERT INTO scheduler_cursors(id,planned_at) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET planned_at=max(planned_at,excluded.planned_at)`, id, at.UnixNano())
 	return err
 }
+
+// PatchTx applies explicit JSON field presence atomically; clear is evaluated
+// first, so a patch can replace a colour mode while preserving unrelated state.
+func (s *TypedStore[T]) PatchTx(tx *sql.Tx, id string, patch map[string]json.RawMessage, clear []string) error {
+	var payload string
+	current := map[string]json.RawMessage{}
+	err := tx.QueryRow(`SELECT payload FROM resource_state WHERE kind=? AND id=?`, s.kind, id).Scan(&payload)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil {
+		if err = json.Unmarshal([]byte(payload), &current); err != nil {
+			return err
+		}
+	}
+	for _, k := range clear {
+		delete(current, k)
+	}
+	for k, v := range patch {
+		current[k] = v
+	}
+	b, err := json.Marshal(current)
+	if err != nil {
+		return err
+	}
+	return s.store.SetTx(tx, s.kind, id, b)
+}

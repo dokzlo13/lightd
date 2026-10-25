@@ -1,19 +1,20 @@
 package middleware
 
-// ImmediateCollector flushes on every event (pass-through)
+import "sync"
+
 type ImmediateCollector struct {
+	mu      sync.Mutex
+	closed  bool
 	onFlush FlushFunc
 }
 
-// NewImmediateCollector creates a new ImmediateCollector
-func NewImmediateCollector(onFlush FlushFunc) *ImmediateCollector {
-	return &ImmediateCollector{onFlush: onFlush}
+func NewImmediateCollector(fn FlushFunc) *ImmediateCollector { return &ImmediateCollector{onFlush: fn} }
+func (c *ImmediateCollector) AddEvent(e map[string]any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrCollectorClosed
+	}
+	return c.onFlush([]map[string]any{e})
 }
-
-// AddEvent immediately flushes the event
-func (c *ImmediateCollector) AddEvent(event map[string]any) {
-	c.onFlush([]map[string]any{event})
-}
-
-// Close is a no-op for ImmediateCollector
-func (c *ImmediateCollector) Close() {}
+func (c *ImmediateCollector) Close() { c.mu.Lock(); defer c.mu.Unlock(); c.closed = true }

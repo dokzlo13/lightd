@@ -52,7 +52,10 @@ func (m *ReconcilerModule) reconcile() lua.LGFunction {
 
 		// Flush all pending desired state changes from builders
 		if m.desiredModule != nil {
-			m.desiredModule.Flush()
+			if err := m.desiredModule.Flush(); err != nil {
+				L.RaiseError("persist desired state: %s", err)
+				return 0
+			}
 		}
 
 		// Trigger orchestrator (MarkApplied is called after reconciliation completes)
@@ -69,7 +72,10 @@ func (m *ReconcilerModule) forceReconcile() lua.LGFunction {
 	return func(L *lua.LState) int {
 		// Flush all pending desired state changes from builders
 		if m.desiredModule != nil {
-			m.desiredModule.Flush()
+			if err := m.desiredModule.Flush(); err != nil {
+				L.RaiseError("persist desired state: %s", err)
+				return 0
+			}
 		}
 
 		// Trigger ALL resources for reconciliation
