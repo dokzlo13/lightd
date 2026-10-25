@@ -2,73 +2,113 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"sync"
+	"time"
 
-	"github.com/rs/zerolog/log"
-
+	"github.com/dokzlo13/lightd/internal/buildinfo"
 	"github.com/dokzlo13/lightd/internal/config"
+	"github.com/rs/zerolog/log"
 )
 
-// HealthService provides HTTP health check endpoints.
+// HealthService distinguishes process liveness from application admission health.
 type HealthService struct {
-	cfg    *config.Config
-	server *http.Server
+	cfg      *config.Config
+	mu       sync.RWMutex
+	server   *http.Server
+	done     chan struct{}
+	provider func(context.Context) (bool, any)
 }
 
-// NewHealthService creates a new HealthService.
-func NewHealthService(cfg *config.Config) *HealthService {
-	return &HealthService{
-		cfg: cfg,
-	}
+func NewHealthService(cfg *config.Config) *HealthService { return &HealthService{cfg: cfg} }
+func (s *HealthService) SetStatusProvider(fn func(context.Context) (bool, any)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.provider = fn
 }
-
-// Start begins the health check server if enabled.
-func (s *HealthService) Start(ctx context.Context) {
-	if !s.cfg.Healthcheck.Enabled {
-		log.Info().Msg("Health check server disabled")
-		return
-	}
-
-	go s.run(ctx)
-}
-
-func (s *HealthService) run(ctx context.Context) {
-	addr := fmt.Sprintf("%s:%d", s.cfg.Healthcheck.GetHost(), s.cfg.Healthcheck.GetPort())
-
+func (s *HealthService) handler() http.Handler {
 	mux := http.NewServeMux()
-
-	// Health check endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy"}`))
+		writeJSON(w, http.StatusOK, map[string]any{"status": "alive", "build": buildinfo.Info()})
 	})
-
-	// Ready check endpoint
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready"}`))
-	})
-
-	s.server = &http.Server{
-		Addr:    addr,
-		Handler: mux,
+	status := func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		fn := s.provider
+		s.mu.RUnlock()
+		ready := false
+		var detail any
+		if fn != nil {
+			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+			defer cancel()
+			ready, detail = fn(ctx)
+		}
+		code := http.StatusServiceUnavailable
+		if ready {
+			code = http.StatusOK
+		}
+		writeJSON(w, code, map[string]any{"ready": ready, "build": buildinfo.Info(), "details": detail})
 	}
+	mux.HandleFunc("/ready", status)
+	mux.HandleFunc("/status", status)
+	return mux
+}
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
 
-	log.Info().Str("addr", addr).Msg("Health check server enabled")
-
+// Start binds synchronously: address conflicts fail application startup.
+func (s *HealthService) Start(ctx context.Context) error {
+	if !s.cfg.Healthcheck.Enabled {
+		return nil
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(s.cfg.Healthcheck.GetHost(), fmt.Sprint(s.cfg.Healthcheck.GetPort())))
+	if err != nil {
+		return fmt.Errorf("health listener: %w", err)
+	}
+	s.mu.Lock()
+	s.server = &http.Server{Handler: s.handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	server := s.server
+	s.done = make(chan struct{})
+	done := s.done
+	s.mu.Unlock()
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.GetShutdownTimeout())
-		defer cancel()
-		if err := s.server.Shutdown(shutdownCtx); err != nil {
-			log.Error().Err(err).Msg("Health check server shutdown error")
+		defer close(done)
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error().Err(err).Msg("Health server stopped unexpectedly")
 		}
 	}()
-
-	if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error().Err(err).Msg("Health check server error")
+	go func() {
+		select {
+		case <-ctx.Done():
+			shutdown, cancel := context.WithTimeout(context.Background(), s.cfg.GetShutdownTimeout())
+			defer cancel()
+			_ = s.Close(shutdown)
+		case <-done:
+		}
+	}()
+	return nil
+}
+func (s *HealthService) Close(ctx context.Context) error {
+	s.mu.RLock()
+	server, done := s.server, s.done
+	s.mu.RUnlock()
+	if server == nil {
+		return nil
+	}
+	if err := server.Shutdown(ctx); err != nil {
+		_ = server.Close()
+		return err
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

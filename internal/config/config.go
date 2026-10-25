@@ -1,6 +1,9 @@
 package config
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -23,12 +26,14 @@ type Config struct {
 	Clients         ClientsConfig     `yaml:"clients"`
 	Script          string            `yaml:"script"`
 	ShutdownTimeout Duration          `yaml:"shutdown_timeout"`
+	ActionTimeout   Duration          `yaml:"action_timeout"`
 }
 
 // Default top-level values
 const (
 	DefaultScript            = "main.lua"
-	DefaultShutdownTimeout   = 5 * time.Second
+	DefaultShutdownTimeout   = 10 * time.Second
+	DefaultActionTimeout     = 30 * time.Second
 	DefaultSchedulerTimezone = "UTC"
 )
 
@@ -48,6 +53,13 @@ func (c *Config) GetShutdownTimeout() time.Duration {
 	return c.ShutdownTimeout.Duration()
 }
 
+func (c *Config) GetActionTimeout() time.Duration {
+	if c.ActionTimeout == 0 {
+		return DefaultActionTimeout
+	}
+	return c.ActionTimeout.Duration()
+}
+
 // EventsConfig groups all event source configurations
 type EventsConfig struct {
 	Webhook   WebhookConfig   `yaml:"webhook"`
@@ -64,7 +76,7 @@ type HueConfig struct {
 
 // Default timeout values
 const (
-	DefaultHueTimeout         = 30 * time.Second
+	DefaultHueTimeout         = 5 * time.Second
 	DefaultGeoHTTPTimeout     = 10 * time.Second
 	DefaultSSEMinRetryBackoff = 1 * time.Second
 	DefaultSSEMaxRetryBackoff = 2 * time.Minute
@@ -522,8 +534,17 @@ func Load(path string) (*Config, error) {
 	expanded := expandEnvVars(string(data))
 
 	var cfg Config
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
-		return nil, err
+	decoder := yaml.NewDecoder(bytes.NewBufferString(expanded))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode config: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("decode trailing config: %w", err)
+		}
+		return nil, fmt.Errorf("configuration must contain exactly one YAML document")
 	}
 
 	return &cfg, nil

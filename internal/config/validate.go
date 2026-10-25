@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"time"
 )
@@ -41,6 +42,15 @@ func (ve ValidationErrors) Error() string {
 func (c *Config) Validate() error {
 	var errs ValidationErrors
 
+	if c.GetShutdownTimeout() <= 0 {
+		errs = append(errs, ValidationError{"shutdown_timeout", "must be positive"})
+	}
+	if c.GetActionTimeout() <= 0 {
+		errs = append(errs, ValidationError{"action_timeout", "must be positive"})
+	}
+	if c.KV.GetCleanupInterval() <= 0 {
+		errs = append(errs, ValidationError{"kv.cleanup_interval", "must be positive"})
+	}
 	// Hue configuration
 	errs = append(errs, c.Hue.Validate()...)
 
@@ -80,7 +90,7 @@ func (c *Config) Validate() error {
 // validateScript checks that the script file exists
 func (c *Config) validateScript() (errs []ValidationError) {
 	scriptPath := c.GetScript()
-	if _, err := os.Stat(scriptPath); err != nil {
+	if info, err := os.Stat(scriptPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, ValidationError{
 				Field:   "script",
@@ -92,6 +102,8 @@ func (c *Config) validateScript() (errs []ValidationError) {
 				Message: fmt.Sprintf("cannot access script file %s: %v", scriptPath, err),
 			})
 		}
+	} else if !info.Mode().IsRegular() {
+		errs = append(errs, ValidationError{"script", "must be a regular file"})
 	}
 	return errs
 }
@@ -162,7 +174,7 @@ func (c *ReconcilerConfig) Validate() (errs []ValidationError) {
 			Message: "debounce must be non-negative",
 		})
 	}
-	if c.RateLimitRPS < 0 {
+	if math.IsNaN(c.RateLimitRPS) || math.IsInf(c.RateLimitRPS, 0) || c.RateLimitRPS < 0 {
 		errs = append(errs, ValidationError{
 			Field:   "reconciler.rate_limit_rps",
 			Message: "rate limit must be non-negative",
@@ -236,17 +248,16 @@ func (c *SSEConfig) Validate() (errs []ValidationError) {
 			Message: "max retry backoff must be positive",
 		})
 	}
-	if c.MinRetryBackoff != 0 && c.MaxRetryBackoff != 0 &&
-		c.MinRetryBackoff.Duration() > c.MaxRetryBackoff.Duration() {
+	if c.GetMinRetryBackoff() > c.GetMaxRetryBackoff() {
 		errs = append(errs, ValidationError{
 			Field:   "events.sse",
 			Message: "min_retry_backoff cannot be greater than max_retry_backoff",
 		})
 	}
-	if c.RetryMultiplier < 0 {
+	if math.IsNaN(c.RetryMultiplier) || math.IsInf(c.RetryMultiplier, 0) || c.GetRetryMultiplier() < 1 {
 		errs = append(errs, ValidationError{
 			Field:   "events.sse.retry_multiplier",
-			Message: "retry multiplier must be non-negative",
+			Message: "retry multiplier must be finite and at least one",
 		})
 	}
 	if c.MaxReconnects < 0 {
@@ -298,13 +309,13 @@ func (c *GeoConfig) Validate(schedulerEnabled bool) (errs []ValidationError) {
 
 	// Validate lat/lon ranges
 	if hasCoordinates {
-		if c.Lat < -90 || c.Lat > 90 {
+		if math.IsNaN(c.Lat) || math.IsInf(c.Lat, 0) || c.Lat < -90 || c.Lat > 90 {
 			errs = append(errs, ValidationError{
 				Field:   "events.scheduler.geo.lat",
 				Message: fmt.Sprintf("latitude must be between -90 and 90, got %f", c.Lat),
 			})
 		}
-		if c.Lon < -180 || c.Lon > 180 {
+		if math.IsNaN(c.Lon) || math.IsInf(c.Lon, 0) || c.Lon < -180 || c.Lon > 180 {
 			errs = append(errs, ValidationError{
 				Field:   "events.scheduler.geo.lon",
 				Message: fmt.Sprintf("longitude must be between -180 and 180, got %f", c.Lon),

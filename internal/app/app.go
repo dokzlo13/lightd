@@ -4,97 +4,73 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
-	"github.com/rs/zerolog/log"
-
 	"github.com/dokzlo13/lightd/internal/config"
+	"github.com/rs/zerolog/log"
 )
 
-// App is the main application container that manages all services and their lifecycle.
-// It provides dependency injection and enables testable architecture.
 type App struct {
 	cfg      *config.Config
 	services *Services
 	ctx      context.Context
 	cancel   context.CancelFunc
+	mu       sync.Mutex
+	fatal    error
 }
 
-// New creates a new App instance with all services initialized but not started.
 func New(cfg *config.Config) (*App, error) {
-	services, err := NewServices(cfg)
+	s, err := NewServices(cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	return &App{
-		cfg:      cfg,
-		services: services,
-	}, nil
+	return &App{cfg: cfg, services: s}, nil
 }
-
-// Start initializes and starts all services.
-// The provided context is used for cancellation.
 func (a *App) Start(ctx context.Context) error {
 	a.ctx, a.cancel = context.WithCancel(ctx)
-
-	// Fatal error handler - cancels the app context to trigger shutdown
-	onFatalError := func(err error) {
-		log.Error().Err(err).Msg("Fatal error, initiating shutdown")
+	onFatal := func(err error) {
+		a.mu.Lock()
+		if a.fatal == nil {
+			a.fatal = err
+		}
+		a.mu.Unlock()
+		log.Error().Err(err).Msg("Fatal service error")
 		a.cancel()
 	}
-
-	if err := a.services.Start(a.ctx, onFatalError); err != nil {
+	if err := a.services.Start(a.ctx, onFatal); err != nil {
+		a.cancel()
+		_ = a.services.Stop()
 		return err
 	}
-
-	log.Info().Msg("HuePlanner started")
+	log.Info().Msg("lightd started")
 	return nil
 }
-
-// Stop gracefully shuts down all services.
 func (a *App) Stop() error {
-	log.Info().Msg("Shutting down...")
-
 	if a.cancel != nil {
 		a.cancel()
 	}
-
 	if a.services != nil {
 		return a.services.Stop()
 	}
-
 	return nil
 }
-
-// Wait blocks until the application context is cancelled.
-func (a *App) Wait() {
+func (a *App) Wait() error {
 	if a.ctx != nil {
 		<-a.ctx.Done()
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.fatal
 }
-
-// ClearDesiredState clears the stored desired state.
-// This is useful for resetting state on startup with --reset-state flag.
 func (a *App) ClearDesiredState() error {
 	if a.services != nil {
 		return a.services.ClearState()
 	}
 	return nil
 }
-
-// SignalContext creates a context that is cancelled when SIGINT or SIGTERM is received.
 func SignalContext() context.Context {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		sig := <-sigChan
-		log.Warn().Str("signal", sig.String()).Msg("Received shutdown signal")
-		cancel()
-	}()
-
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	go func() { <-ctx.Done(); stop() }()
 	return ctx
 }

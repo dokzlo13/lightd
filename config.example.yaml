@@ -75,3 +75,6 @@ clients:
     max_response_size: 1048576    # Max response body size in bytes (1MB)
 
 script: "main.lua"
+
+# Maximum execution time for a top-level Lua action
+action_timeout: "${ACTION_TIMEOUT:30s}"

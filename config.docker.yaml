@@ -9,7 +9,7 @@
 hue:
   bridge: "${HUE_BRIDGE}"
   token: "${HUE_TOKEN}"
-  timeout: "${HUE_TIMEOUT:30s}"
+  timeout: "${HUE_TIMEOUT:5s}"
 
 database:
   path: "${DATABASE_PATH:/app/data/lightd.sqlite}"
@@ -42,7 +42,7 @@ eventbus:
 kv:
   cleanup_interval: "${KV_CLEANUP_INTERVAL:5m}"
 
-shutdown_timeout: "${SHUTDOWN_TIMEOUT:5s}"
+shutdown_timeout: "${SHUTDOWN_TIMEOUT:10s}"
 
 events:
   webhook:
@@ -83,3 +83,6 @@ clients:
 # Path to Lua script - mount your scripts to /app/config/
 script: "${SCRIPT_PATH:/app/config/lightd.lua}"
 
+
+# Maximum execution time for a top-level Lua action
+action_timeout: "${ACTION_TIMEOUT:30s}"
