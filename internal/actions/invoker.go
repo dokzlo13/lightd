@@ -2,106 +2,137 @@ package actions
 
 import (
 	"context"
+	"errors"
 	"fmt"
-
-	"github.com/rs/zerolog/log"
+	"time"
 
 	"github.com/dokzlo13/lightd/internal/storage"
+	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
-// Invoker executes actions with deduplication
+var ErrAdmissionRejected = errors.New("action queue admission rejected")
+
+type Executor interface {
+	Do(context.Context, func(context.Context)) bool
+}
+type Metadata struct {
+	PlannedAt     time.Time
+	PolicyVersion string
+	Generation    int64
+}
+type metadataKey struct{}
+type invocationKey struct{}
+type invocationContext struct {
+	ID      string
+	Invoker *Invoker
+}
+
+func WithMetadata(ctx context.Context, m Metadata) context.Context {
+	return context.WithValue(ctx, metadataKey{}, m)
+}
+func InvocationID(ctx context.Context) string {
+	v, _ := ctx.Value(invocationKey{}).(invocationContext)
+	return v.ID
+}
+
+// Invoker records receipts and terminal outcomes independently of deduplication.
 type Invoker struct {
 	registry   *Registry
 	ledger     *storage.Ledger
-	ctxFactory func(ctx context.Context) *Context
+	ctxFactory func(context.Context) *Context
 }
 
-// NewInvoker creates a new action invoker
-func NewInvoker(registry *Registry, l *storage.Ledger, ctxFactory func(ctx context.Context) *Context) *Invoker {
-	return &Invoker{
-		registry:   registry,
-		ledger:     l,
-		ctxFactory: ctxFactory,
-	}
+func NewInvoker(r *Registry, l *storage.Ledger, f func(context.Context) *Context) *Invoker {
+	return &Invoker{r, l, f}
 }
-
-// Invoke executes an action with the given idempotency key
-// - For schedules: idempotencyKey = occurrence_id ("scene:dawn/1735372800")
-// - For buttons: idempotencyKey = button_event_id (from Hue SSE)
-// - For manual/programmatic calls: idempotencyKey = "" (no dedupe)
-func (i *Invoker) Invoke(ctx context.Context, actionName string, args map[string]any, idempotencyKey string) error {
-	return i.invoke(ctx, actionName, args, idempotencyKey, "", "")
+func (i *Invoker) HasAction(name string) bool { _, ok := i.registry.Get(name); return ok }
+func (i *Invoker) receipt(ctx context.Context, name, key, source, def string) (storage.Invocation, bool, error) {
+	if source == "" {
+		source = "manual"
+	}
+	m, _ := ctx.Value(metadataKey{}).(Metadata)
+	in := storage.Invocation{ID: uuid.NewString(), Action: name, Key: key, Source: source, Definition: def, ParentID: InvocationID(ctx), PlannedAt: m.PlannedAt, PolicyVersion: m.PolicyVersion, Generation: m.Generation}
+	ok, err := i.ledger.Receive(ctx, in)
+	return in, ok, err
 }
-
-// InvokeWithSource is like Invoke but includes source and def_id for ledger tracking
-func (i *Invoker) InvokeWithSource(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error {
-	return i.invoke(ctx, actionName, args, idempotencyKey, source, defID)
+func (i *Invoker) Invoke(ctx context.Context, name string, args map[string]any, key string) error {
+	return i.InvokeWithSource(ctx, name, args, key, "manual", "")
 }
-
-// HasAction checks if an action is registered
-func (i *Invoker) HasAction(actionName string) bool {
-	_, exists := i.registry.Get(actionName)
-	return exists
-}
-
-// invoke is the shared implementation for Invoke and InvokeWithSource
-func (i *Invoker) invoke(ctx context.Context, actionName string, args map[string]any, idempotencyKey, source, defID string) error {
-	// Check if already completed (dedupe)
-	if idempotencyKey != "" && i.ledger.HasCompleted(idempotencyKey) {
-		log.Debug().
-			Str("action", actionName).
-			Str("idempotency_key", idempotencyKey).
-			Msg("Action already completed, skipping")
-		return nil
-	}
-
-	// Get action
-	action, exists := i.registry.Get(actionName)
-	if !exists {
-		return fmt.Errorf("action %q not found", actionName)
-	}
-
-	actx := i.ctxFactory(ctx)
-
-	// Execute action
-	logEvent := log.Info().Str("action", actionName)
-	if source != "" {
-		logEvent = logEvent.Str("source", source)
-	}
-	if defID != "" {
-		logEvent = logEvent.Str("def_id", defID)
-	}
-	if len(args) > 0 {
-		logEvent = logEvent.Interface("args", args)
-	}
-	logEvent.Msg("Executing action")
-
-	err := action.Execute(actx, args)
-
-	// Log completion or failure
-	if err != nil {
-		if idempotencyKey != "" {
-			i.appendLedger(storage.EventActionFailed, idempotencyKey, source, defID, map[string]any{
-				"action": actionName,
-				"error":  err.Error(),
-			})
-		}
+func (i *Invoker) InvokeWithSource(ctx context.Context, name string, args map[string]any, key, source, def string) error {
+	in, ok, err := i.receipt(ctx, name, key, source, def)
+	if err != nil || !ok {
 		return err
 	}
-
-	if idempotencyKey != "" {
-		i.appendLedger(storage.EventActionCompleted, idempotencyKey, source, defID, map[string]any{
-			"action": actionName,
-		})
-	}
-
-	return nil
+	return i.execute(ctx, in, func(context.Context) (map[string]any, error) { return args, nil })
+}
+func (i *Invoker) Queue(ctx context.Context, executor Executor, name string, args map[string]any, key, source, def string) error {
+	return i.QueuePrepared(ctx, executor, name, key, source, def, func(context.Context) (map[string]any, error) { return args, nil })
 }
 
-// appendLedger appends to ledger, using source/defID if provided
-func (i *Invoker) appendLedger(eventType storage.EventType, idempotencyKey, source, defID string, payload map[string]any) error {
-	if source != "" || defID != "" {
-		return i.ledger.AppendWithSource(eventType, idempotencyKey, source, defID, payload)
+// QueuePrepared persists receipt before admission. prepare runs on the Lua worker,
+// so reducers can safely use Lua. A reducer failure never invokes the action.
+func (i *Invoker) QueuePrepared(ctx context.Context, executor Executor, name, key, source, def string, prepare func(context.Context) (map[string]any, error)) error {
+	in, ok, err := i.receipt(ctx, name, key, source, def)
+	if err != nil || !ok {
+		return err
 	}
-	return i.ledger.Append(eventType, idempotencyKey, payload)
+	if executor.Do(ctx, func(workCtx context.Context) {
+		if err := i.execute(workCtx, in, prepare); err != nil {
+			log.Error().Err(err).Str("invocation_id", in.ID).Str("action", name).Msg("Action failed")
+		}
+	}) {
+		return nil
+	}
+	recordErr := i.finish(in, "rejected", ErrAdmissionRejected, nil)
+	return errors.Join(ErrAdmissionRejected, recordErr)
+}
+func (i *Invoker) finish(in storage.Invocation, status string, err error, actx *Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if actx == nil {
+		return i.ledger.FinishInvocation(ctx, in, status, err, nil)
+	}
+	return i.ledger.FinishInvocation(ctx, in, status, err, actx.commit)
+}
+func (i *Invoker) execute(ctx context.Context, in storage.Invocation, prepare func(context.Context) (map[string]any, error)) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("action panicked: %v", p)
+		}
+		if err != nil {
+			err = errors.Join(err, i.finish(in, "failed", err, nil))
+		}
+	}()
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = i.ledger.StartInvocation(ctx, in); err != nil {
+		return err
+	}
+	ctx = context.WithValue(ctx, invocationKey{}, invocationContext{ID: in.ID, Invoker: i})
+	args, err := prepare(ctx)
+	if err != nil {
+		return err
+	}
+	action, ok := i.registry.Get(in.Action)
+	if !ok {
+		return fmt.Errorf("action %q not found", in.Action)
+	}
+	actx := i.ctxFactory(ctx)
+	actx.runAction = func(name string, args map[string]any) error {
+		return i.InvokeWithSource(ctx, name, args, "", "lua", "")
+	}
+	log.Info().Str("action", in.Action).Str("source", in.Source).Str("invocation_id", in.ID).Msg("Executing action")
+	if err = action.Execute(actx, args); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = i.finish(in, "completed", nil, actx); err != nil {
+		return fmt.Errorf("commit action outcome: %w", err)
+	}
+	actx.committed()
+	return nil
 }

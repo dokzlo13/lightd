@@ -54,4 +54,3 @@ type Bucket interface {
 	// Clear removes all keys from the bucket.
 	Clear() error
 }
-

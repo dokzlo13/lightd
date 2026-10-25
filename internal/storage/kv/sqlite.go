@@ -183,4 +183,3 @@ func CleanupExpired(db *sql.DB) (int64, error) {
 
 	return result.RowsAffected()
 }
-

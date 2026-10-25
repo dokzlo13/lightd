@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 )
@@ -91,11 +93,5 @@ func (s *TypedStore[T]) GetAll() (map[string]T, map[string]int64, error) {
 // Update applies a modification function to the current state.
 // If the ID doesn't exist, the modify function receives the zero value.
 func (s *TypedStore[T]) Update(id string, modify func(current T) T) error {
-	current, _, err := s.Get(id)
-	if err != nil {
-		return err
-	}
-
-	updated := modify(current)
-	return s.Set(id, updated)
+	return s.Transaction(context.Background(), func(tx *sql.Tx) error { return s.UpdateTx(tx, id, modify) })
 }

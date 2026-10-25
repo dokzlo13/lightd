@@ -3,6 +3,7 @@ package actions
 
 import (
 	"context"
+	"database/sql"
 
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
 	"github.com/dokzlo13/lightd/internal/storage"
@@ -22,11 +23,13 @@ type Reconciler interface {
 // Context is the capability interface provided to actions
 // It exposes stable methods, not raw pointers
 type Context struct {
-	ctx        context.Context // Go context for cancellation/timeout
-	actual     ActualState
-	desired    *storage.TypedStore[group.Desired]
-	reconciler Reconciler
-	runAction  func(name string, args map[string]any) error
+	ctx         context.Context // Go context for cancellation/timeout
+	actual      ActualState
+	desired     *storage.TypedStore[group.Desired]
+	reconciler  Reconciler
+	runAction   func(name string, args map[string]any) error
+	commitHooks []func(*sql.Tx) error
+	afterCommit []func()
 }
 
 // NewContext creates a new ActionContext
@@ -121,4 +124,27 @@ func (c *Context) GetScene(groupID string) string {
 		return ""
 	}
 	return state.SceneName
+}
+
+// DeferCommit registers final transactional state writes and post-commit signals.
+func (c *Context) DeferCommit(write func(*sql.Tx) error, after func()) {
+	if write != nil {
+		c.commitHooks = append(c.commitHooks, write)
+	}
+	if after != nil {
+		c.afterCommit = append(c.afterCommit, after)
+	}
+}
+func (c *Context) commit(tx *sql.Tx) error {
+	for _, fn := range c.commitHooks {
+		if err := fn(tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (c *Context) committed() {
+	for _, fn := range c.afterCommit {
+		fn()
+	}
 }

@@ -124,6 +124,9 @@ func (l *Ledger) GetByTimeRange(start, end time.Time, limit int) ([]*Entry, erro
 // DeleteOlderThan removes entries older than the specified duration (retention policy)
 func (l *Ledger) DeleteOlderThan(retention time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-retention).Unix()
+	if _, err := l.db.Exec(`DELETE FROM invocations WHERE received_at < ? AND status NOT IN ('accepted','running')`, time.Now().Add(-retention).UnixNano()); err != nil {
+		return 0, err
+	}
 	result, err := l.db.Exec(`
 		DELETE FROM event_ledger WHERE timestamp < ?
 	`, cutoff)

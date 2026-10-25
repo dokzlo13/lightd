@@ -2,12 +2,12 @@ package events
 
 import (
 	"context"
-	"sync"
-
+	"errors"
 	"github.com/rs/zerolog/log"
+	"sync"
+	"sync/atomic"
 )
 
-// EventType represents the type of event
 type EventType string
 
 const (
@@ -18,148 +18,117 @@ const (
 	EventTypeSchedule     EventType = "schedule"
 	EventTypeWebhook      EventType = "webhook"
 )
-
-// Default configuration
 const (
 	DefaultWorkerCount = 4
 	DefaultQueueSize   = 100
 )
 
-// Event represents an event in the system
+var ErrClosed = errors.New("event bus closed")
+var ErrQueueFull = errors.New("event bus queue full")
+
 type Event struct {
 	Type EventType
 	Data map[string]interface{}
 }
-
-// Handler is a function that handles events
 type Handler func(Event)
-
-// work represents a unit of work for the worker pool
 type work struct {
-	event   Event
-	handler Handler
+	event    Event
+	handlers []Handler
 }
 
-// Bus provides event routing with a bounded worker pool
+// Ack handlers must only admit bounded work, never execute Lua. They run in
+// publication order. Legacy handlers share one worker to preserve input order.
 type Bus struct {
-	mu       sync.RWMutex
-	handlers map[EventType][]Handler
-
-	// Worker pool
+	mu        sync.Mutex
+	publishMu sync.Mutex
+	handlers  map[EventType][]Handler
+	ack       map[EventType][]func(Event) error
 	workQueue chan work
-	wg        sync.WaitGroup
-
-	// Shutdown signaling - closing this channel signals publishers to stop
-	// Using a channel in select is race-free (unlike mutex + bool)
-	closing   chan struct{}
-	closeOnce sync.Once
+	closed    bool
+	done      chan struct{}
+	rejected  atomic.Uint64
 }
 
-// NewBus creates a new event bus with default settings
-func NewBus() *Bus {
-	return NewBusWithConfig(DefaultWorkerCount, DefaultQueueSize)
-}
-
-// NewBusWithConfig creates a new event bus with custom worker count and queue size
-func NewBusWithConfig(workerCount, queueSize int) *Bus {
-	b := &Bus{
-		handlers:  make(map[EventType][]Handler),
-		workQueue: make(chan work, queueSize),
-		closing:   make(chan struct{}),
+func NewBus() *Bus { return NewBusWithConfig(DefaultWorkerCount, DefaultQueueSize) }
+func NewBusWithConfig(workers, size int) *Bus {
+	if size < 1 {
+		size = DefaultQueueSize
 	}
-
-	// Start worker pool
-	for i := 0; i < workerCount; i++ {
-		b.wg.Add(1)
-		go b.worker(i)
-	}
-
-	log.Debug().Int("workers", workerCount).Int("queue_size", queueSize).Msg("Event bus worker pool started")
+	b := &Bus{handlers: map[EventType][]Handler{}, ack: map[EventType][]func(Event) error{}, workQueue: make(chan work, size), done: make(chan struct{})}
+	go b.worker()
 	return b
 }
-
-// worker processes events from the work queue
-func (b *Bus) worker(id int) {
-	defer b.wg.Done()
-
+func (b *Bus) worker() {
+	defer close(b.done)
 	for w := range b.workQueue {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Error().
-						Interface("panic", r).
-						Str("event_type", string(w.event.Type)).
-						Int("worker", id).
-						Msg("Event handler panicked")
-				}
+		for _, h := range w.handlers {
+			func() {
+				defer func() {
+					if p := recover(); p != nil {
+						log.Error().Interface("panic", p).Msg("Event handler panicked")
+					}
+				}()
+				h(w.event)
 			}()
-			w.handler(w.event)
-		}()
-	}
-}
-
-// Subscribe registers a handler for a specific event type
-func (b *Bus) Subscribe(eventType EventType, handler Handler) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.handlers[eventType] = append(b.handlers[eventType], handler)
-}
-
-// Publish sends an event to all subscribed handlers.
-// Non-blocking: if the work queue is full or bus is closing, events are dropped.
-// Uses channel-based signaling for race-free shutdown detection.
-func (b *Bus) Publish(event Event) {
-	b.mu.RLock()
-	handlers := b.handlers[event.Type]
-	b.mu.RUnlock()
-
-	for _, handler := range handlers {
-		select {
-		case <-b.closing:
-			log.Warn().Str("event_type", string(event.Type)).Msg("Event bus closing, dropping event")
-			return
-		case b.workQueue <- work{event: event, handler: handler}:
-			// Successfully queued
-		default:
-			// Queue full - drop event with warning
-			log.Warn().
-				Str("event_type", string(event.Type)).
-				Msg("Event bus queue full, dropping event")
 		}
 	}
 }
-
-// Close shuts down the worker pool gracefully.
-// First signals publishers to stop, then closes the work queue and waits for workers.
+func (b *Bus) Subscribe(t EventType, h Handler) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.handlers[t] = append(b.handlers[t], h)
+}
+func (b *Bus) SubscribeAck(t EventType, h func(Event) error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ack[t] = append(b.ack[t], h)
+}
+func (b *Bus) Publish(e Event) error {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		b.rejected.Add(1)
+		return ErrClosed
+	}
+	hs := append([]Handler(nil), b.handlers[e.Type]...)
+	as := append([]func(Event) error(nil), b.ack[e.Type]...)
+	b.mu.Unlock()
+	for _, h := range as {
+		if err := h(e); err != nil {
+			b.rejected.Add(1)
+			return err
+		}
+	}
+	if len(hs) > 0 {
+		select {
+		case b.workQueue <- work{e, hs}:
+		default:
+			b.rejected.Add(1)
+			return ErrQueueFull
+		}
+	}
+	return nil
+}
 func (b *Bus) Close(ctx context.Context) {
-	// Signal publishers to stop sending
-	b.closeOnce.Do(func() {
-		close(b.closing)
-	})
-
-	// Now it's safe to close the work queue - no new sends after closing is signaled
-	close(b.workQueue)
-
-	// Wait for workers to finish with timeout
-	done := make(chan struct{})
-	go func() {
-		b.wg.Wait()
-		close(done)
-	}()
-
+	b.publishMu.Lock()
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		close(b.workQueue)
+	}
+	b.mu.Unlock()
+	b.publishMu.Unlock()
 	select {
-	case <-done:
-		log.Debug().Msg("Event bus workers stopped gracefully")
+	case <-b.done:
 	case <-ctx.Done():
-		log.Warn().Msg("Event bus shutdown timed out, some events may be lost")
 	}
 }
-
-// Clear removes all handlers
 func (b *Bus) Clear() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	b.handlers = make(map[EventType][]Handler)
+	b.handlers = map[EventType][]Handler{}
+	b.ack = map[EventType][]func(Event) error{}
 }
+func (b *Bus) Rejected() uint64 { return b.rejected.Load() }

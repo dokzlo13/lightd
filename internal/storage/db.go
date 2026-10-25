@@ -15,11 +15,12 @@ type DB struct {
 
 // Open opens the database and initializes the schema
 func Open(dbPath string) (*DB, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 
+	db.SetMaxOpenConns(1)
 	if err := initSchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
@@ -118,7 +119,7 @@ func initSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to create kv_store table: %w", err)
 	}
 
-	return nil
+	return initInvocations(db)
 }
 
 // Close closes the database connection
