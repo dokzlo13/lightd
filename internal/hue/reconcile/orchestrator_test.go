@@ -186,3 +186,29 @@ func TestRetryAgeSurvivesRestartAndExpires(t *testing.T) {
 		t.Fatal("new desired version failed to recover expired work")
 	}
 }
+
+func TestImportedHistoricalDesiredIsNotReplayed(t *testing.T) {
+	db := deliveryDB(t)
+	if _, err := db.Exec(`CREATE TABLE resource_state(kind TEXT,id TEXT,version INTEGER); INSERT INTO resource_state VALUES('group','fixture',1)`); err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeResource{version: 1}
+	o := NewOrchestrator(0, 0, 10)
+	o.Register(fakeProvider{r})
+	if err := o.SetDB(db); err != nil {
+		t.Fatal(err)
+	}
+	o.reconcileAll(context.Background())
+	if r.attempts != 0 {
+		t.Fatal("unknown historical desired caused a startup write")
+	}
+	s := o.Status()
+	if s.Imported["group:fixture"] != 1 || len(s.Acknowledged) != 0 {
+		t.Fatalf("import confused with acknowledgment: %#v", s)
+	}
+	r.version = 2
+	o.reconcileAll(context.Background())
+	if r.attempts != 1 {
+		t.Fatal("fresh desired frame did not activate")
+	}
+}

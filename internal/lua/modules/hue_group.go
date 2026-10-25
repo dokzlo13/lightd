@@ -187,6 +187,10 @@ func hueSetScene(L *lua.LState) int {
 		s.On = &on
 		s.PowerMode = "enforce"
 	}
+	if L.Get(4) != lua.LNil {
+		duration := L.CheckInt(4)
+		s.Duration = &duration
+	}
 	if err := r.client.ApplyGroup(hueContext(L), r.id, s, L.CheckString(2)); err != nil {
 		L.RaiseError("%s", err)
 		return 0
@@ -206,6 +210,10 @@ func hueSetState(L *lua.LState) int {
 	d.DisallowUnknownFields()
 	if err = d.Decode(&s); err != nil {
 		L.RaiseError("invalid native Hue state: %s", err)
+		return 0
+	}
+	if s.PowerMode == "next_on" {
+		L.RaiseError("next_on requires ctx.desired, not an immediate Hue call")
 		return 0
 	}
 	return hueApply(L, r, s)

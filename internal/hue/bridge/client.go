@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -30,23 +31,25 @@ type Status struct {
 // Client owns policy around the generated SDK: deadlines, sparse commands,
 // resource catalog, per-light serialization and persisted manual authority.
 type Client struct {
-	commandGate            chan struct{}
-	memoryAuthority        map[string]targetAuthority
-	connectivity           map[string]bool
-	api                    *openhue.ClientWithResponses
-	http                   *http.Client
-	base, address, token   string
-	db                     *sql.DB
-	timeout                time.Duration
-	mu                     sync.RWMutex
-	groups                 map[string]Group
-	scenes                 map[string]Scene
-	status                 Status
-	commandMu              sync.Mutex
-	lightLimit, groupLimit *rate.Limiter
+	commandGate          chan struct{}
+	memoryAuthority      map[string]targetAuthority
+	connectivity         map[string]bool
+	api                  *openhue.ClientWithResponses
+	http                 *http.Client
+	base, address, token string
+	db                   *sql.DB
+	timeout              time.Duration
+	mu                   sync.RWMutex
+	groups               map[string]Group
+	scenes               map[string]Scene
+	status               Status
+	lightLimit           *rate.Limiter
 }
 
-func New(address, token string, timeout time.Duration) *Client {
+func New(address, token string, timeout time.Duration) (*Client, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = timeout
@@ -75,8 +78,7 @@ func New(address, token string, timeout time.Duration) *Client {
 		return err
 	}}
 
-	c, _ := NewWithHTTP(address, token, &http.Client{Transport: transport, Timeout: timeout}, timeout)
-	return c
+	return NewWithHTTP(address, token, &http.Client{Transport: transport, Timeout: timeout}, timeout)
 }
 func NewWithHTTP(address, token string, h *http.Client, timeout time.Duration) (*Client, error) {
 	if timeout <= 0 {
@@ -93,8 +95,8 @@ func NewWithHTTP(address, token string, h *http.Client, timeout time.Duration) (
 	if h == nil {
 		return nil, fmt.Errorf("HTTP client is required")
 	}
-	c := &Client{commandGate: make(chan struct{}, 1), memoryAuthority: map[string]targetAuthority{}, http: h, base: base, address: u.Host, token: token, timeout: timeout, groups: map[string]Group{}, scenes: map[string]Scene{}, lightLimit: rate.NewLimiter(10, 1), groupLimit: rate.NewLimiter(1, 1)}
-	c.api, err = openhue.NewClientWithResponses(base, openhue.WithHTTPClient(h), openhue.WithRequestEditorFn(func(ctx context.Context, r *http.Request) error {
+	c := &Client{commandGate: make(chan struct{}, 1), memoryAuthority: map[string]targetAuthority{}, http: h, base: base, address: u.Host, token: token, timeout: timeout, groups: map[string]Group{}, scenes: map[string]Scene{}, lightLimit: rate.NewLimiter(10, 1)}
+	c.api, err = openhue.NewClientWithResponses(base, openhue.WithHTTPClient(boundedDoer{h}), openhue.WithRequestEditorFn(func(ctx context.Context, r *http.Request) error {
 		r.Header.Set("hue-application-key", token)
 		return nil
 	}))
@@ -105,11 +107,7 @@ func (c *Client) SetDB(db *sql.DB) error {
 	if db == nil {
 		return nil
 	}
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS hue_manual_fences_v1 (light_id TEXT NOT NULL,kind TEXT NOT NULL,resource_id TEXT NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(light_id,kind,resource_id))`)
-	if err != nil {
-		return err
-	}
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS hue_target_authority_v1(light_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,kind TEXT NOT NULL,resource_id TEXT NOT NULL,version INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0)`)
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS hue_target_authority_v1(light_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,kind TEXT NOT NULL,resource_id TEXT NOT NULL,version INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0)`)
 	return err
 }
 func (c *Client) Address() string          { return c.address }
@@ -117,8 +115,6 @@ func (c *Client) Token() string            { return c.token }
 func (c *Client) BaseURL() string          { return c.base }
 func (c *Client) HTTPClient() *http.Client { return c.http }
 func (c *Client) Timeout() time.Duration   { return c.timeout }
-func (c *Client) V1() *Client              { return c } // internal construction compatibility; all traffic uses V2.
-func (c *Client) V2() *Client              { return c }
 func (c *Client) Bridge() *Client          { return c }
 func (c *Client) Close() error             { c.http.CloseIdleConnections(); return nil }
 func (c *Client) Status() Status           { c.mu.RLock(); defer c.mu.RUnlock(); return c.status }
@@ -345,21 +341,34 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.record(err)
 		return err
 	}
-	connections, err := decodeData[struct {
-		Type   string                      `json:"type"`
-		Owner  *openhue.ResourceIdentifier `json:"owner"`
-		Status *string                     `json:"status"`
-	}](connectR.StatusCode(), connectR.Body)
+	resources, err := decodeData[json.RawMessage](connectR.StatusCode(), connectR.Body)
 	if err != nil {
 		c.record(err)
 		return err
 	}
 	connectivity := map[string]bool{}
-	for _, conn := range connections {
-		if conn.Type == "zigbee_connectivity" && conn.Owner != nil && conn.Owner.Rid != nil && conn.Status != nil {
-			connectivity[*conn.Owner.Rid] = string(*conn.Status) == "connected"
+	for _, raw := range resources {
+		var header struct {
+			Type string `json:"type"`
+		}
+		if err = json.Unmarshal(raw, &header); err != nil {
+			return err
+		}
+		if header.Type != "zigbee_connectivity" {
+			continue
+		}
+		var conn struct {
+			Owner  *openhue.ResourceIdentifier `json:"owner"`
+			Status string                      `json:"status"`
+		}
+		if err = json.Unmarshal(raw, &conn); err != nil {
+			return fmt.Errorf("invalid zigbee connectivity resource: %w", err)
+		}
+		if conn.Owner != nil && conn.Owner.Rid != nil {
+			connectivity[*conn.Owner.Rid] = conn.Status == "connected"
 		}
 	}
+
 	byDevice := map[string][]string{}
 	for _, d := range devices {
 		if d.Id == nil || d.Services == nil {
@@ -577,9 +586,6 @@ func (c *Client) ResolveScene(groupID, scene string) (Scene, error) {
 	return matches[0], nil
 }
 
-// readBounded is shared by the SSE error path, never exposing credentials.
-func ReadBounded(r io.Reader) string { b, _ := io.ReadAll(io.LimitReader(r, 4096)); return string(b) }
-
 func rawGradients(body []byte) map[string]json.RawMessage {
 	var env struct {
 		Data []struct {
@@ -621,7 +627,7 @@ func (c *Client) ClearAuthority() error {
 	if c.db == nil {
 		return nil
 	}
-	_, err := c.db.Exec(`DELETE FROM hue_manual_fences_v1; DELETE FROM hue_target_authority_v1`)
+	_, err := c.db.Exec(`DELETE FROM hue_target_authority_v1`)
 	return err
 }
 
@@ -636,4 +642,27 @@ func checkWrite(status int, body []byte, id string) error {
 		}
 	}
 	return fmt.Errorf("Hue write response did not acknowledge the requested light")
+}
+
+type boundedDoer struct{ client *http.Client }
+type boundedBody struct {
+	io.Reader
+	io.Closer
+}
+
+func (d boundedDoer) Do(req *http.Request) (*http.Response, error) {
+	r, err := d.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = boundedBody{Reader: io.LimitReader(r.Body, (8<<20)+1), Closer: r.Body}
+	return r, nil
+}
+
+func (c *Client) SetRateLimit(rps float64) error {
+	if math.IsNaN(rps) || math.IsInf(rps, 0) || rps <= 0 {
+		return fmt.Errorf("Hue write rate must be finite and positive")
+	}
+	c.lightLimit = rate.NewLimiter(rate.Limit(rps), 1)
+	return nil
 }

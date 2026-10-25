@@ -29,13 +29,16 @@ type write struct {
 	Body map[string]any
 }
 type fixture struct {
-	mu     sync.Mutex
-	server *httptest.Server
-	lights map[string]map[string]any
-	writes []write
-	failID string
-	status int
-	slow   bool
+	putEntered chan struct{}
+	putRelease chan struct{}
+	blockOnce  sync.Once
+	mu         sync.Mutex
+	server     *httptest.Server
+	lights     map[string]map[string]any
+	writes     []write
+	failID     string
+	status     int
+	slow       bool
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -74,7 +77,7 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	case "zone":
 		data = []any{map[string]any{"id": zoneID, "metadata": map[string]any{"name": "Test zone"}, "services": []any{map[string]any{"rid": groupedID, "rtype": "grouped_light"}}, "children": []any{map[string]any{"rid": lightA, "rtype": "light"}, map[string]any{"rid": lightB, "rtype": "light"}}}}
 	case "":
-		data = []any{}
+		data = []any{map[string]any{"type": "some_future_resource", "status": map[string]any{"active": true}}}
 	case "device":
 		data = []any{}
 	case "scene":
@@ -94,6 +97,9 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == "PUT" {
+			if f.putEntered != nil {
+				f.blockOnce.Do(func() { close(f.putEntered); <-f.putRelease })
+			}
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				panic(err)
@@ -371,5 +377,94 @@ func TestWriteRequiresSpecificAcknowledgment(t *testing.T) {
 		if err := checkWrite(200, []byte(body), lightA); err == nil {
 			t.Fatalf("accepted malformed ack: %s", body)
 		}
+	}
+}
+
+type fixtureRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f fixtureRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type endlessBody struct{ count int }
+
+func (b *endlessBody) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	b.count += len(p)
+	return len(p), nil
+}
+func (b *endlessBody) Close() error { return nil }
+func TestSDKResponseBodyIsBoundedBeforeParsing(t *testing.T) {
+	body := &endlessBody{}
+	h := &http.Client{Transport: fixtureRoundTripper(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
+	})}
+	c, err := NewWithHTTP("https://fixture.invalid", "fixture-token", h, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Lights(context.Background()); err == nil {
+		t.Fatal("invalid oversized response accepted")
+	}
+	if body.count > (8<<20)+1 {
+		t.Fatalf("SDK read unbounded body: %d", body.count)
+	}
+}
+
+func TestPublicationCannotPassAnInFlightSend(t *testing.T) {
+	f := newFixture(t)
+	db := openTestDB(t)
+	_, _ = db.Exec(`INSERT INTO resource_state VALUES('light',?,1,'{}')`, lightA)
+	c := f.client(t, db)
+	publish(t, c, db, "light", lightA, 1)
+	f.putEntered = make(chan struct{})
+	f.putRelease = make(chan struct{})
+	old := WithDesired(context.Background(), "light", lightA, 1)
+	b := 30.0
+	sent := make(chan error, 1)
+	go func() { sent <- c.ApplyLight(old, lightA, State{Brightness: &b}) }()
+	<-f.putEntered
+	acquired := make(chan struct{})
+	published := make(chan error, 1)
+	go func() {
+		release, err := c.AcquireCommand(context.Background())
+		if err != nil {
+			published <- err
+			return
+		}
+		defer release()
+		close(acquired)
+		tx, err := db.Begin()
+		if err != nil {
+			published <- err
+			return
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec(`UPDATE resource_state SET version=2 WHERE kind='light' AND id=?`, lightA); err == nil {
+			err = c.RecordDesiredTx(tx, "light", lightA, 2)
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		published <- err
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("new desired publication passed an in-flight Hue write")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(f.putRelease)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-published; err != nil {
+		t.Fatal(err)
+	}
+	before := len(f.writes)
+	if err := c.ApplyLight(old, lightA, State{Brightness: &b}); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("old intent was not superseded: %v", err)
+	}
+	if len(f.writes) != before {
+		t.Fatal("old retry sent after newer publication")
 	}
 }

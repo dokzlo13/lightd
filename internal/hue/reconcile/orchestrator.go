@@ -21,6 +21,8 @@ type RetryStatus struct {
 	Error        string    `json:"error"`
 }
 type Status struct {
+	Superseded       map[string]int64       `json:"superseded_versions"`
+	Imported         map[string]int64       `json:"imported_versions"`
 	PersistenceError string                 `json:"persistence_error,omitempty"`
 	Running          bool                   `json:"running"`
 	Pending          int                    `json:"pending"`
@@ -31,6 +33,9 @@ type Status struct {
 // Orchestrator retries failed persisted intent independently of periodic drift
 // enforcement. Retry delay is bounded (1s..30s); no worker sleeps during backoff.
 type Orchestrator struct {
+	superseded           map[ResourceKey]int64
+	attemptTimeout       time.Duration
+	imported             map[ResourceKey]int64
 	authorityGenerations map[ResourceKey]int64
 	reassert             func(context.Context, string, string, int64) error
 	db                   *sql.DB
@@ -49,7 +54,7 @@ type Orchestrator struct {
 }
 
 func NewOrchestrator(interval time.Duration, debounceMs int, _ float64) *Orchestrator {
-	return &Orchestrator{generations: map[ResourceKey]int64{}, authorityGenerations: map[ResourceKey]int64{}, maxRetryAge: 10 * time.Minute, providers: map[Kind]ResourceProvider{}, lastVersions: map[ResourceKey]int64{}, pending: map[ResourceKey]struct{}{}, retries: map[ResourceKey]RetryStatus{}, trigger: make(chan struct{}, 1), periodicInterval: interval, debounceMs: debounceMs}
+	return &Orchestrator{superseded: map[ResourceKey]int64{}, attemptTimeout: 30 * time.Second, imported: map[ResourceKey]int64{}, generations: map[ResourceKey]int64{}, authorityGenerations: map[ResourceKey]int64{}, maxRetryAge: 10 * time.Minute, providers: map[Kind]ResourceProvider{}, lastVersions: map[ResourceKey]int64{}, pending: map[ResourceKey]struct{}{}, retries: map[ResourceKey]RetryStatus{}, trigger: make(chan struct{}, 1), periodicInterval: interval, debounceMs: debounceMs}
 }
 func (o *Orchestrator) Register(p ResourceProvider) { o.providers[p.Kind()] = p }
 func (o *Orchestrator) Trigger() {
@@ -83,11 +88,23 @@ func (o *Orchestrator) TriggerAll(ctx context.Context) {
 func (o *Orchestrator) Status() Status {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	s := Status{PersistenceError: o.persistenceError, Running: o.running, Pending: len(o.pending), Retrying: map[string]RetryStatus{}, Acknowledged: map[string]int64{}}
+	s := Status{Superseded: map[string]int64{}, Imported: map[string]int64{}, PersistenceError: o.persistenceError, Running: o.running, Pending: len(o.pending), Retrying: map[string]RetryStatus{}, Acknowledged: map[string]int64{}}
+	for k, v := range o.superseded {
+		s.Superseded[string(k.Kind)+":"+k.ID] = v
+	}
+	for k, v := range o.imported {
+		s.Imported[string(k.Kind)+":"+k.ID] = v
+	}
 	for k, v := range o.retries {
 		s.Retrying[string(k.Kind)+":"+k.ID] = v
 	}
 	for k, v := range o.lastVersions {
+		if _, superseded := o.superseded[k]; superseded {
+			continue
+		}
+		if _, imported := o.imported[k]; imported {
+			continue
+		}
 		s.Acknowledged[string(k.Kind)+":"+k.ID] = v
 	}
 	return s
@@ -261,6 +278,12 @@ func (o *Orchestrator) reconcileAll(ctx context.Context) {
 					o.failLocked(k, r.DesiredVersion(), persistErr)
 				} else {
 					o.lastVersions[k] = r.DesiredVersion()
+					delete(o.imported, k)
+					if deliveryStatus == "superseded" {
+						o.superseded[k] = r.DesiredVersion()
+					} else {
+						delete(o.superseded, k)
+					}
 					delete(o.pending, k)
 					delete(o.retries, k)
 				}
@@ -296,6 +319,8 @@ func (o *Orchestrator) failLocked(k ResourceKey, version int64, err error) {
 	_ = o.persistLocked(k, version, "pending", r)
 }
 func (o *Orchestrator) reconcileOne(ctx context.Context, r Resource) error {
+	ctx, cancel := context.WithTimeout(ctx, o.attemptTimeout)
+	defer cancel()
 	if err := r.Load(ctx); err != nil {
 		return err
 	}

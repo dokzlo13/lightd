@@ -7,6 +7,6 @@ import (
 
 type Client = bridge.Client
 
-func NewClient(address, token string, timeout time.Duration) *Client {
+func NewClient(address, token string, timeout time.Duration) (*Client, error) {
 	return bridge.New(address, token, timeout)
 }

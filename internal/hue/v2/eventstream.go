@@ -14,6 +14,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/events/sse"
 	"github.com/dokzlo13/lightd/internal/hue/bridge"
+	"github.com/google/uuid"
 	"github.com/rs/zerolog/log"
 	stream "github.com/tmaxmax/go-sse"
 )
@@ -122,7 +123,7 @@ func (e *EventStream) connect(ctx context.Context, bus *events.Bus) error {
 	e.status.LastError = ""
 	e.mu.Unlock()
 	defer func() { e.mu.Lock(); e.status.Connected = false; e.mu.Unlock() }()
-	for ev, err := range stream.Read(resp.Body, &stream.ReadConfig{MaxEventSize: 1 << 20}) {
+	for ev, err := range stream.Read(strictEventReader{resp.Body}, &stream.ReadConfig{MaxEventSize: 1 << 20}) {
 		if err != nil {
 			return err
 		}
@@ -132,7 +133,7 @@ func (e *EventStream) connect(ctx context.Context, bus *events.Bus) error {
 		e.mu.Lock()
 		e.status.LastEvent = time.Now().UTC()
 		e.mu.Unlock()
-		e.processEvent(ev.Data, bus)
+		e.processFrame(ev.Data, ev.LastEventID, bus)
 	}
 	return io.EOF // A clean remote EOF still requires reconnect pacing.
 }
@@ -142,7 +143,8 @@ func ownerID(data map[string]interface{}) string {
 	return id
 }
 
-func (e *EventStream) processEvent(data string, bus *events.Bus) {
+func (e *EventStream) processEvent(data string, bus *events.Bus) { e.processFrame(data, "", bus) }
+func (e *EventStream) processFrame(data, frameID string, bus *events.Bus) {
 	var events []map[string]interface{}
 	if err := json.Unmarshal([]byte(data), &events); err != nil {
 		log.Warn().Err(err).Str("data", data).Msg("Failed to parse event")
@@ -150,6 +152,7 @@ func (e *EventStream) processEvent(data string, bus *events.Bus) {
 	}
 
 	for _, event := range events {
+		event["stream_id"] = frameID
 		e.handleEvent(event, bus)
 	}
 }
@@ -168,6 +171,7 @@ func (e *EventStream) handleEvent(event map[string]interface{}, bus *events.Bus)
 		}
 
 		itemMap["container_id"] = event["id"]
+		itemMap["stream_id"] = event["stream_id"]
 		itemMap["creationtime"] = event["creationtime"]
 		itemType, _ := itemMap["type"].(string)
 		itemID, _ := itemMap["id"].(string)
@@ -213,7 +217,7 @@ func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, 
 	updated, _ := buttonReport["updated"].(string) // Use updated timestamp as unique event ID
 
 	// Generate a unique event ID from resource ID and timestamp
-	eventID := fmt.Sprintf("%s-%s", id, updated)
+	eventID := eventIdentity(id, updated, data)
 
 	log.Debug().
 		Str("id", id).
@@ -221,13 +225,14 @@ func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, 
 		Str("event_id", eventID).
 		Msg("Button event")
 
-	bus.Publish(events.Event{
+	e.publish(bus, events.Event{
 		Type: events.EventTypeButton,
 		Data: map[string]interface{}{
 			"resource_id":  id,
 			"action":       action,
 			"event_id":     eventID,
 			"container_id": data["container_id"],
+			"stream_id":    data["stream_id"],
 		},
 	})
 }
@@ -262,7 +267,7 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 	if updated == "" {
 		updated, _ = data["creationtime"].(string)
 	}
-	eventID := fmt.Sprintf("%s-%s", id, updated)
+	eventID := eventIdentity(id, updated, data)
 
 	log.Debug().
 		Str("id", id).
@@ -272,7 +277,7 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 		Str("event_id", eventID).
 		Msg("Rotary event")
 
-	bus.Publish(events.Event{
+	e.publish(bus, events.Event{
 		Type: events.EventTypeRotary,
 		Data: map[string]interface{}{
 			"resource_id":  id,
@@ -282,6 +287,7 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 			"duration":     int(duration),
 			"event_id":     eventID,
 			"container_id": data["container_id"],
+			"stream_id":    data["stream_id"],
 		},
 	})
 }
@@ -295,12 +301,16 @@ func (e *EventStream) handleConnectivityEvent(id string, data map[string]interfa
 		Str("status", status).
 		Msg("Connectivity event")
 
-	bus.Publish(events.Event{
+	e.publish(bus, events.Event{
 		Type: events.EventTypeConnectivity,
 		Data: map[string]interface{}{
-			"device_id": id,
-			"owner_id":  ownerID(data),
-			"status":    status,
+			"device_id":    id,
+			"resource_id":  id,
+			"event_id":     eventIdentity(id, "", data),
+			"container_id": data["container_id"],
+			"stream_id":    data["stream_id"],
+			"owner_id":     ownerID(data),
+			"status":       status,
 		},
 	})
 }
@@ -309,6 +319,9 @@ func (e *EventStream) handleLightChangeEvent(id string, data map[string]interfac
 	eventData := map[string]interface{}{
 		"resource_id":   id,
 		"resource_type": string(resourceType),
+		"event_id":      eventIdentity(id, "", data),
+		"container_id":  data["container_id"],
+		"stream_id":     data["stream_id"],
 	}
 
 	// Extract owner info (device or zone/room)
@@ -360,8 +373,41 @@ func (e *EventStream) handleLightChangeEvent(id string, data map[string]interfac
 		Interface("data", eventData).
 		Msg("Light change event")
 
-	bus.Publish(events.Event{
+	e.publish(bus, events.Event{
 		Type: events.EventTypeLightChange,
 		Data: eventData,
 	})
+}
+
+// go-sse Read is also a finite-response parser and may dispatch an unfinished
+// block at EOF. A persistent Hue stream requires the WHATWG blank terminator.
+type strictEventReader struct{ io.Reader }
+
+func (r strictEventReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func (e *EventStream) publish(bus *events.Bus, event events.Event) {
+	if bus == nil {
+		return
+	}
+	if err := bus.Publish(event); err != nil {
+		log.Warn().Err(err).Str("type", string(event.Type)).Interface("event_id", event.Data["event_id"]).Interface("resource_id", event.Data["resource_id"]).Msg("Hue event rejected by action pipeline")
+	}
+}
+
+func eventIdentity(id, updated string, data map[string]interface{}) string {
+	if updated != "" {
+		return id + "-" + updated
+	}
+	for _, field := range []string{"container_id", "stream_id", "creationtime"} {
+		if v, ok := data[field].(string); ok && v != "" {
+			return id + "-" + v
+		}
+	}
+	return id + "-" + uuid.NewString()
 }

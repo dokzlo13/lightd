@@ -21,6 +21,36 @@ func (o *Orchestrator) SetDB(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// Existing pre-journal rows have unknown physical acknowledgment. Treat them
+	// as imported baselines, not queued lighting commands. A fresh desired frame
+	// or explicit force is required to activate them.
+	var journalCount, authorityCount int
+	if err = db.QueryRow(`SELECT COUNT(*) FROM hue_delivery_v1`).Scan(&journalCount); err != nil {
+		return err
+	}
+	if journalCount == 0 {
+		var tableCount int
+		if err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='hue_target_authority_v1'`).Scan(&tableCount); err != nil {
+			return err
+		}
+		if tableCount > 0 {
+			if err = db.QueryRow(`SELECT COUNT(*) FROM hue_target_authority_v1`).Scan(&authorityCount); err != nil {
+				return err
+			}
+		}
+		if authorityCount == 0 {
+			var stateTable int
+			if err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='resource_state'`).Scan(&stateTable); err != nil {
+				return err
+			}
+			if stateTable > 0 {
+				_, err = db.Exec(`INSERT INTO hue_delivery_v1(kind,resource_id,version,generation,authority_generation,status,updated_at) SELECT kind,id,version,0,0,'imported',? FROM resource_state WHERE kind IN ('group','light')`, time.Now().UnixMilli())
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	rows, err := db.Query(`SELECT kind,resource_id,version,generation,authority_generation,status,attempts,first_attempt,next_attempt,last_error FROM hue_delivery_v1`)
 	if err != nil {
 		return err
@@ -40,7 +70,13 @@ func (o *Orchestrator) SetDB(db *sql.DB) error {
 		k := ResourceKey{Kind(kind), id}
 		o.generations[k] = generation
 		o.authorityGenerations[k] = authorityGeneration
-		if status == "acknowledged" || status == "superseded" {
+		if status == "superseded" {
+			o.superseded[k] = version
+		}
+		if status == "imported" {
+			o.imported[k] = version
+		}
+		if status == "acknowledged" || status == "superseded" || status == "imported" {
 			o.lastVersions[k] = version
 			continue
 		}
@@ -86,6 +122,8 @@ func (o *Orchestrator) ClearDelivery() error {
 		}
 	}
 	o.lastVersions = map[ResourceKey]int64{}
+	o.imported = map[ResourceKey]int64{}
+	o.superseded = map[ResourceKey]int64{}
 	o.pending = map[ResourceKey]struct{}{}
 	o.retries = map[ResourceKey]RetryStatus{}
 	o.generations = map[ResourceKey]int64{}
@@ -95,6 +133,8 @@ func (o *Orchestrator) ClearDelivery() error {
 }
 func (o *Orchestrator) forceLocked(k ResourceKey) {
 	o.generations[k]++
+	delete(o.imported, k)
+	delete(o.superseded, k)
 	o.pending[k] = struct{}{}
 	delete(o.retries, k)
 	r := RetryStatus{FirstAttempt: time.Now()}

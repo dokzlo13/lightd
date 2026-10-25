@@ -30,7 +30,13 @@ type HueService struct {
 }
 
 func NewHueService(cfg *config.Config, db *sql.DB, store *storage.Store) (*HueService, error) {
-	c := hue.NewClient(cfg.Hue.Bridge, cfg.Hue.Token, cfg.Hue.GetTimeout())
+	c, err := hue.NewClient(cfg.Hue.Bridge, cfg.Hue.Token, cfg.Hue.GetTimeout())
+	if err != nil {
+		return nil, err
+	}
+	if err := c.SetRateLimit(cfg.Reconciler.GetRateLimitRPS()); err != nil {
+		return nil, err
+	}
 	if err := c.SetDB(db); err != nil {
 		return nil, err
 	}

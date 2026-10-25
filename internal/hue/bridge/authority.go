@@ -58,6 +58,9 @@ func (c *Client) desiredMembers(kind, id string) ([]string, error) {
 // the same transaction as desired state and action outcome. No network or
 // separate connection is used. The caller holds AcquireCommand's guard.
 func (c *Client) RecordDesiredTx(tx *sql.Tx, kind, id string, version int64) error {
+	if version <= 0 {
+		return fmt.Errorf("desired authority requires a positive persisted version")
+	}
 	ids, err := c.desiredMembers(kind, id)
 	if err != nil {
 		return err
@@ -148,25 +151,41 @@ func (c *Client) targetLocked(ctx context.Context, id string) (targetAuthority, 
 	err := c.db.QueryRowContext(ctx, `SELECT generation,kind,resource_id,version,acknowledged FROM hue_target_authority_v1 WHERE light_id=?`, id).Scan(&a.Generation, &a.Kind, &a.ID, &a.Version, &a.Acknowledged)
 	return a, err
 }
+func (c *Client) checkTargetLocked(ctx context.Context, id string, tokens map[string]targetAuthority) (targetAuthority, error) {
+	a, err := c.targetLocked(ctx, id)
+	if err != nil {
+		return a, fmt.Errorf("load target authority (re-publish desired state after migration): %w", err)
+	}
+	if d, ok := desiredRequest(ctx); ok {
+		if a.Kind != d.Kind || a.ID != d.ID || a.Version != d.Version {
+			return a, ErrSuperseded
+		}
+	} else {
+		want, ok := tokens[id]
+		if !ok || a.Generation != want.Generation || a.ID != want.ID {
+			return a, ErrSuperseded
+		}
+	}
+	return a, nil
+}
+func (c *Client) targetPending(ctx context.Context, id string, tokens map[string]targetAuthority) (bool, error) {
+	release, err := c.AcquireCommand(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	a, err := c.checkTargetLocked(ctx, id, tokens)
+	return !a.Acknowledged, err
+}
 func (c *Client) targetSend(ctx context.Context, id string, tokens map[string]targetAuthority, send func() error) error {
 	release, err := c.AcquireCommand(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
-	a, err := c.targetLocked(ctx, id)
+	a, err := c.checkTargetLocked(ctx, id, tokens)
 	if err != nil {
-		return fmt.Errorf("load target authority (re-publish desired state after migration): %w", err)
-	}
-	if d, ok := desiredRequest(ctx); ok {
-		if a.Kind != d.Kind || a.ID != d.ID || a.Version != d.Version {
-			return ErrSuperseded
-		}
-	} else {
-		want, ok := tokens[id]
-		if !ok || a.Generation != want.Generation || a.ID != want.ID {
-			return ErrSuperseded
-		}
+		return err
 	}
 	if a.Acknowledged {
 		return nil

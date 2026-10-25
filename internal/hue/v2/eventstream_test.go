@@ -64,7 +64,10 @@ func TestSSECleanEOFPacesReconnectAndCancellation(t *testing.T) {
 	}
 }
 func TestSSEDeletionDoesNotProduceButtonAction(t *testing.T) {
-	c := bridge.New("fixture.invalid", "fixture-token", time.Second)
+	c, err := bridge.New("fixture.invalid", "fixture-token", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	es := NewEventStreamWithConfig(c, EventStreamConfig{})
 	bus := events.NewBusWithConfig(1, 8)
 	defer bus.Close(context.Background())
@@ -74,5 +77,26 @@ func TestSSEDeletionDoesNotProduceButtonAction(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if n.Load() != 0 {
 		t.Fatal("deletion became a button action")
+	}
+}
+
+func TestSSEIncompleteFinalBlockIsDiscarded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data:[{"type":"update","id":"fixture-container","data":[{"type":"button","id":"fixture-button","button":{"button_report":{"event":"short_release","updated":"fixture-time"}}}]}]`)
+	}))
+	defer server.Close()
+	c, err := bridge.NewWithHTTP(server.URL, "fixture-token", server.Client(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := NewEventStreamWithConfig(c, EventStreamConfig{})
+	bus := events.NewBusWithConfig(1, 8)
+	var n atomic.Int32
+	bus.Subscribe(events.EventTypeButton, func(events.Event) { n.Add(1) })
+	_ = es.connect(context.Background(), bus)
+	bus.Close(context.Background())
+	if n.Load() != 0 {
+		t.Fatal("unterminated final SSE block became a lighting action")
 	}
 }

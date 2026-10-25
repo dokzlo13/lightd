@@ -105,6 +105,18 @@ func (c *Client) apply(ctx context.Context, plans map[string]State) error {
 		if s.PowerMode == "next_on" {
 			continue
 		}
+		pending, err := c.targetPending(ctx, id, tokens)
+		if errors.Is(err, ErrSuperseded) {
+			superseded++
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if !pending {
+			continue
+		}
 		// Preparation and pacing do not hold the final-send/publication gate.
 		actual, err := c.Light(ctx, id)
 		if err != nil {
