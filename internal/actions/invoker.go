@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var ErrIntegrity = errors.New("Lua VM integrity failure")
 var ErrAdmissionRejected = errors.New("action queue admission rejected")
 
 type Executor interface {
@@ -76,21 +77,46 @@ func (i *Invoker) Queue(ctx context.Context, executor Executor, name string, arg
 
 // QueuePrepared persists receipt before admission. prepare runs on the Lua worker,
 // so reducers can safely use Lua. A reducer failure never invokes the action.
+// Reservation owns queue capacity across the receipt transaction. Commit must
+// accept a valid token even during shutdown, so committed receipts cannot be lost.
+type Reservation interface {
+	Commit(func(context.Context)) error
+	Release()
+}
+type ReservingExecutor interface {
+	Reserve(context.Context) (Reservation, error)
+}
+
 func (i *Invoker) QueuePrepared(ctx context.Context, executor Executor, name, key, source, def string, prepare func(context.Context) (map[string]any, error)) error {
-	in, ok, err := i.receipt(ctx, name, key, source, def)
-	if err != nil || !ok {
+	reserving, ok := executor.(ReservingExecutor)
+	if !ok {
+		return fmt.Errorf("%w: executor has no reservation support", ErrAdmissionRejected)
+	}
+	reservation, err := reserving.Reserve(ctx)
+	if err != nil {
+		return errors.Join(ErrAdmissionRejected, err)
+	}
+	defer reservation.Release()
+	in, accepted, err := i.receipt(ctx, name, key, source, def)
+	if err != nil || !accepted {
 		return err
 	}
-	if executor.Do(ctx, func(workCtx context.Context) {
+	err = reservation.Commit(func(workCtx context.Context) {
 		if err := i.execute(workCtx, in, prepare); err != nil {
+			if errors.Is(err, ErrIntegrity) {
+				if fatal, ok := executor.(interface{ Abort(error) }); ok {
+					fatal.Abort(err)
+				}
+			}
 			log.Error().Err(err).Str("invocation_id", in.ID).Str("action", name).Msg("Action failed")
 		}
-	}) {
-		return nil
+	})
+	if err != nil {
+		return errors.Join(err, i.finish(in, "rejected", err, nil))
 	}
-	recordErr := i.finish(in, "rejected", ErrAdmissionRejected, nil)
-	return errors.Join(ErrAdmissionRejected, recordErr)
+	return nil
 }
+
 func (i *Invoker) finish(in storage.Invocation, status string, err error, actx *Context) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -103,7 +129,7 @@ func (i *Invoker) execute(ctx context.Context, in storage.Invocation, prepare fu
 	completed := false
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("action panicked: %v", p)
+			err = fmt.Errorf("%w: action panicked: %v", ErrIntegrity, p)
 		}
 		if err != nil && !completed {
 			err = errors.Join(err, i.finish(in, "failed", err, nil))
@@ -135,6 +161,11 @@ func (i *Invoker) execute(ctx context.Context, in storage.Invocation, prepare fu
 	if err = ctx.Err(); err != nil {
 		return err
 	}
+	release, guardErr := actx.acquireCommit(ctx)
+	if guardErr != nil {
+		return guardErr
+	}
+	defer release()
 	if err = i.finish(in, "completed", nil, actx); err != nil {
 		return fmt.Errorf("commit action outcome: %w", err)
 	}

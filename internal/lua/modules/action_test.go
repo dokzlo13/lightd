@@ -117,3 +117,25 @@ func TestMultipleBuilderHandlesShareFrameAcrossCheckpoint(t *testing.T) {
 		t.Fatalf("alias patch lost: %+v %v", d, e)
 	}
 }
+
+func TestNativeDesiredValidatesBeforeCommitAndDoesNotClampLegacyCT(t *testing.T) {
+	L, i, stores, _ := actionFixture(t)
+	L.SetGlobal("group_id", lua.LString(fixtureGroup))
+	if e := L.DoString(`local a=require("action");a.define("wide",function(ctx)ctx.desired:group(group_id):set_ct(600)end);a.define("invalid",function(ctx)ctx.desired:group(group_id):set_color(2,0.3)end)`); e != nil {
+		t.Fatal(e)
+	}
+	if e := i.Invoke(context.Background(), "wide", nil, ""); e != nil {
+		t.Fatal(e)
+	}
+	d, version, _ := stores.Groups().Get(fixtureGroup)
+	if d.Ct == nil || *d.Ct != 600 {
+		t.Fatal("legacy CT clamp remains")
+	}
+	if i.Invoke(context.Background(), "invalid", nil, "") == nil {
+		t.Fatal("invalid XY accepted")
+	}
+	_, after, _ := stores.Groups().Get(fixtureGroup)
+	if after != version {
+		t.Fatal("invalid desired committed")
+	}
+}

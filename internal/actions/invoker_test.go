@@ -7,6 +7,7 @@ import (
 	"github.com/dokzlo13/lightd/internal/storage"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func setupInvoker(t *testing.T) (*Invoker, *Registry, *storage.DB) {
@@ -116,7 +117,7 @@ func TestRejectedAdmissionCanRetryButFailedActionCannot(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("duplicate side effect: %d", calls)
 	}
-	if queryCount(t, db.DB, `SELECT count(*) FROM invocations WHERE status='rejected'`) != 1 || queryCount(t, db.DB, `SELECT count(*) FROM invocations WHERE status='failed'`) != 1 {
+	if queryCount(t, db.DB, `SELECT count(*) FROM invocations WHERE status='accepted'`) != 0 || queryCount(t, db.DB, `SELECT count(*) FROM invocations WHERE status='failed'`) != 1 {
 		t.Fatal("missing terminal outcomes")
 	}
 }
@@ -143,5 +144,75 @@ func TestPreparationFailureDoesNotExecute(t *testing.T) {
 	x.work(context.Background())
 	if calls != 0 {
 		t.Fatal("action ran despite failed reducer")
+	}
+}
+
+func TestCommitGateAcquiredBeforeTransactionAndReleasedOnFailure(t *testing.T) {
+	i, r, db := setupInvoker(t)
+	held := false
+	released := false
+	r.RegisterSimple("guarded", func(c *Context, _ map[string]any) error {
+		c.SetCommitGuard(func(ctx context.Context) (func(), error) {
+			// Single-connection DB can only answer here if no SQL transaction started.
+			var n int
+			check, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+			if e := db.QueryRowContext(check, `SELECT 1`).Scan(&n); e != nil {
+				return nil, e
+			}
+			held = true
+			return func() { held = false; released = true }, nil
+		})
+		c.DeferCommit(func(tx *sql.Tx) error {
+			if !held {
+				t.Error("transaction outside gate")
+			}
+			return errors.New("injected commit failure")
+		}, nil)
+		return nil
+	})
+	if i.Invoke(context.Background(), "guarded", nil, "") == nil {
+		t.Fatal("expected commit failure")
+	}
+	if held || !released {
+		t.Fatal("gate leaked")
+	}
+}
+
+func (e *queueExecutor) Reserve(ctx context.Context) (Reservation, error) {
+	if !e.accept {
+		return nil, ErrAdmissionRejected
+	}
+	return &fakeReservation{executor: e}, nil
+}
+
+type fakeReservation struct{ executor *queueExecutor }
+
+func (r *fakeReservation) Commit(fn func(context.Context)) error { r.executor.work = fn; return nil }
+func (r *fakeReservation) Release()                              {}
+
+func TestReserveFirstAvoidsOrphanWhenRejectionStorageFails(t *testing.T) {
+	i, r, db := setupInvoker(t)
+	calls := 0
+	r.RegisterSimple("test", func(*Context, map[string]any) error { calls++; return nil })
+	// The old receipt-before-Do sequence orphaned an accepted row when rejection
+	// persistence failed. Saturation now returns before any receipt transaction.
+	if _, e := db.Exec(`CREATE TRIGGER reject_outcome BEFORE INSERT ON event_ledger WHEN NEW.event_type='action_rejected' BEGIN SELECT RAISE(ABORT,'fault'); END;`); e != nil {
+		t.Fatal(e)
+	}
+	x := &queueExecutor{accept: false}
+	if !errors.Is(i.Queue(context.Background(), x, "test", nil, "key", "schedule", "fixture"), ErrAdmissionRejected) {
+		t.Fatal("rejection expected")
+	}
+	if n := queryCount(t, db.DB, `SELECT count(*) FROM invocations`); n != 0 {
+		t.Fatalf("orphan receipt %d", n)
+	}
+	x.accept = true
+	if e := i.Queue(context.Background(), x, "test", nil, "key", "schedule", "fixture"); e != nil {
+		t.Fatal(e)
+	}
+	x.work(context.Background())
+	if calls != 1 {
+		t.Fatalf("lost occurrence %d", calls)
 	}
 }

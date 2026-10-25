@@ -2,6 +2,7 @@ package modules
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/hue"
@@ -18,20 +19,29 @@ type ActionModule struct {
 	invoker      *actions.Invoker
 	newFrame     func() (*luactx.Builder, *luactx.DesiredModule)
 	orchestrator *reconcile.Orchestrator
+	commitGuard  func(context.Context) (func(), error)
+	fatal        func(error)
 }
 
 func NewActionModule(registry *actions.Registry, bridgeClient *bridge.Client, stores *hue.StoreRegistry, orchestrator *reconcile.Orchestrator) *ActionModule {
 	m := &ActionModule{registry: registry, orchestrator: orchestrator}
+	if bridgeClient != nil {
+		m.commitGuard = bridgeClient.AcquireCommand
+	}
 	actual := group.NewActualProvider(bridgeClient)
 	m.newFrame = func() (*luactx.Builder, *luactx.DesiredModule) {
 		desired := luactx.NewDesiredModule(stores.Groups(), stores.Lights())
 		desired.SetActualProviders(actual, light.NewActualProvider(bridgeClient))
+		if bridgeClient != nil {
+			desired.SetCommitHooks(bridgeClient.AcquireCommand, bridgeClient.RecordDesiredTx)
+		}
 		b := luactx.NewBuilder().Register(luactx.NewActualModule(actual)).Register(desired).Register(luactx.NewReconcilerModule(orchestrator, desired)).Register(luactx.NewRequestModule())
 		return b, desired
 	}
 	return m
 }
-func (m *ActionModule) SetInvoker(i *actions.Invoker) { m.invoker = i }
+func (m *ActionModule) SetFatalHandler(fn func(error)) { m.fatal = fn }
+func (m *ActionModule) SetInvoker(i *actions.Invoker)  { m.invoker = i }
 func (m *ActionModule) Loader(L *lua.LState) int {
 	mod := L.NewTable()
 	L.SetField(mod, "define", L.NewFunction(m.define))
@@ -85,6 +95,7 @@ func (a *luaAction) Execute(ctx *actions.Context, args map[string]any) (err erro
 	defer desired.Close()
 	// Each nested invocation has its own frame. Only a successful final outcome
 	// commits this frame; explicit ctx:reconcile checkpoints remain independent.
+	ctx.SetCommitGuard(a.module.commitGuard)
 	ctx.DeferCommit(desired.FlushTx, func() {
 		if a.module.orchestrator != nil {
 			a.module.orchestrator.Trigger()
@@ -93,6 +104,13 @@ func (a *luaAction) Execute(ctx *actions.Context, args map[string]any) (err erro
 	ctxTable := builder.Build(a.L)
 	argsTable := MapToLuaTable(a.L, args)
 	if err = a.L.CallByParam(lua.P{Fn: a.fn, NRet: 0, Protect: true}, ctxTable, argsTable); err != nil {
+		var apiErr *lua.ApiError
+		if errors.As(err, &apiErr) && apiErr.Type == lua.ApiErrorPanic {
+			if a.module.fatal != nil {
+				a.module.fatal(err)
+			}
+			return errors.Join(actions.ErrIntegrity, err)
+		}
 		return fmt.Errorf("Lua action %s: %w", a.name, err)
 	}
 	return nil

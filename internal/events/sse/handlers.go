@@ -28,6 +28,7 @@ type collectorCache struct {
 	mu         sync.Mutex
 	collectors map[string]middleware.Collector
 	generation atomic.Uint64
+	closed     bool
 }
 
 func (c *collectorCache) Clear() {
@@ -39,9 +40,15 @@ func (c *collectorCache) Clear() {
 	}
 	c.collectors = map[string]middleware.Collector{}
 }
-func (c *collectorCache) add(key string, e map[string]any, create func(uint64) middleware.Collector) error {
+func (c *collectorCache) add(key string, e map[string]any, expected uint64, create func(uint64) middleware.Collector) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return middleware.ErrCollectorClosed
+	}
+	if expected != c.generation.Load() {
+		return fmt.Errorf("binding changed during admission")
+	}
 	v := c.collectors[key]
 	if v == nil {
 		v = create(c.generation.Load())
@@ -51,12 +58,17 @@ func (c *collectorCache) add(key string, e map[string]any, create func(uint64) m
 }
 
 // RegisterHandlers routes ordered admission without running Lua on source goroutines.
-func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i *actions.Invoker, x exec.Executor) {
+func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i *actions.Invoker, x exec.Executor) func() {
 	cache := &collectorCache{collectors: map[string]middleware.Collector{}}
 	if mutable, ok := r.(MutableRegistry); ok {
 		mutable.SetOnHandlersChanged(cache.Clear)
 	}
-	context.AfterFunc(ctx, cache.Clear)
+	done := make(chan struct{})
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() { cache.mu.Lock(); cache.closed = true; cache.mu.Unlock(); cache.Clear(); close(done) })
+	}
+	stopCleanup := context.AfterFunc(ctx, cleanup)
 	admit := func(kind events.EventType, key, action string, static map[string]any, factory *collect.CollectorFactory, e events.Event, selectedGeneration uint64) error {
 		data := copyEventData(e.Data)
 		if eid, ok := data["event_id"].(string); !ok || eid == "" {
@@ -68,7 +80,7 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 		if err != nil || !ok {
 			return err
 		}
-		err = cache.add(string(kind)+":"+key, data, func(generation uint64) middleware.Collector {
+		err = cache.add(string(kind)+":"+key, data, selectedGeneration, func(generation uint64) middleware.Collector {
 			generation = selectedGeneration
 			flush := func(batch []map[string]any) error {
 				ids := ""
@@ -163,6 +175,13 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 		}
 		return nil
 	})
+	return func() {
+		if stopCleanup() {
+			cleanup()
+		} else {
+			<-done
+		}
+	}
 }
 func copyEventData(data map[string]interface{}) map[string]any {
 	out := make(map[string]any, len(data))

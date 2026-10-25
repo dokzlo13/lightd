@@ -32,6 +32,9 @@ type DesiredModule struct {
 	closed        bool
 	actualGroup   *group.ActualProvider
 	actualLight   *light.ActualProvider
+	actionCtx     context.Context
+	guard         func(context.Context) (func(), error)
+	record        func(*sql.Tx, string, string, int64) error
 }
 
 // NewDesiredModule creates a new desired state module.
@@ -56,6 +59,7 @@ func (m *DesiredModule) Name() string {
 
 // Install adds ctx.desired to the context table.
 func (m *DesiredModule) Install(L *lua.LState, ctx *lua.LTable) {
+	m.actionCtx = L.Context()
 	// Register builder metatables
 	RegisterGroupBuilderType(L)
 	RegisterLightBuilderType(L)
@@ -92,8 +96,17 @@ func (m *DesiredModule) FlushTx(tx *sql.Tx) error {
 		if err != nil {
 			return err
 		}
-		if err = m.groupStore.PatchTx(tx, id, patch, b.clear); err != nil {
+		if err = m.groupStore.PatchTxValidated(tx, id, patch, b.clear, func(d group.Desired) error { return d.State.Validate() }); err != nil {
 			return err
+		}
+		if m.record != nil {
+			version, err := m.groupStore.VersionTx(tx, id)
+			if err != nil {
+				return err
+			}
+			if err = m.record(tx, m.groupStore.Kind(), id, version); err != nil {
+				return err
+			}
 		}
 	}
 	ids = ids[:0]
@@ -107,8 +120,17 @@ func (m *DesiredModule) FlushTx(tx *sql.Tx) error {
 		if err != nil {
 			return err
 		}
-		if err = m.lightStore.PatchTx(tx, id, patch, b.clear); err != nil {
+		if err = m.lightStore.PatchTxValidated(tx, id, patch, b.clear, func(d light.Desired) error { return d.Validate() }); err != nil {
 			return err
+		}
+		if m.record != nil {
+			version, err := m.lightStore.VersionTx(tx, id)
+			if err != nil {
+				return err
+			}
+			if err = m.record(tx, m.lightStore.Kind(), id, version); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -148,7 +170,18 @@ func (m *DesiredModule) clearPending() {
 
 // Flush is an explicit checkpoint; later Lua failure cannot undo this commit.
 func (m *DesiredModule) Flush() error {
-	err := m.groupStore.Transaction(context.Background(), m.FlushTx)
+	ctx := m.actionCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.guard != nil {
+		release, err := m.guard(ctx)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	err := m.groupStore.Transaction(ctx, m.FlushTx)
 	if err == nil {
 		m.clearPending()
 	}
@@ -191,4 +224,9 @@ func (m *DesiredModule) getLightBuilder() lua.LGFunction {
 func (m *DesiredModule) SetActualProviders(g *group.ActualProvider, l *light.ActualProvider) {
 	m.actualGroup = g
 	m.actualLight = l
+}
+
+func (m *DesiredModule) SetCommitHooks(guard func(context.Context) (func(), error), record func(*sql.Tx, string, string, int64) error) {
+	m.guard = guard
+	m.record = record
 }

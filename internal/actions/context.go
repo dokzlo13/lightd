@@ -30,6 +30,7 @@ type Context struct {
 	runAction   func(name string, args map[string]any) error
 	commitHooks []func(*sql.Tx) error
 	afterCommit []func()
+	commitGuard func(context.Context) (func(), error)
 }
 
 // NewContext creates a new ActionContext
@@ -147,4 +148,14 @@ func (c *Context) committed() {
 	for _, fn := range c.afterCommit {
 		fn()
 	}
+}
+
+// SetCommitGuard acquires the bridge publication gate before beginning the SQL
+// transaction. Never acquire this gate from a transaction callback.
+func (c *Context) SetCommitGuard(guard func(context.Context) (func(), error)) { c.commitGuard = guard }
+func (c *Context) acquireCommit(ctx context.Context) (func(), error) {
+	if c.commitGuard == nil {
+		return func() {}, nil
+	}
+	return c.commitGuard(ctx)
 }

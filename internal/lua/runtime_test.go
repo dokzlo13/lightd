@@ -72,3 +72,32 @@ func TestQueuePreservesContextAndSynchronousPanicReturns(t *testing.T) {
 	}
 	r.Stop(context.Background())
 }
+
+func TestReservedReceiptSurvivesBoundedShutdown(t *testing.T) {
+	r := bareRuntime()
+	go r.Run(context.Background())
+	waitReady(t, r)
+	token, e := r.Reserve(context.Background())
+	if e != nil {
+		t.Fatal(e)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if !errors.Is(r.Stop(ctx), context.DeadlineExceeded) {
+		t.Fatal("stop did not await outstanding reservation")
+	}
+	if r.L.IsClosed() {
+		t.Fatal("closed VM beneath reserved publication")
+	}
+	ran := make(chan error, 1)
+	if e = token.Commit(func(ctx context.Context) { ran <- ctx.Err() }); e != nil {
+		t.Fatal(e)
+	}
+	token.Release()
+	if e = r.Stop(context.Background()); e != nil {
+		t.Fatal(e)
+	}
+	if !errors.Is(<-ran, context.Canceled) {
+		t.Fatal("accepted receipt did not receive cancelled outcome")
+	}
+}

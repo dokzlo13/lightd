@@ -29,6 +29,7 @@ type RuntimeStatus struct {
 	Queued    int    `json:"queued"`
 	Running   bool   `json:"running"`
 	LastError string `json:"last_error,omitempty"`
+	Fatal     bool   `json:"fatal"`
 }
 type Runtime struct {
 	L             *lua.LState
@@ -45,11 +46,14 @@ type Runtime struct {
 	done          chan struct{}
 	finishOnce    sync.Once
 	closed        bool
+	queueClosed   bool
+	reserved      int
 	started       bool
 	running       bool
 	cancel        context.CancelFunc
 	actionTimeout time.Duration
 	lastError     string
+	fatal         bool
 }
 
 func NewRuntime(deps RuntimeDeps) *Runtime {
@@ -67,12 +71,12 @@ func (r *Runtime) SetActionTimeout(d time.Duration) {
 func (r *Runtime) Status() RuntimeStatus {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return RuntimeStatus{Ready: r.started && !r.closed, Queued: len(r.workQueue), Running: r.running, LastError: r.lastError}
+	return RuntimeStatus{Ready: r.started && !r.closed, Queued: len(r.workQueue), Running: r.running, LastError: r.lastError, Fatal: r.fatal}
 }
-func (r *Runtime) Do(ctx context.Context, work LuaWork) bool {
+func (r *Runtime) Do(ctx context.Context, work func(context.Context)) bool {
 	return r.enqueue(ctx, queuedWork{ctx: ctx, run: func(c context.Context) error { work(c); return nil }}, false) == nil
 }
-func (r *Runtime) DoSync(ctx context.Context, work LuaWork) error {
+func (r *Runtime) DoSync(ctx context.Context, work func(context.Context)) error {
 	return r.enqueue(ctx, queuedWork{ctx: ctx, run: func(c context.Context) error { work(c); return nil }}, true)
 }
 func (r *Runtime) DoSyncWithResult(ctx context.Context, work func(context.Context) error) error {
@@ -87,26 +91,74 @@ func (r *Runtime) DoSyncWithResult(ctx context.Context, work func(context.Contex
 		return ctx.Err()
 	}
 }
+
+type reservation struct {
+	runtime *Runtime
+	ctx     context.Context
+	used    bool
+}
+
+func (r *Runtime) Reserve(ctx context.Context) (actions.Reservation, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, ErrRuntimeClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(r.workQueue)+r.reserved >= cap(r.workQueue) {
+		return nil, ErrQueueFull
+	}
+	r.reserved++
+	return &reservation{runtime: r, ctx: ctx}, nil
+}
+func (t *reservation) Commit(fn func(context.Context)) error {
+	return t.commit(queuedWork{ctx: t.ctx, run: func(ctx context.Context) error { fn(ctx); return nil }})
+}
+func (t *reservation) commit(item queuedWork) error {
+	r := t.runtime
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.used {
+		return fmt.Errorf("queue reservation already released")
+	}
+	t.used = true
+	// Capacity was reserved, and shutdown cannot close the queue while reserved.
+	r.workQueue <- item
+	r.reserved--
+	r.closeQueueLocked()
+	return nil
+}
+func (t *reservation) Release() {
+	r := t.runtime
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.used {
+		return
+	}
+	t.used = true
+	r.reserved--
+	r.closeQueueLocked()
+	select {
+	case r.space <- struct{}{}:
+	default:
+	}
+}
+func (r *Runtime) closeQueueLocked() {
+	if r.closed && r.reserved == 0 && !r.queueClosed {
+		r.queueClosed = true
+		close(r.workQueue)
+	}
+}
 func (r *Runtime) enqueue(ctx context.Context, item queuedWork, wait bool) error {
 	for {
-		r.mu.Lock()
-		if r.closed {
-			r.mu.Unlock()
-			return ErrRuntimeClosed
+		token, err := r.Reserve(ctx)
+		if err == nil {
+			return token.(*reservation).commit(item)
 		}
-		if err := ctx.Err(); err != nil {
-			r.mu.Unlock()
+		if !wait || !errors.Is(err, ErrQueueFull) {
 			return err
-		}
-		select {
-		case r.workQueue <- item:
-			r.mu.Unlock()
-			return nil
-		default:
-			r.mu.Unlock()
-		}
-		if !wait {
-			return ErrQueueFull
 		}
 		select {
 		case <-r.space:
@@ -128,15 +180,25 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	if !r.closed {
 		r.closed = true
-		close(r.workQueue)
+		r.closeQueueLocked()
 	}
 	if r.cancel != nil {
 		r.cancel()
 	}
 	started := r.started
+	if !started {
+		r.started = true
+	}
 	r.mu.Unlock()
 	if !started {
-		r.finish()
+		go func() {
+			cancelled, cancel := context.WithCancel(context.Background())
+			cancel()
+			defer r.finish()
+			for item := range r.workQueue {
+				r.executeWork(cancelled, item)
+			}
+		}()
 	}
 	select {
 	case <-r.done:
@@ -162,7 +224,7 @@ func (r *Runtime) Run(parent context.Context) {
 		r.mu.Lock()
 		if !r.closed {
 			r.closed = true
-			close(r.workQueue)
+			r.closeQueueLocked()
 		}
 		r.mu.Unlock()
 	})
@@ -191,6 +253,7 @@ func (r *Runtime) executeWork(runtimeCtx context.Context, item queuedWork) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("Lua work panic: %v", p)
+			r.Abort(err)
 		}
 		r.mu.Lock()
 		r.running = false
@@ -223,6 +286,7 @@ func (r *Runtime) registerModules() {
 	// Action module
 	r.actionModule = modules.NewActionModule(r.deps.Registry, r.deps.Bridge, r.deps.Stores, r.deps.Orchestrator)
 	r.actionModule.SetInvoker(r.deps.Invoker)
+	r.actionModule.SetFatalHandler(r.Abort)
 	r.L.PreloadModule("action", r.actionModule.Loader)
 
 	// Sched module
@@ -278,6 +342,9 @@ func (r *Runtime) LoadScript(path string) error {
 		return fmt.Errorf("failed to execute Lua script: %w", err)
 	}
 
+	if status := r.Status(); status.Fatal {
+		return fmt.Errorf("Lua runtime integrity failure: %s", status.LastError)
+	}
 	log.Info().Msg("Lua script loaded successfully")
 	return nil
 }
@@ -295,4 +362,22 @@ func (r *Runtime) GetWebhookModule() *modules.WebhookModule {
 // Invoker returns the action invoker
 func (r *Runtime) Invoker() *actions.Invoker {
 	return r.deps.Invoker
+}
+
+// Abort fails closed after a Go panic; accepted invocation callbacks receive a
+// cancelled context solely to write terminal outcomes, never to execute Lua.
+func (r *Runtime) Abort(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fatal = true
+	if err != nil {
+		r.lastError = err.Error()
+	}
+	if !r.closed {
+		r.closed = true
+		r.closeQueueLocked()
+	}
+	if r.cancel != nil {
+		r.cancel()
+	}
 }

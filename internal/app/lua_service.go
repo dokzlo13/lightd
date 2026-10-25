@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"github.com/dokzlo13/lightd/internal/actions"
 	"time"
 
 	luastate "github.com/yuin/gopher-lua"
@@ -73,3 +74,9 @@ func (s *LuaService) LState() *luastate.LState {
 func (s *LuaService) Stop(ctx context.Context) error   { return s.Runtime.Stop(ctx) }
 func (s *LuaService) Status() lua.RuntimeStatus        { return s.Runtime.Status() }
 func (s *LuaService) SetActionTimeout(d time.Duration) { s.Runtime.SetActionTimeout(d) }
+
+func (s *LuaService) Abort(err error) { s.Runtime.Abort(err) }
+
+func (s *LuaService) Reserve(ctx context.Context) (actions.Reservation, error) {
+	return s.Runtime.Reserve(ctx)
+}

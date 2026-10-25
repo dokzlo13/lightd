@@ -286,6 +286,9 @@ func (l *Ledger) SaveCursor(id string, at time.Time) error {
 // PatchTx applies explicit JSON field presence atomically; clear is evaluated
 // first, so a patch can replace a colour mode while preserving unrelated state.
 func (s *TypedStore[T]) PatchTx(tx *sql.Tx, id string, patch map[string]json.RawMessage, clear []string) error {
+	return s.PatchTxValidated(tx, id, patch, clear, nil)
+}
+func (s *TypedStore[T]) PatchTxValidated(tx *sql.Tx, id string, patch map[string]json.RawMessage, clear []string, validate func(T) error) error {
 	var payload string
 	current := map[string]json.RawMessage{}
 	err := tx.QueryRow(`SELECT payload FROM resource_state WHERE kind=? AND id=?`, s.kind, id).Scan(&payload)
@@ -306,6 +309,15 @@ func (s *TypedStore[T]) PatchTx(tx *sql.Tx, id string, patch map[string]json.Raw
 	b, err := json.Marshal(current)
 	if err != nil {
 		return err
+	}
+	if validate != nil {
+		var value T
+		if err = json.Unmarshal(b, &value); err != nil {
+			return err
+		}
+		if err = validate(value); err != nil {
+			return err
+		}
 	}
 	return s.store.SetTx(tx, s.kind, id, b)
 }
@@ -343,4 +355,10 @@ func (l *Ledger) EndEvents(ids []string, status string, cause error) error {
 	err = tx.Commit()
 	l.report(err)
 	return err
+}
+
+func (s *TypedStore[T]) VersionTx(tx *sql.Tx, id string) (int64, error) {
+	var version int64
+	err := tx.QueryRow(`SELECT version FROM resource_state WHERE kind=? AND id=?`, s.kind, id).Scan(&version)
+	return version, err
 }

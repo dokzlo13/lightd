@@ -153,6 +153,10 @@ func lightBuilderSetColorXY(L *lua.LState) int {
 	x := float32(L.CheckNumber(2))
 	y := float32(L.CheckNumber(3))
 
+	if math.IsNaN(float64(x)) || math.IsNaN(float64(y)) || math.IsInf(float64(x), 0) || math.IsInf(float64(y), 0) || x < 0 || x > 1 || y < 0 || y > 1 {
+		L.RaiseError("xy coordinates must be finite 0..1")
+		return 0
+	}
 	builder.state.Xy = []float32{x, y}
 	builder.module.markLightPending(builder)
 	L.Push(ud)
@@ -167,15 +171,12 @@ func lightBuilderSetCt(L *lua.LState) int {
 	builder.state.Hue = nil
 	builder.state.Sat = nil
 	builder.clear = append(builder.clear, "xy", "hue", "sat")
-	ct := L.CheckInt(2)
-
-	// Clamp to valid range
-	if ct < 153 {
-		ct = 153
+	value := float64(L.CheckNumber(2))
+	if math.IsNaN(value) || math.IsInf(value, 0) || math.Trunc(value) != value || value <= 0 || value > 65535 {
+		L.ArgError(2, "mirek must be a positive integer <=65535")
+		return 0
 	}
-	if ct > 500 {
-		ct = 500
-	}
+	ct := int(value)
 
 	ctVal := uint16(ct)
 	builder.state.Ct = &ctVal

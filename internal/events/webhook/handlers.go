@@ -15,16 +15,24 @@ type HandlerRegistry interface {
 	FindHandler(string, string) *MatchResult
 }
 
-func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i *actions.Invoker, x exec.Executor) {
+func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i *actions.Invoker, x exec.Executor) func() {
 	var mu sync.Mutex
 	collectors := map[string]middleware.Collector{}
-	context.AfterFunc(ctx, func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, c := range collectors {
-			c.Close()
-		}
-	})
+	closed := false
+	done := make(chan struct{})
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() {
+			mu.Lock()
+			defer mu.Unlock()
+			closed = true
+			for _, c := range collectors {
+				c.Close()
+			}
+			close(done)
+		})
+	}
+	stopCleanup := context.AfterFunc(ctx, cleanup)
 	bus.SubscribeAck(events.EventTypeWebhook, func(e events.Event) error {
 		method, _ := e.Data["method"].(string)
 		path, _ := e.Data["path"].(string)
@@ -45,6 +53,10 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 		key := method + ":" + match.Handler.Path
 		mu.Lock()
 		defer mu.Unlock()
+		if closed {
+			_ = i.EndEvents([]string{eventID}, "rejected", middleware.ErrCollectorClosed)
+			return middleware.ErrCollectorClosed
+		}
 		collector := collectors[key]
 		if collector == nil {
 			collector = createWebhookCollector(ctx, match.Handler, i, x)
@@ -56,6 +68,13 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 		}
 		return err
 	})
+	return func() {
+		if stopCleanup() {
+			cleanup()
+		} else {
+			<-done
+		}
+	}
 }
 func createWebhookCollector(ctx context.Context, h *Handler, i *actions.Invoker, x exec.Executor) middleware.Collector {
 	flush := func(batch []map[string]any) error {

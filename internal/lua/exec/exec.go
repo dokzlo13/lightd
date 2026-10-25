@@ -4,7 +4,9 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"github.com/dokzlo13/lightd/internal/actions"
 	"math"
 
 	glua "github.com/yuin/gopher-lua"
@@ -33,6 +35,10 @@ func CallReducer(L *glua.LState, reducer *glua.LFunction, events []map[string]an
 	L.Push(eventsTable)
 
 	if err := L.PCall(1, 1, nil); err != nil {
+		var apiErr *glua.ApiError
+		if errors.As(err, &apiErr) && apiErr.Type == glua.ApiErrorPanic {
+			return nil, errors.Join(actions.ErrIntegrity, err)
+		}
 		return nil, fmt.Errorf("Lua reducer: %w", err)
 	}
 
