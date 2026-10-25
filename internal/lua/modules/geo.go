@@ -3,6 +3,7 @@ package modules
 import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
+	"time"
 
 	"github.com/dokzlo13/lightd/internal/geo"
 )
@@ -25,6 +26,7 @@ func (m *GeoModule) Loader(L *lua.LState) int {
 	mod := L.NewTable()
 
 	L.SetField(mod, "today", L.NewFunction(m.today))
+	L.SetField(mod, "for_date", L.NewFunction(m.forDate))
 	L.SetField(mod, "location", L.NewFunction(m.location))
 
 	L.Push(mod)
@@ -40,7 +42,27 @@ func (m *GeoModule) today(L *lua.LState) int {
 		return 1
 	}
 
-	times, err := m.calculator.GetTimesForToday()
+	return m.pushDate(L, time.Now())
+}
+func (m *GeoModule) forDate(L *lua.LState) int {
+	if !m.calculator.IsConfigured() {
+		L.Push(lua.LNil)
+		return 1
+	}
+	loc, err := time.LoadLocation(m.calculator.Location().Timezone)
+	if err != nil {
+		L.RaiseError("invalid timezone: %s", err)
+		return 0
+	}
+	date, err := time.ParseInLocation("2006-01-02", L.CheckString(1), loc)
+	if err != nil {
+		L.RaiseError("date must be YYYY-MM-DD")
+		return 0
+	}
+	return m.pushDate(L, date)
+}
+func (m *GeoModule) pushDate(L *lua.LState, date time.Time) int {
+	times, err := m.calculator.GetTimes(date)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to calculate astronomical times")
 		L.Push(lua.LNil)
@@ -48,12 +70,24 @@ func (m *GeoModule) today(L *lua.LState) int {
 	}
 
 	result := L.NewTable()
-	L.SetField(result, "dawn", lua.LNumber(times.Dawn.Unix()))
-	L.SetField(result, "sunrise", lua.LNumber(times.Sunrise.Unix()))
-	L.SetField(result, "noon", lua.LNumber(times.Noon.Unix()))
-	L.SetField(result, "sunset", lua.LNumber(times.Sunset.Unix()))
-	L.SetField(result, "dusk", lua.LNumber(times.Dusk.Unix()))
-	L.SetField(result, "midnight", lua.LNumber(times.Midnight.Unix()))
+	if !times.Dawn.IsZero() {
+		L.SetField(result, "dawn", lua.LNumber(times.Dawn.Unix()))
+	}
+	if !times.Sunrise.IsZero() {
+		L.SetField(result, "sunrise", lua.LNumber(times.Sunrise.Unix()))
+	}
+	if !times.Noon.IsZero() {
+		L.SetField(result, "noon", lua.LNumber(times.Noon.Unix()))
+	}
+	if !times.Sunset.IsZero() {
+		L.SetField(result, "sunset", lua.LNumber(times.Sunset.Unix()))
+	}
+	if !times.Dusk.IsZero() {
+		L.SetField(result, "dusk", lua.LNumber(times.Dusk.Unix()))
+	}
+	if !times.Midnight.IsZero() {
+		L.SetField(result, "midnight", lua.LNumber(times.Midnight.Unix()))
+	}
 
 	L.Push(result)
 	return 1

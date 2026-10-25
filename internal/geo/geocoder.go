@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -86,11 +88,13 @@ func (g *Geocoder) Resolve(ctx context.Context, name string) (*Location, error) 
 
 	// Store in persistent cache for future runs
 	if g.cache != nil {
-		g.cache.Put(name, &storage.CachedLocation{
+		if err := g.cache.Put(name, &storage.CachedLocation{
 			Name:      loc.Name,
 			Latitude:  loc.Latitude,
 			Longitude: loc.Longitude,
-		})
+		}); err != nil {
+			return nil, fmt.Errorf("persist geocoding cache: %w", err)
+		}
 		log.Debug().Str("query", name).Msg("Location cached for future use")
 	}
 
@@ -122,9 +126,13 @@ func (g *Geocoder) geocodeNominatim(ctx context.Context, name string) (*Location
 		return nil, fmt.Errorf("geocoding failed with status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read geocoding response: %w", err)
+	}
+
+	if len(body) > 1<<20 {
+		return nil, fmt.Errorf("geocoding response exceeds 1 MiB")
 	}
 
 	var results []struct {
@@ -137,12 +145,14 @@ func (g *Geocoder) geocodeNominatim(ctx context.Context, name string) (*Location
 	}
 
 	if len(results) == 0 {
-		return nil, fmt.Errorf("location not found: %s", name)
+		return nil, fmt.Errorf("configured location not found")
 	}
 
-	var lat, lon float64
-	fmt.Sscanf(results[0].Lat, "%f", &lat)
-	fmt.Sscanf(results[0].Lon, "%f", &lon)
+	lat, latErr := strconv.ParseFloat(results[0].Lat, 64)
+	lon, lonErr := strconv.ParseFloat(results[0].Lon, 64)
+	if latErr != nil || lonErr != nil || math.IsNaN(lat) || math.IsNaN(lon) || math.IsInf(lat, 0) || math.IsInf(lon, 0) || lat < -90 || lat > 90 || lon < -180 || lon > 180 {
+		return nil, fmt.Errorf("geocoder returned invalid coordinates")
+	}
 
 	loc := &Location{
 		Name:      results[0].DisplayName,
@@ -150,7 +160,7 @@ func (g *Geocoder) geocodeNominatim(ctx context.Context, name string) (*Location
 		Longitude: lon,
 	}
 
-	log.Info().
+	log.Debug().
 		Str("query", name).
 		Str("resolved", loc.Name).
 		Float64("lat", lat).
@@ -176,7 +186,7 @@ func ResolveOnBoot(ctx context.Context, geocoder *Geocoder, locationName string,
 			Longitude: lon,
 			Timezone:  timezone,
 		}
-		log.Info().
+		log.Debug().
 			Str("name", locationName).
 			Float64("lat", lat).
 			Float64("lon", lon).
@@ -189,7 +199,7 @@ func ResolveOnBoot(ctx context.Context, geocoder *Geocoder, locationName string,
 	if locationName != "" {
 		loc, err := geocoder.Resolve(ctx, locationName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to geocode location %q: %w", locationName, err)
+			return nil, fmt.Errorf("failed to geocode configured location: %w", err)
 		}
 		// Set timezone if provided (geocoding doesn't return timezone)
 		if timezone != "" {

@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -47,7 +48,7 @@ type Occurrence struct {
 // NewOccurrence creates a new occurrence with a standard ID format
 func NewOccurrence(scheduleID string, t time.Time) *Occurrence {
 	return &Occurrence{
-		ID:         fmt.Sprintf("%s/%d", scheduleID, t.Unix()),
+		ID:         fmt.Sprintf("%s/%d", scheduleID, t.UnixNano()),
 		ScheduleID: scheduleID,
 		Time:       t,
 	}
@@ -56,7 +57,7 @@ func NewOccurrence(scheduleID string, t time.Time) *Occurrence {
 // NewOccurrenceWithSuffix creates an occurrence with a custom suffix (e.g., for boot recovery)
 func NewOccurrenceWithSuffix(scheduleID string, t time.Time, suffix string) *Occurrence {
 	return &Occurrence{
-		ID:         fmt.Sprintf("%s/%s/%d", scheduleID, suffix, t.Unix()),
+		ID:         fmt.Sprintf("%s/%s/%d", scheduleID, suffix, t.UnixNano()),
 		ScheduleID: scheduleID,
 		Time:       t,
 	}
@@ -85,6 +86,9 @@ func NewDailySchedule(
 	misfirePolicy MisfirePolicy,
 	evaluator TimeEvaluator,
 ) (*DailySchedule, error) {
+	if id == "" || actionName == "" {
+		return nil, fmt.Errorf("schedule id and action must not be empty")
+	}
 	expr, err := ParseTimeExpr(timeExprStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid time expression: %w", err)
@@ -95,13 +99,17 @@ func NewDailySchedule(
 		return nil, fmt.Errorf("astronomical time expression %q requires geo to be enabled (events.scheduler.geo.enabled: true)", timeExprStr)
 	}
 
+	copiedArgs, err := copyArgs(actionArgs)
+	if err != nil {
+		return nil, fmt.Errorf("schedule arguments: %w", err)
+	}
 	return &DailySchedule{
 		id:            id,
 		tag:           tag,
 		timeExpr:      expr,
 		evaluator:     evaluator,
 		actionName:    actionName,
-		actionArgs:    actionArgs,
+		actionArgs:    copiedArgs,
 		misfirePolicy: misfirePolicy,
 	}, nil
 }
@@ -109,7 +117,7 @@ func NewDailySchedule(
 func (s *DailySchedule) ID() string                   { return s.id }
 func (s *DailySchedule) Tag() string                  { return s.tag }
 func (s *DailySchedule) ActionName() string           { return s.actionName }
-func (s *DailySchedule) ActionArgs() map[string]any   { return s.actionArgs }
+func (s *DailySchedule) ActionArgs() map[string]any   { args, _ := copyArgs(s.actionArgs); return args }
 func (s *DailySchedule) MisfirePolicy() MisfirePolicy { return s.misfirePolicy }
 
 // Next returns the next occurrence after the given time.
@@ -166,14 +174,20 @@ func NewPeriodicSchedule(
 	}
 }
 
-func (s *PeriodicSchedule) ID() string                   { return s.id }
-func (s *PeriodicSchedule) Tag() string                  { return s.tag }
-func (s *PeriodicSchedule) ActionName() string           { return s.actionName }
-func (s *PeriodicSchedule) ActionArgs() map[string]any   { return s.actionArgs }
+func (s *PeriodicSchedule) ID() string         { return s.id }
+func (s *PeriodicSchedule) Tag() string        { return s.tag }
+func (s *PeriodicSchedule) ActionName() string { return s.actionName }
+func (s *PeriodicSchedule) ActionArgs() map[string]any {
+	args, _ := copyArgs(s.actionArgs)
+	return args
+}
 func (s *PeriodicSchedule) MisfirePolicy() MisfirePolicy { return s.misfirePolicy }
 
 // Next returns the next occurrence after the given time.
 func (s *PeriodicSchedule) Next(after time.Time) *Occurrence {
+	if s.interval < time.Second {
+		return nil
+	}
 	if after.Before(s.startTime) {
 		return NewOccurrence(s.id, s.startTime)
 	}
@@ -187,6 +201,9 @@ func (s *PeriodicSchedule) Next(after time.Time) *Occurrence {
 
 // Prev returns the previous occurrence before the given time.
 func (s *PeriodicSchedule) Prev(before time.Time) *Occurrence {
+	if s.interval < time.Second {
+		return nil
+	}
 	if before.Before(s.startTime) || before.Equal(s.startTime) {
 		return nil
 	}
@@ -210,4 +227,20 @@ func (s *PeriodicSchedule) Prev(before time.Time) *Occurrence {
 // Interval returns the schedule interval for display.
 func (s *PeriodicSchedule) Interval() time.Duration {
 	return s.interval
+}
+
+func copyArgs(args map[string]any) (map[string]any, error) {
+	if args == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxPolicyBytes {
+		return nil, fmt.Errorf("schedule arguments exceed 1 MiB")
+	}
+	var copy map[string]any
+	err = json.Unmarshal(data, &copy)
+	return copy, err
 }

@@ -38,6 +38,8 @@ func (m *SchedModule) Loader(L *lua.LState) int {
 	mod := L.NewTable()
 
 	L.SetField(mod, "define", L.NewFunction(m.define))
+	L.SetField(mod, "policy", L.NewFunction(m.policy))
+	L.SetField(mod, "preview", L.NewFunction(m.preview))
 	L.SetField(mod, "periodic", L.NewFunction(m.periodic))
 	L.SetField(mod, "run_closest", L.NewFunction(m.runClosest))
 	L.SetField(mod, "print", L.NewFunction(m.print))
@@ -118,7 +120,10 @@ func (m *SchedModule) periodic(L *lua.LState) int {
 		tag = t.String()
 	}
 
-	m.scheduler.DefinePeriodic(id, interval, actionName, args, tag)
+	if err := m.scheduler.DefinePeriodic(id, interval, actionName, args, tag); err != nil {
+		L.RaiseError("invalid periodic schedule: %s", err)
+		return 0
+	}
 
 	log.Debug().
 		Str("id", id).
@@ -154,7 +159,11 @@ func (m *SchedModule) runClosest(L *lua.LState) int {
 		strategy = scheduler.Strategy(s.String())
 	}
 
-	m.scheduler.RunClosest(tags, strategy)
+	if err := m.scheduler.RunClosest(tags, strategy); err != nil {
+		L.Push(lua.LFalse)
+		L.Push(lua.LString(err.Error()))
+		return 2
+	}
 
 	L.Push(lua.LBool(true))
 	L.Push(lua.LNil)
@@ -218,6 +227,10 @@ func (m *SchedModule) getClosest(L *lua.LState) int {
 		strategy = scheduler.Strategy(s.String())
 	}
 
+	if strategy != scheduler.StrategyNext && strategy != scheduler.StrategyPrev {
+		L.RaiseError("strategy must be NEXT or PREV")
+		return 0
+	}
 	info := m.scheduler.GetClosest(tags, strategy)
 	if info == nil {
 		L.Push(lua.LNil)
@@ -235,7 +248,7 @@ func (m *SchedModule) getClosest(L *lua.LState) int {
 // print(opts) - Print the current schedule
 // opts.format: "today" (default) or "tomorrow"
 func (m *SchedModule) print(L *lua.LState) int {
-	day := time.Now()
+	day := time.Now().In(m.scheduler.Timezone())
 
 	// Check for optional opts table
 	if L.GetTop() >= 1 {
@@ -260,4 +273,55 @@ func (m *SchedModule) disable(L *lua.LState) int {
 		L.RaiseError("failed to disable schedule: %s", err.Error())
 	}
 	return 0
+}
+
+// policy(id, spec) atomically validates and installs a complete phase calendar.
+func (m *SchedModule) policy(L *lua.LState) int {
+	id := L.CheckString(1)
+	table := L.CheckTable(2)
+	spec, err := scheduler.PolicySpecFromLua(table)
+	if err != nil {
+		L.RaiseError("invalid policy: %s", err)
+		return 0
+	}
+	if spec.ID != "" && spec.ID != id {
+		L.RaiseError("policy id does not match")
+		return 0
+	}
+	spec.ID = id
+	if err = m.scheduler.InstallPolicy(spec); err != nil {
+		L.RaiseError("invalid policy: %s", err)
+	}
+	return 0
+}
+func (m *SchedModule) preview(L *lua.LState) int {
+	opts := L.CheckTable(1)
+	id := opts.RawGetString("policy").String()
+	date := opts.RawGetString("date").String()
+	preview, err := m.scheduler.PreviewPolicy(id, date)
+	if err != nil {
+		L.Push(lua.LNil)
+		L.Push(lua.LString(err.Error()))
+		return 2
+	}
+	result := L.NewTable()
+	L.SetField(result, "date", lua.LString(preview.Date))
+	L.SetField(result, "timezone", lua.LString(preview.Timezone))
+	L.SetField(result, "version", lua.LString(preview.Version))
+	phases := L.NewTable()
+	for _, phase := range preview.Phases {
+		row := L.NewTable()
+		L.SetField(row, "id", lua.LString(phase.ID))
+		L.SetField(row, "action", lua.LString(phase.Action))
+		L.SetField(row, "skipped", lua.LBool(phase.Skipped))
+		if phase.Time != nil {
+			L.SetField(row, "time", lua.LNumber(phase.Time.Unix()))
+			L.SetField(row, "timestamp", lua.LString(phase.Time.Format(time.RFC3339)))
+		}
+		phases.Append(row)
+	}
+	L.SetField(result, "phases", phases)
+	L.Push(result)
+	L.Push(lua.LNil)
+	return 2
 }

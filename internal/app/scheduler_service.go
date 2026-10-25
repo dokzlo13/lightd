@@ -2,9 +2,8 @@ package app
 
 import (
 	"context"
-	"time"
-
-	"github.com/rs/zerolog/log"
+	"fmt"
+	"sync"
 
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events"
@@ -13,99 +12,64 @@ import (
 	"github.com/dokzlo13/lightd/internal/storage"
 )
 
-// SchedulerService wraps the scheduler and related periodic tasks.
 type SchedulerService struct {
-	cfg       *config.Config
 	Scheduler *scheduler.Scheduler
-	ledger    *storage.Ledger
 	enabled   bool
+	mu        sync.Mutex
+	cancel    context.CancelFunc
+	done      chan struct{}
+	runErr    error
 }
 
-// NewSchedulerService creates a new SchedulerService.
-func NewSchedulerService(
-	cfg *config.Config,
-	bus *events.Bus,
-	l *storage.Ledger,
-	geoCalc *geo.Calculator,
-) *SchedulerService {
-	schedCfg := cfg.Events.Scheduler
-	enabled := schedCfg.IsEnabled()
-
-	var sched *scheduler.Scheduler
-	if enabled {
-		if schedCfg.Geo.IsEnabled() {
-			// Full scheduler with astronomical time support
-			// geoCalc already contains the resolved location
-			sched = scheduler.New(bus, l, geoCalc, schedCfg.GetTimezone())
+func NewSchedulerService(cfg *config.Config, bus *events.Bus, ledger *storage.Ledger, calc *geo.Calculator) *SchedulerService {
+	c := cfg.Events.Scheduler
+	s := &SchedulerService{enabled: c.IsEnabled()}
+	if s.enabled {
+		if c.Geo.IsEnabled() {
+			s.Scheduler = scheduler.New(bus, ledger, calc, c.GetTimezone())
 		} else {
-			// Fixed-time only scheduler (no geo required)
-			sched = scheduler.NewWithFixedTimeOnly(bus, l, schedCfg.GetTimezone())
-			log.Info().Msg("Scheduler geo is disabled - astronomical times (@dawn, @noon, @sunset, etc.) are not available")
+			s.Scheduler = scheduler.NewWithFixedTimeOnly(bus, ledger, c.GetTimezone())
 		}
 	}
-
-	return &SchedulerService{
-		cfg:       cfg,
-		Scheduler: sched,
-		ledger:    l,
-		enabled:   enabled,
-	}
+	return s
 }
+func (s *SchedulerService) IsEnabled() bool { return s.enabled }
 
-// IsEnabled returns whether the scheduler is enabled.
-func (s *SchedulerService) IsEnabled() bool {
-	return s.enabled
-}
-
-// Start begins the scheduler and related periodic tasks.
-func (s *SchedulerService) Start(ctx context.Context) {
+// Start reports recovery admission failures instead of claiming successful startup.
+func (s *SchedulerService) Start(ctx context.Context) error {
 	if !s.enabled {
-		log.Info().Msg("Scheduler disabled")
-		return
+		return nil
 	}
-
-	log.Info().Msg("Scheduler enabled")
-
-	// Run boot recovery first
-	s.Scheduler.RunBootRecovery()
-
-	// Start scheduler
-	go func() {
-		if err := s.Scheduler.Run(ctx); err != nil {
-			log.Error().Err(err).Msg("Scheduler error")
-		}
-	}()
-
-	// Ledger cleanup (if ledger is enabled)
-	if s.cfg.Ledger.IsEnabled() {
-		log.Info().
-			Dur("retention", s.cfg.Ledger.GetRetentionPeriod()).
-			Dur("interval", s.cfg.Ledger.GetRetentionInterval()).
-			Msg("Ledger cleanup enabled")
-		go s.runLedgerCleanup(ctx)
-	} else {
-		log.Info().Msg("Ledger cleanup disabled")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done != nil {
+		return fmt.Errorf("scheduler already started")
+	}
+	if err := s.Scheduler.RunBootRecovery(); err != nil {
+		return fmt.Errorf("scheduler boot recovery: %w", err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+	s.done = make(chan struct{})
+	go func() { err := s.Scheduler.Run(runCtx); s.mu.Lock(); s.runErr = err; s.mu.Unlock(); close(s.done) }()
+	return nil
+}
+func (s *SchedulerService) Stop(ctx context.Context) error {
+	s.mu.Lock()
+	done := s.done
+	cancel := s.cancel
+	s.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.runErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
-
-// runLedgerCleanup periodically cleans up old ledger entries.
-func (s *SchedulerService) runLedgerCleanup(ctx context.Context) {
-	retention := s.cfg.Ledger.GetRetentionPeriod()
-	interval := s.cfg.Ledger.GetRetentionInterval()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			deleted, err := s.ledger.DeleteOlderThan(retention)
-			if err != nil {
-				log.Error().Err(err).Msg("Failed to cleanup old ledger entries")
-			} else if deleted > 0 {
-				log.Info().Int64("deleted", deleted).Dur("retention", retention).Msg("Cleaned up old ledger entries")
-			}
-		}
-	}
-}
+func (s *SchedulerService) Err() error { s.mu.Lock(); defer s.mu.Unlock(); return s.runErr }

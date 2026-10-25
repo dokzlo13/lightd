@@ -33,7 +33,7 @@ type TimeExpr struct {
 
 var (
 	// Match patterns like "@dawn", "@sunset", "@noon + 30m", "@sunrise - 1h30m"
-	astroPattern = regexp.MustCompile(`^@(\w+)\s*([+-]\s*\d+[hms]+(?:\d+[ms]+)?)?$`)
+	astroPattern = regexp.MustCompile(`^@(\w+)\s*([+-]\s*[0-9a-z.]+)?$`)
 	// Match patterns like "22:15", "06:30"
 	fixedPattern = regexp.MustCompile(`^(\d{1,2}):(\d{2})$`)
 	// Match duration like "30m", "1h", "1h30m"
@@ -92,6 +92,9 @@ func ParseTimeExpr(expr string) (*TimeExpr, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid offset: %w", err)
 			}
+			if d < -24*time.Hour || d > 24*time.Hour {
+				return nil, fmt.Errorf("solar offset must be within 24 hours")
+			}
 			offset = d
 		}
 
@@ -137,8 +140,11 @@ func (te *TimeExpr) Evaluate(date time.Time, astro *geo.AstroTimes, tz *time.Loc
 
 	switch te.BaseTime {
 	case BaseTimeFixed:
-		baseTime = time.Date(date.Year(), date.Month(), date.Day(),
-			te.FixedHour, te.FixedMin, 0, 0, tz)
+		var ok bool
+		baseTime, ok = resolveWallTime(date.In(tz), te.FixedHour, te.FixedMin, tz)
+		if !ok {
+			return time.Time{}, false
+		}
 
 	case BaseTimeDawn:
 		if astro == nil || astro.Dawn.IsZero() {
@@ -244,37 +250,56 @@ func (e *AstroTimeEvaluator) Evaluate(expr *TimeExpr, date time.Time) (time.Time
 }
 
 func (e *AstroTimeEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Time) (time.Time, bool) {
-	date := after.In(e.tz)
-
-	for i := 0; i < 366; i++ {
-		checkDate := date.AddDate(0, 0, i)
-		t, ok := e.Evaluate(expr, checkDate)
-		if !ok {
-			continue
-		}
-		if t.After(after) {
-			return t, true
-		}
-	}
-
-	return time.Time{}, false
+	return searchOccurrence(e, expr, after, true)
+}
+func (e *AstroTimeEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
+	return searchOccurrence(e, expr, before, false)
 }
 
-func (e *AstroTimeEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
-	date := before.In(e.tz)
-
-	for i := 0; i < 366; i++ {
-		checkDate := date.AddDate(0, 0, -i)
-		t, ok := e.Evaluate(expr, checkDate)
-		if !ok {
-			continue
+// searchOccurrence includes neighboring anchor dates because solar instants and
+// offsets may fall outside their anchor's civil date. Scan chronologically and
+// retain the nearest actual instant; stop only after the displacement window.
+func searchOccurrence(e TimeEvaluator, expr *TimeExpr, query time.Time, next bool) (time.Time, bool) {
+	date := query.In(e.Timezone())
+	date = time.Date(date.Year(), date.Month(), date.Day(), 12, 0, 0, 0, e.Timezone())
+	var best time.Time
+	for n := -3; n < 370; n++ {
+		days := n
+		if !next {
+			days = -n
 		}
-		if t.Before(before) {
-			return t, true
+		at, ok := e.Evaluate(expr, date.AddDate(0, 0, days))
+		if ok && ((next && at.After(query)) || (!next && at.Before(query))) {
+			if best.IsZero() || (next && at.Before(best)) || (!next && at.After(best)) {
+				best = at
+			}
+		}
+		if !best.IsZero() && n > 3 {
+			break
 		}
 	}
+	return best, !best.IsZero()
+}
 
-	return time.Time{}, false
+// resolveWallTime skips nonexistent civil times and chooses the first instant
+// of an autumn fold. time.Date alone deliberately leaves this choice undefined.
+func resolveWallTime(date time.Time, hour, minute int, tz *time.Location) (time.Time, bool) {
+	wall := time.Date(date.Year(), date.Month(), date.Day(), hour, minute, 0, 0, time.UTC)
+	offsets := map[int]bool{}
+	for h := -48; h <= 48; h += 6 {
+		_, offset := wall.Add(time.Duration(h) * time.Hour).In(tz).Zone()
+		offsets[offset] = true
+	}
+	var first time.Time
+	for offset := range offsets {
+		candidate := wall.Add(-time.Duration(offset) * time.Second).In(tz)
+		if candidate.Year() == date.Year() && candidate.Month() == date.Month() && candidate.Day() == date.Day() && candidate.Hour() == hour && candidate.Minute() == minute {
+			if first.IsZero() || candidate.Before(first) {
+				first = candidate
+			}
+		}
+	}
+	return first, !first.IsZero()
 }
 
 // FixedTimeEvaluator evaluates only fixed time expressions (no geo required)
@@ -306,42 +331,11 @@ func (e *FixedTimeEvaluator) ComputeNextOccurrence(expr *TimeExpr, after time.Ti
 	if !expr.IsFixed() {
 		return time.Time{}, false
 	}
-
-	date := after.In(e.tz)
-
-	// For fixed times, just check today and tomorrow
-	for i := 0; i < 2; i++ {
-		checkDate := date.AddDate(0, 0, i)
-		t, ok := e.Evaluate(expr, checkDate)
-		if !ok {
-			continue
-		}
-		if t.After(after) {
-			return t, true
-		}
-	}
-
-	return time.Time{}, false
+	return searchOccurrence(e, expr, after, true)
 }
-
 func (e *FixedTimeEvaluator) ComputePrevOccurrence(expr *TimeExpr, before time.Time) (time.Time, bool) {
 	if !expr.IsFixed() {
 		return time.Time{}, false
 	}
-
-	date := before.In(e.tz)
-
-	// For fixed times, just check today and yesterday
-	for i := 0; i < 2; i++ {
-		checkDate := date.AddDate(0, 0, -i)
-		t, ok := e.Evaluate(expr, checkDate)
-		if !ok {
-			continue
-		}
-		if t.Before(before) {
-			return t, true
-		}
-	}
-
-	return time.Time{}, false
+	return searchOccurrence(e, expr, before, false)
 }

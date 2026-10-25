@@ -72,9 +72,6 @@ func NewCalculator(loc *Location) *Calculator {
 	}
 
 	log.Info().
-		Str("name", loc.Name).
-		Float64("lat", loc.Latitude).
-		Float64("lon", loc.Longitude).
 		Str("timezone", c.tz.String()).
 		Msg("Geo calculator initialized")
 
@@ -235,11 +232,9 @@ func sunTime(jd, lat, lon float64, tz *time.Location, date time.Time, angle floa
 
 	cosOmega := (math.Sin(angleRad) - math.Sin(latRad)*math.Sin(dec)) / (math.Cos(latRad) * math.Cos(dec))
 
-	// Clamp to valid range
-	if cosOmega > 1 {
-		cosOmega = 1
-	} else if cosOmega < -1 {
-		cosOmega = -1
+	// An out-of-range hour angle means this crossing does not occur.
+	if math.IsNaN(cosOmega) || cosOmega > 1 || cosOmega < -1 {
+		return time.Time{}
 	}
 
 	omega := math.Acos(cosOmega) * 180.0 / math.Pi
@@ -255,14 +250,8 @@ func sunTime(jd, lat, lon float64, tz *time.Location, date time.Time, angle floa
 }
 
 // julianToTime converts Julian day to time.Time
-func julianToTime(jd float64, tz *time.Location, refDate time.Time) time.Time {
-	// Convert Julian day to Unix timestamp
+func julianToTime(jd float64, tz *time.Location, _ time.Time) time.Time {
 	unixTime := (jd - 2440587.5) * 86400.0
-	t := time.Unix(int64(unixTime), int64((unixTime-math.Floor(unixTime))*1e9))
-
-	// Adjust to the reference date's timezone
-	return time.Date(
-		refDate.Year(), refDate.Month(), refDate.Day(),
-		t.Hour(), t.Minute(), t.Second(), 0, tz,
-	)
+	seconds := math.Floor(unixTime)
+	return time.Unix(int64(seconds), int64((unixTime-seconds)*1e9)).In(tz).Truncate(time.Second)
 }
