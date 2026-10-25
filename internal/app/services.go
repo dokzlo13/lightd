@@ -60,7 +60,6 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	s.Store = storage.NewStore(database.DB)
 
 	// Initialize geo calculator (config is under events.scheduler.geo)
-	// Note: config.Validate() should be called before NewServices() to ensure geo config is valid
 	schedCfg := cfg.Events.Scheduler
 	geoCfg := schedCfg.Geo
 	if schedCfg.IsEnabled() && geoCfg.IsEnabled() {
@@ -74,7 +73,7 @@ func NewServices(cfg *config.Config) (*Services, error) {
 			geoCfg.Location,
 			geoCfg.Lat,
 			geoCfg.Lon,
-			schedCfg.GetTimezone(), // Timezone is now at scheduler level
+			schedCfg.GetTimezone(),
 		)
 		if err != nil {
 			s.Close()

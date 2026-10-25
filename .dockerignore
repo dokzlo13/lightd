@@ -49,3 +49,12 @@ Thumbs.db
 *.tmp
 *.log
 
+
+# Private audit/worktree/runtime artifacts
+.trash/
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite3
+*.sqlite3-*

@@ -59,3 +59,8 @@ cover.out
 # Go workspace / local tooling
 go.work
 go.work.sum
+
+# Versioned example policies and test fixtures
+!examples/**/*.lua
+!testdata/**/*.lua
+!internal/**/testdata/**/*.lua
