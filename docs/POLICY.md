@@ -9,8 +9,8 @@ A fixed wall time in a spring DST gap is skipped. A time repeated in an autumn f
 ```sh
 lightd --check-config --config config.yaml
 lightd --preview-policy examples/seasonal-policy.lua \
-  --date 2026-12-21 --timezone Europe/Helsinki \
-  --latitude 60.17 --longitude 24.94 --json
+  --date 2026-12-21 --timezone UTC \
+  --latitude 0 --longitude 0 --json
 ```
 
 `--check-config` validates effective configuration and syntax-compiles ordinary automation Lua. It does not run the script or claim that dynamic action registrations are valid. Normal startup validates schedule action references after the script loads.

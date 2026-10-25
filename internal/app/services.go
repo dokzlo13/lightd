@@ -326,16 +326,18 @@ func (s *Services) Stop() error {
 		}
 		if s.Hue != nil {
 			errs = append(errs, s.Hue.Stop(ctx))
-			s.Hue.Bus.Close(ctx)
+			errs = append(errs, joinWithin(ctx, func() { s.Hue.Bus.Close(ctx) }))
 		}
-		for _, cleanup := range s.cleanups {
-			cleanup()
-		}
+		errs = append(errs, joinWithin(ctx, func() {
+			for _, cleanup := range s.cleanups {
+				cleanup()
+			}
+		}))
 		if s.Lua != nil {
 			errs = append(errs, s.Lua.Stop(ctx))
 		}
 		if s.KV != nil {
-			s.KV.StopCleanup()
+			errs = append(errs, joinWithin(ctx, s.KV.StopCleanup))
 		}
 		done := make(chan struct{})
 		go func() { s.background.Wait(); close(done) }()
@@ -358,3 +360,19 @@ func (s *Services) Stop() error {
 	return s.stopErr
 }
 func (s *Services) Close() { _ = s.Stop() }
+
+// joinWithin bounds legacy synchronous cleanup while preserving ownership of any
+// unfinished goroutine. A timeout prevents Stop from closing its shared DB/VM.
+func joinWithin(ctx context.Context, closeFn func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); closeFn() }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

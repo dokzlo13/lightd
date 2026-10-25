@@ -3,15 +3,18 @@
 # =============================================================================
 # Builder Stage
 # =============================================================================
-# Pin Go version and Alpine variant explicitly for reproducible builds
-# To fully pin, add digest: golang:1.24-alpine3.21@sha256:<digest>
-FROM golang:1.25-alpine3.23 AS builder
+# Pin the toolchain and base image identity.
+FROM golang:1.27.3-alpine3.24@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS builder
 
 # Install build dependencies for CGO (required by go-sqlite3)
 # Note: go-sqlite3 bundles SQLite source, no need for sqlite-dev
 RUN apk add --no-cache \
     gcc \
     musl-dev
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
 
 WORKDIR /src
 
@@ -31,7 +34,7 @@ COPY . .
 RUN CGO_ENABLED=1 GOOS=linux \
     go build \
     -tags sqlite_omit_load_extension \
-    -ldflags="-s -w -extldflags '-static'" \
+    -ldflags="-s -w -extldflags '-static' -X github.com/dokzlo13/lightd/internal/buildinfo.Version=${VERSION} -X github.com/dokzlo13/lightd/internal/buildinfo.Commit=${COMMIT} -X github.com/dokzlo13/lightd/internal/buildinfo.BuildTime=${BUILD_TIME}" \
     -trimpath \
     -o /bin/lightd \
     ./cmd/lightd
@@ -41,7 +44,7 @@ RUN CGO_ENABLED=1 GOOS=linux \
 # =============================================================================
 # Using Alpine for tzdata and ca-certificates
 # Binary is fully static, no runtime libs needed
-FROM alpine:3.23
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 
 # Installations
 # - ca-certificates: HTTPS connections

@@ -28,6 +28,8 @@ This document is the complete reference for the Lua scripting API in Lightd.
 
 ---
 
+> v0.3 uses native Hue V2 IDs and units. Read [migration instructions](docs/MIGRATING_0.3.md) before upgrading.
+
 ## Core Concepts
 
 ### Actions
@@ -53,7 +55,7 @@ end)
 ### Running Actions Programmatically
 
 ```lua
--- Run an action immediately (bypasses ledger/deduplication)
+-- Run an audited action immediately; nested calls receive child invocation IDs
 action.run("my_action", { foo = "bar" })
 ```
 
@@ -74,7 +76,7 @@ Every action receives a `ctx` table with access to system functionality:
 Query the current state of groups:
 
 ```lua
-local state, err = ctx.actual:group("1")
+local state, err = ctx.actual:group("10000000-0000-0000-0000-000000000001")
 if err then
     log.error("Failed to get group: " .. err)
     return
@@ -90,7 +92,7 @@ end
 
 #### ctx.desired
 
-Declare the desired state for groups and lights (see [Reconciled Mode](#reconciled-mode)).
+Declare action-local desired state; see [native desired-state control](docs/HUE_API.md#desired-state-and-ownership).
 
 #### ctx.request
 
@@ -113,159 +115,33 @@ end)
 
 ## Hue API
 
-Lightd provides two ways to control lights:
-
-1. **Immediate mode**: Direct API calls with instant feedback
-2. **Reconciled mode**: Declare desired state, let the system apply it
+The canonical reference is [Native Hue control](docs/HUE_API.md). It covers direct and desired control, snapshots, capability-aware effects/signals, native resource UUIDs, percentage brightness and millisecond transitions.
 
 ### Immediate Mode
 
-Direct control via the `hue` module. Changes happen immediately, no persistence.
-
 ```lua
 local hue = require("hue")
-
--- Get a group (returns userdata, error)
-local group, err = hue.group("1")
-if err then
-    log.error("Failed: " .. err)
-    return
-end
-
--- Chainable methods
-group:on()                         -- turn on
-group:off()                        -- turn off
-group:toggle()                     -- toggle power
-group:set_bri(200)                 -- brightness (1-254)
-group:set_scene("Relax")           -- activate scene by name
-group:set_color(0.45, 0.41)        -- CIE xy color
-group:set_ct(350)                  -- color temp in mirek (153-500)
-group:alert("select")              -- flash once
-
--- Chaining example
-group:on():set_scene("Energize"):set_bri(254)
-
--- Getters
-local id = group:id()              -- group ID (number)
-local name = group:name()          -- group name
-local on = group:any_on()          -- any light on? (bool)
-local all = group:all_on()         -- all lights on? (bool)
-local bri = group:get_bri()        -- current brightness
-local state = group:get_state()    -- { bri, xy, ct, colormode }
-local lights = group:lights()      -- table of light IDs
-
--- Generic state setter (all at once)
-group:set_state({
-    on = true,
-    bri = 200,
-    xy = {0.45, 0.41},
-    transitiontime = 10,  -- in deciseconds (1 = 100ms)
-})
+local group, err = hue.group("10000000-0000-0000-0000-000000000001") -- synthetic ID
+if err then error(err) end
+group:set_brightness(45)
+group:set_scene("Relax") -- appearance only; off members stay off
 ```
 
-#### Light Control
-
-Individual lights work the same way:
-
-```lua
-local light, err = hue.light("5")
-light:on():set_bri(254):set_color(0.5, 0.4)
-```
-
-#### When to Use Immediate Mode
-
-- **Rotary dials**: Real-time brightness adjustment needs instant feedback
-- **Visual effects**: Color cycling, alerts, animations
-- **Quick toggles**: When you don't need persistence
+Calls raise errors on failure. Immediate external effects cannot be rolled back by a later Lua error. New direct commands supersede older desired retries for the affected lamps.
 
 ### Reconciled Mode
 
-Declare what you *want* the lights to be. The reconciler figures out how to get there.
-
 ```lua
-action.define("set_evening_scene", function(ctx, args)
-    -- Declare desired state
-    ctx.desired:group("1"):on():set_scene("Relax")
-    ctx.desired:group("2"):on():set_scene("Relax")
-    
-    -- Trigger reconciliation
-    ctx:reconcile()
+action.define("set_evening_scene", function(ctx,args)
+    ctx.desired:group(args.group):preserve_power():set_scene("Relax")
 end)
 ```
 
-#### Desired State Builder
-
-The builder pattern accumulates changes:
-
-```lua
--- Groups
-ctx.desired:group("1"):on()                    -- power on
-ctx.desired:group("1"):off()                   -- power off
-ctx.desired:group("1"):set_scene("Energize")   -- set scene
-ctx.desired:group("1"):set_bri(200)            -- brightness
-ctx.desired:group("1"):set_color(0.5, 0.4)     -- CIE xy
-ctx.desired:group("1"):set_ct(300)             -- color temp
-ctx.desired:group("1"):set_hue(40000)          -- hue (0-65535)
-ctx.desired:group("1"):set_sat(254)            -- saturation (0-254)
-
--- Chain everything
-ctx.desired:group("1"):on():set_scene("Relax")
-
--- Lights work the same way
-ctx.desired:light("5"):on():set_bri(254)
-```
-
-#### When to Use Reconciled Mode
-
-- **Schedules**: Scene changes that should persist across restarts
-- **State management**: When you want lightd to track intended state
-- **Idempotency**: Multiple triggers won't cause duplicate API calls
-- **Recovery**: Desired state is reapplied after bridge reconnects
+An action's desired patches and successful outcome commit atomically on return. Repeated handles accumulate into one resource patch. Each nested action owns a separate frame. An error discards only that action's uncommitted patches. `ctx:reconcile()` commits a checkpoint immediately; `ctx:force_reconcile()` explicitly reasserts stored intent.
 
 ### How Reconciliation Works
 
-The reconciler implements a "desired state" pattern similar to Kubernetes:
-
-1. **Desired state is persisted**: When you call `ctx.desired:group("1"):set_scene("Relax")`, this is written to SQLite
-2. **Actual state is fetched**: The reconciler queries the Hue bridge for current state
-3. **Diff is computed**: An FSM determines the minimal action needed:
-   - `ActionNone`: Already in desired state, do nothing
-   - `ActionTurnOnWithScene`: Group is off, needs to turn on with a scene
-   - `ActionApplyScene`: Group is on, needs to change scene
-   - `ActionTurnOff`: Group needs to turn off
-   - `ActionApplyState`: Apply brightness/color changes
-4. **Changes are applied with rate limiting**: The bridge has API limits (~10 req/sec)
-
-```
-┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│   Action    │────▶│   Desired   │────▶│ Reconciler  │
-│             │      │   Store     │      │             │
-└─────────────┘      │  (SQLite)   │      └──────┬──────┘
-                     └─────────────┘             │
-                                                ▼
-                    ┌─────────────┐      ┌─────────────┐
-                    │    Hue      │◀────│    FSM      │
-                    │   Bridge    │      │   (Diff)    │
-                    └─────────────┘      └─────────────┘
-```
-
-**Benefits:**
-- If lights are already in desired state, no API call is made
-- If the bridge is unreachable, desired state persists and will be applied later
-- Multiple actions setting the same state are deduplicated
-- Rate limiting prevents overwhelming the bridge
-
-#### Reconciler Configuration
-
-```yaml
-reconciler:
-  enabled: true             # Set false to disable reconciled mode entirely
-  periodic_interval: 0      # Periodic reconciliation interval (0 = on-demand only)
-  debounce_ms: 0            # Delay before reconciliation (0 = immediate)
-  rate_limit_rps: 10.0      # Hue API rate limit (bridge allows ~10 req/sec)
-```
-
-When `enabled: false`, `ctx.desired` and `ctx:reconcile()` won't work - use immediate mode only.
+Persistent per-member authority orders overlapping direct and desired commands. Failed absolute intent retries with bounded backoff and expiry; acknowledged/superseded members are skipped, including after restart. Ordinary periodic checks do not silently enforce physical drift. Imported historical rows are not automatically enacted. See the native API reference for power modes, retry limits and diagnostics.
 
 ---
 
@@ -358,7 +234,7 @@ When `enabled: false`, all `sse.button()`, `sse.rotary()`, `sse.connectivity()`,
 
 ### Scheduler
 
-The `sched` module provides time-based triggers with astronomical time support.
+The `sched` module provides time-based triggers with astronomical time support. Native atomic policies and offline preview are documented in [POLICY.md](docs/POLICY.md). Definitions are recreated from the script; occurrence cursors and invocation outcomes persist. Fixed DST gap times are skipped and folded times run at the first occurrence once. Periodic intervals must be at least one second.
 
 ```lua
 local sched = require("sched")
@@ -407,7 +283,7 @@ sched.define("late_morning", "@noon - 2h30m", "meeting", {})
 ```lua
 sched.define("scene:morning", "@dawn", "set_scene", { scene = "Energize" }, {
     tag = "scene_set",   -- group schedules for queries
-    replay = true,       -- run on boot if missed (default: true)
+    replay = true,       -- latest-per-tag reassertion on boot (default: true)
 })
 
 -- replay = false means skip boot recovery for this schedule
@@ -478,7 +354,7 @@ When `scheduler.enabled: false`, `sched.define()` and `sched.periodic()` won't t
 ### Webhooks
 
 The `events.webhook` module exposes HTTP endpoints.
-Webhook server will always return `200 OK` if request was accepted and `404 Not Found` if here is no webhook action for this path. You cannot return something as response body from your actions.
+Webhook acceptance returns `202` with an ingress receipt. Missing routes return `404`, overload `429`, and unavailable/shutting-down admission `503`. A receipt is not physical completion or a promise to replay after a crash. Action return values do not become the HTTP response body.
 
 
 
@@ -1006,35 +882,7 @@ end
 
 ### hue
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `group` | `hue.group(id) -> (group, err)` | Get group object |
-| `groups` | `hue.groups() -> (table, err)` | Get all groups |
-| `light` | `hue.light(id) -> (light, err)` | Get light object |
-| `lights` | `hue.lights() -> (table, err)` | Get all lights |
-
-### hue.group / hue.light methods
-
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `id` | `:id()` | number | Resource ID |
-| `name` | `:name()` | string | Resource name |
-| `is_on` | `:is_on()` | bool | Power state |
-| `any_on` | `:any_on()` | bool | Any light on (groups) |
-| `all_on` | `:all_on()` | bool | All lights on (groups) |
-| `get_bri` | `:get_bri()` | number | Current brightness |
-| `get_state` | `:get_state()` | table | Full state |
-| `on` | `:on()` | self | Turn on |
-| `off` | `:off()` | self | Turn off |
-| `toggle` | `:toggle()` | self | Toggle power |
-| `set_bri` | `:set_bri(1-254)` | self | Set brightness |
-| `set_scene` | `:set_scene(name)` | self | Activate scene |
-| `set_color` | `:set_color(x, y)` | self | Set CIE xy color |
-| `set_ct` | `:set_ct(153-500)` | self | Set color temp (mirek) |
-| `set_hue` | `:set_hue(0-65535)` | self | Set hue |
-| `set_sat` | `:set_sat(0-254)` | self | Set saturation |
-| `alert` | `:alert(type)` | self | Flash light |
-| `set_state` | `:set_state(tbl)` | self | Set multiple properties |
+See the complete [native module/object reference](docs/HUE_API.md). Factories are `hue.group(UUID)` and `hue.light(UUID)`; listing/refresh are `groups()`, `lights()`, `scenes()` and `refresh()`. Resource methods include power, percentage brightness, CT/XY/HSV, sparse updates, scene application, snapshots/restoration, effects and signaling. Old V1 field names are rejected with migration guidance.
 
 ### events.sse
 
@@ -1165,15 +1013,4 @@ end
 
 ### ctx.desired:group / ctx.desired:light
 
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `on` | `:on()` | self | Set power on |
-| `off` | `:off()` | self | Set power off |
-| `toggle` | `:toggle()` | self | Toggle power |
-| `set_scene` | `:set_scene(name)` | self | Set scene |
-| `set_bri` | `:set_bri(1-254)` | self | Set brightness |
-| `set_color` | `:set_color(x, y)` | self | Set CIE xy |
-| `set_ct` | `:set_ct(153-500)` | self | Set color temp |
-| `set_hue` | `:set_hue(0-65535)` | self | Set hue |
-| `set_sat` | `:set_sat(0-254)` | self | Set saturation |
-
+Builders support `on`, `off`, `toggle`, `preserve_power`, `next_on`, `set_brightness`, `set_color`, `set_hsv`, `set_ct`, `set_transition` and group `set_scene`/`clear_scene`. Use native UUIDs and units. See [desired state and ownership](docs/HUE_API.md#desired-state-and-ownership) for commit, mode replacement and power semantics.

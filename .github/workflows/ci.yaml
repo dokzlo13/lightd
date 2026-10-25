@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: ./scripts/check.sh
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Build and verify offline CLI
+        run: |
+          go build -tags sqlite_omit_load_extension -trimpath -o lightd ./cmd/lightd
+          ./lightd --version
+          ./lightd --preview-policy examples/seasonal-policy.lua --date 2026-12-21 --timezone UTC --latitude 0 --longitude 0 --json

@@ -1,182 +1,180 @@
 name: Release
-
 on:
-  release:
-    types: [published]
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
+  push:
+    tags: ['v*']
 permissions:
-  contents: write
-  packages: write
-
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  # =============================================================================
-  # Build binaries for all platforms
-  # =============================================================================
-  build-binaries:
-    name: Build ${{ matrix.os }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: ./scripts/check.sh
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+  binaries:
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux AMD64 - servers, desktops
-          - os: linux
+          - runner: ubuntu-24.04
+            os: linux
             arch: amd64
-            runner: ubuntu-latest
-            ext: ""
-            cc: gcc
-          # Linux ARM64 - Raspberry Pi, ARM servers
-          - os: linux
+            ext: ''
+          - runner: ubuntu-24.04-arm
+            os: linux
             arch: arm64
-            runner: ubuntu-latest
-            ext: ""
-            cc: aarch64-linux-gnu-gcc
-            cross: true
-          # macOS ARM64 (Apple Silicon M1/M2/M3/M4)
-          - os: darwin
+            ext: ''
+          - runner: macos-15
+            os: darwin
             arch: arm64
-            runner: macos-latest
-            ext: ""
-            cc: clang
-          # Windows AMD64
-          - os: windows
+            ext: ''
+          - runner: windows-2022
+            os: windows
             arch: amd64
-            runner: windows-latest
-            ext: ".exe"
-            cc: gcc
-
+            ext: '.exe'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: true
-
-      # Linux ARM64 cross-compilation setup
-      - name: Install cross-compiler (Linux ARM64)
-        if: matrix.cross && matrix.os == 'linux' && matrix.arch == 'arm64'
+      - name: Ensure Windows C compiler
+        if: runner.os == 'Windows'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      # Windows: Install GCC via chocolatey for CGO
-      - name: Install GCC (Windows)
-        if: matrix.os == 'windows'
-        run: |
-          choco install mingw -y
-          echo "CC=gcc" >> $env:GITHUB_ENV
-
-      - name: Build binary
+          if ! command -v gcc; then
+            choco install mingw -y --no-progress
+            echo 'C:\ProgramData\chocolatey\bin' >> "$GITHUB_PATH"
+          fi
+      - name: Native SQLite and CLI tests
         env:
-          CGO_ENABLED: 1
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          CC: ${{ matrix.cc }}
+          CGO_ENABLED: '1'
         run: |
-          go build \
-            -tags sqlite_omit_load_extension \
-            -ldflags="-s -w" \
-            -trimpath \
-            -o lightd-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} \
-            ./cmd/lightd
-        shell: bash
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          test "$(go env GOARCH)" = '${{ matrix.arch }}'
+          go test -tags sqlite_omit_load_extension ./internal/storage/... ./cmd/lightd
+      - name: Build stamped binary and notices
+        env:
+          CGO_ENABLED: '1'
+          RELEASE_TAG: ${{ github.ref_name }}
+          BINARY_NAME: lightd-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+        run: |
+          mkdir -p package
+          build_time=$(git show -s --format=%cI HEAD)
+          go build -tags sqlite_omit_load_extension -trimpath -ldflags="-s -w -X github.com/dokzlo13/lightd/internal/buildinfo.Version=$RELEASE_TAG -X github.com/dokzlo13/lightd/internal/buildinfo.Commit=$GITHUB_SHA -X github.com/dokzlo13/lightd/internal/buildinfo.BuildTime=$build_time" -o "package/$BINARY_NAME" ./cmd/lightd
+          "./package/$BINARY_NAME" --version
+          "./package/$BINARY_NAME" --preview-policy examples/seasonal-policy.lua --date 2026-12-21 --timezone UTC --latitude 0 --longitude 0 --json
+          python3 scripts/release-notices.py package/THIRD_PARTY
+          cp -R docs examples package/
+          cp README.md MANUAL.md CHANGELOG.md package/
+      - name: Archive
+        env:
+          PACKAGE_NAME: lightd-${{ matrix.os }}-${{ matrix.arch }}
+          PACKAGE_OS: ${{ matrix.os }}
+        run: |
+          python3 - <<'PY'
+          import os,pathlib,tarfile,zipfile
+          name=os.environ['PACKAGE_NAME'];root=pathlib.Path('package');pathlib.Path('release').mkdir(exist_ok=True)
+          if os.environ['PACKAGE_OS']=='windows':
+              with zipfile.ZipFile('release/'+name+'.zip','w',zipfile.ZIP_DEFLATED) as z:
+                  for p in sorted(root.rglob('*')):
+                      if p.is_file():z.write(p,p.relative_to(root))
+          else:
+              with tarfile.open('release/'+name+'.tar.gz','w:gz') as t:
+                  for p in sorted(root.iterdir()):t.add(p,arcname=p.name)
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: lightd-${{ matrix.os }}-${{ matrix.arch }}
-          path: lightd-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+          name: binaries-${{ matrix.os }}-${{ matrix.arch }}
+          path: release/*
           if-no-files-found: error
-
-  # =============================================================================
-  # Upload binaries to release
-  # =============================================================================
-  upload-release-assets:
-    name: Upload Release Assets
-    needs: build-binaries
-    runs-on: ubuntu-latest
+  image:
+    needs: [quality, binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
-          path: artifacts
-          pattern: lightd-*
-          merge-multiple: false
-
-      - name: Create archives
-        run: |
-          mkdir -p release
-          for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            file=$(ls "$dir")
-            
-            if [[ "$file" == *.exe ]]; then
-              # Windows: create zip
-              zip -j "release/${name}.zip" "$dir/$file"
-            else
-              # Unix: create tar.gz and make executable
-              chmod +x "$dir/$file"
-              tar -czvf "release/${name}.tar.gz" -C "$dir" "$file"
-            fi
-          done
-          ls -la release/
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # =============================================================================
-  # Build and push Docker image (multi-architecture)
-  # =============================================================================
-  build-docker:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata (tags, labels)
+      - name: Build metadata
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        run: |
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Build and smoke-test container
+        run: |
+          docker build --build-arg VERSION="$GITHUB_REF_NAME" --build-arg COMMIT="$GITHUB_SHA" --build-arg BUILD_TIME='${{ steps.meta.outputs.built_at }}' -t lightd:smoke .
+          docker run --rm --read-only --tmpfs /tmp lightd:smoke --version
+          docker run --rm --read-only --tmpfs /tmp -v "$PWD/examples:/examples:ro" lightd:smoke --preview-policy /examples/seasonal-policy.lua --date 2026-12-21 --timezone UTC --latitude 0 --longitude 0 --json
+      - name: Scan container for fixable high and critical vulnerabilities
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP/trivy:/root/.cache/trivy" aquasec/trivy:0.76.1 image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 lightd:smoke
+      - name: Publish image and provenance
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.built_at }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          provenance: mode=max
+          sbom: true
+  publish:
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-*
+          path: release
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          printf 'ghcr.io/%s@%s\n' "$GITHUB_REPOSITORY" "$IMAGE_DIGEST" > release/image-digest.txt
+          (cd release && sha256sum lightd-* image-digest.txt > checksums.txt)
+          python3 - <<'PY'
+          import os,pathlib
+          text=pathlib.Path('CHANGELOG.md').read_text()
+          text+='\n\nContainer: `ghcr.io/'+os.environ['GITHUB_REPOSITORY']+'@'+os.environ['IMAGE_DIGEST']+'`\n'
+          text+='\nSource: `'+os.environ['GITHUB_SHA']+'`\n'
+          pathlib.Path('release-notes.md').write_text(text)
+          PY
+          gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --notes-file release-notes.md --repo "$GITHUB_REPOSITORY" release/*
