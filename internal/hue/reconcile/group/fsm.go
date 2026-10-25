@@ -2,6 +2,7 @@ package group
 
 import (
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/compare"
+	"math"
 )
 
 // PowerState represents the power state of a group.
@@ -54,6 +55,9 @@ func (a Action) String() string {
 //  4. If group is ON and state differs → ApplyState
 //  5. Otherwise → None
 func DetermineAction(desired Desired, actual Actual) Action {
+	if desired.PowerMode == "next_on" {
+		return ActionNone
+	}
 	currentPower := derivePowerState(actual)
 
 	switch currentPower {
@@ -88,9 +92,7 @@ func determineActionFromOff(desired Desired) Action {
 		return ActionTurnOnWithState
 	}
 
-	// Power on requested but no scene or state to apply
-	// This shouldn't happen in normal usage, but we can't turn on without something
-	return ActionNone
+	return ActionTurnOnWithState
 }
 
 // determineActionFromOn determines action when group is currently on.
@@ -105,6 +107,10 @@ func determineActionFromOn(desired Desired, actual Actual) Action {
 	// (bridge doesn't report active scene name, only resulting state)
 	if desired.SceneName != "" {
 		return ActionApplyScene
+	}
+
+	if wantsPowerOn(desired) && !actual.AllOn {
+		return ActionTurnOnWithState
 	}
 
 	// Third priority: color/brightness changes
@@ -129,7 +135,7 @@ func wantsPowerOff(desired Desired) bool {
 
 // hasColorProperties returns true if any color/brightness property is set.
 func hasColorProperties(s State) bool {
-	return s.Bri != nil || s.Hue != nil || s.Sat != nil ||
+	return s.Brightness != nil || s.Effect != "" || s.Bri != nil || s.Hue != nil || s.Sat != nil ||
 		len(s.Xy) >= 2 || s.Ct != nil
 }
 
@@ -137,6 +143,18 @@ func hasColorProperties(s State) bool {
 // Only compares fields that are set in desired (nil = don't care).
 // Uses tolerances for numeric values to account for bridge rounding.
 func stateMatches(desired, actual State) bool {
+	if desired.Brightness != nil && (actual.Brightness == nil || math.Abs(*desired.Brightness-*actual.Brightness) > 0.8) {
+		return false
+	}
+	if desired.Effect != "" && desired.Effect != actual.Effect {
+		return false
+	}
+	if desired.Ct != nil && actual.ColorMode != "" && actual.ColorMode != "ct" {
+		return false
+	}
+	if len(desired.Xy) >= 2 && actual.ColorMode != "" && actual.ColorMode != "xy" {
+		return false
+	}
 	// Brightness
 	if desired.Bri != nil {
 		if actual.Bri == nil || !compare.BriMatches(*desired.Bri, *actual.Bri) {

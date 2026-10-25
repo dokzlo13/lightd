@@ -67,7 +67,7 @@ func TestDetermineAction(t *testing.T) {
 				State: State{On: BoolPtr(true)},
 			},
 			actual:   Actual{AnyOn: false, AllOn: false},
-			expected: ActionNone, // Can't turn on without something to apply
+			expected: ActionTurnOnWithState, // On-only commands are supported
 		},
 		{
 			name: "off/wants_power_off",
@@ -761,33 +761,3 @@ func TestActionString(t *testing.T) {
 }
 
 // Note: Tolerance helper tests are in the compare package.
-
-func TestFromHuegoState(t *testing.T) {
-	t.Run("nil_input", func(t *testing.T) {
-		got := FromHuegoState(nil)
-		if got.On != nil || got.Bri != nil || got.Ct != nil {
-			t.Error("FromHuegoState(nil) should return empty State")
-		}
-	})
-}
-
-func TestToHuegoState(t *testing.T) {
-	t.Run("only_set_fields_included", func(t *testing.T) {
-		state := State{
-			On:  BoolPtr(true),
-			Bri: Uint8Ptr(200),
-			// Ct is nil, should not be included
-		}
-
-		hs := state.ToHuegoState()
-
-		if !hs.On {
-			t.Error("On should be true")
-		}
-		if hs.Bri != 200 {
-			t.Error("Bri should be 200")
-		}
-		// Note: huego.State uses value types, so Ct will be 0 (zero value)
-		// This is expected behavior - we're converting from pointer to value
-	})
-}

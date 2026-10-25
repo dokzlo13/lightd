@@ -1,7 +1,7 @@
 package lua
 
 import (
-	"github.com/amimof/huego"
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
@@ -19,7 +19,7 @@ type RuntimeDeps struct {
 	Registry     *actions.Registry
 	Invoker      *actions.Invoker
 	Scheduler    *scheduler.Scheduler
-	Bridge       *huego.Bridge
+	Bridge       *bridge.Client
 	SceneIndex   *hue.SceneIndex
 	Stores       *hue.StoreRegistry
 	Orchestrator *reconcile.Orchestrator

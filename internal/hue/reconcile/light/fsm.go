@@ -2,6 +2,7 @@ package light
 
 import (
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/compare"
+	"math"
 )
 
 // PowerState represents the power state of a light.
@@ -47,6 +48,9 @@ func (a Action) String() string {
 //  3. If light is ON and state differs → ApplyState
 //  4. Otherwise → None
 func DetermineAction(desired Desired, actual Actual) Action {
+	if desired.PowerMode == "next_on" {
+		return ActionNone
+	}
 	currentPower := derivePowerState(actual)
 
 	switch currentPower {
@@ -115,7 +119,7 @@ func wantsPowerOff(desired Desired) bool {
 
 // hasColorProperties returns true if any color/brightness property is set.
 func hasColorProperties(s State) bool {
-	return s.Bri != nil || s.Hue != nil || s.Sat != nil ||
+	return s.Brightness != nil || s.Effect != "" || s.Bri != nil || s.Hue != nil || s.Sat != nil ||
 		len(s.Xy) >= 2 || s.Ct != nil
 }
 
@@ -123,6 +127,18 @@ func hasColorProperties(s State) bool {
 // Only compares fields that are set in desired (nil = don't care).
 // Uses tolerances for numeric values to account for bridge rounding.
 func stateMatches(desired, actual State) bool {
+	if desired.Brightness != nil && (actual.Brightness == nil || math.Abs(*desired.Brightness-*actual.Brightness) > 0.8) {
+		return false
+	}
+	if desired.Effect != "" && desired.Effect != actual.Effect {
+		return false
+	}
+	if desired.Ct != nil && actual.ColorMode != "" && actual.ColorMode != "ct" {
+		return false
+	}
+	if len(desired.Xy) >= 2 && actual.ColorMode != "" && actual.ColorMode != "xy" {
+		return false
+	}
 	// Brightness
 	if desired.Bri != nil {
 		if actual.Bri == nil || !compare.BriMatches(*desired.Bri, *actual.Bri) {

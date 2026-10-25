@@ -1,171 +1,145 @@
 package v2
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/rs/zerolog/log"
 
 	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/events/sse"
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
+	"github.com/rs/zerolog/log"
+	stream "github.com/tmaxmax/go-sse"
 )
 
-// ErrMaxReconnectsExceeded is returned when the maximum number of reconnect attempts is exceeded.
 var ErrMaxReconnectsExceeded = errors.New("max reconnects exceeded")
 
-// EventStreamConfig contains configuration for event stream reconnection.
 type EventStreamConfig struct {
-	MinBackoff    time.Duration // Minimum backoff between reconnects
-	MaxBackoff    time.Duration // Maximum backoff between reconnects
-	Multiplier    float64       // Backoff multiplier
-	MaxReconnects int           // Max reconnect attempts, 0 = infinite
+	MinBackoff, MaxBackoff time.Duration
+	Multiplier             float64
+	MaxReconnects          int
 }
-
-// EventStream listens to the Hue event stream (SSE) via V2 API.
-// This is the primary reason for this custom V2 client - no Go library
-// currently supports Hue V2 SSE events.
+type StreamStatus struct {
+	Connected  bool      `json:"connected"`
+	Reconnects int       `json:"reconnects"`
+	LastEvent  time.Time `json:"last_event,omitempty"`
+	LastError  string    `json:"last_error,omitempty"`
+}
 type EventStream struct {
 	v2Client   *Client
 	httpClient *http.Client
 	config     EventStreamConfig
+	mu         sync.RWMutex
+	status     StreamStatus
+	OnConnect  func(context.Context) error
 }
 
-// NewEventStreamWithConfig creates a new event stream listener with custom configuration
-func NewEventStreamWithConfig(v2Client *Client, config EventStreamConfig) *EventStream {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+func NewEventStreamWithConfig(c *Client, cfg EventStreamConfig) *EventStream {
+	if cfg.MinBackoff <= 0 {
+		cfg.MinBackoff = time.Second
 	}
-
-	return &EventStream{
-		v2Client: v2Client,
-		httpClient: &http.Client{
-			Transport: transport,
-			// No timeout for SSE - it's a long-lived connection
-		},
-		config: config,
+	if cfg.MaxBackoff < cfg.MinBackoff {
+		cfg.MaxBackoff = time.Minute
 	}
+	if cfg.Multiplier < 1 {
+		cfg.Multiplier = 2
+	}
+	// Keep bounded dial/TLS/header timeouts from the REST transport, but never
+	// impose a total lifetime timeout on the established stream.
+	hc := *c.HTTPClient()
+	hc.Timeout = 0
+	return &EventStream{v2Client: c, httpClient: &hc, config: cfg}
 }
-
-// Run starts listening to the event stream with automatic reconnection.
-// Returns ErrMaxReconnectsExceeded if max reconnects is exceeded.
+func (e *EventStream) Status() StreamStatus { e.mu.RLock(); defer e.mu.RUnlock(); return e.status }
 func (e *EventStream) Run(ctx context.Context, bus *events.Bus) error {
-	retryCount := 0
-	currentBackoff := e.config.MinBackoff
-
+	failures := 0
+	backoff := e.config.MinBackoff
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		default:
 		}
-
+		started := time.Now()
 		err := e.connect(ctx, bus)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-
-			retryCount++
-
-			// Check if we exceeded max reconnects
-			if e.config.MaxReconnects > 0 && retryCount > e.config.MaxReconnects {
-				log.Error().
-					Int("max_reconnects", e.config.MaxReconnects).
-					Msg("Event stream: max reconnects exceeded, terminating")
-				return ErrMaxReconnectsExceeded
-			}
-
-			log.Warn().
-				Err(err).
-				Dur("backoff", currentBackoff).
-				Int("retry", retryCount).
-				Int("max_reconnects", e.config.MaxReconnects).
-				Msg("Event stream disconnected, reconnecting")
-
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(currentBackoff):
-			}
-
-			// Calculate next backoff with multiplier, capped at max
-			nextBackoff := time.Duration(float64(currentBackoff) * e.config.Multiplier)
-			if nextBackoff > e.config.MaxBackoff {
-				nextBackoff = e.config.MaxBackoff
-			}
-			currentBackoff = nextBackoff
-
-			continue
+		if ctx.Err() != nil {
+			return nil
 		}
-
-		// Reset retry count and backoff on successful connection
-		retryCount = 0
-		currentBackoff = e.config.MinBackoff
+		if time.Since(started) >= time.Minute {
+			failures = 0
+			backoff = e.config.MinBackoff
+		}
+		failures++
+		e.mu.Lock()
+		e.status.Connected = false
+		e.status.Reconnects++
+		if err != nil {
+			e.status.LastError = err.Error()
+		}
+		e.mu.Unlock()
+		if e.config.MaxReconnects > 0 && failures > e.config.MaxReconnects {
+			return ErrMaxReconnectsExceeded
+		}
+		log.Warn().Err(err).Dur("backoff", backoff).Msg("Hue event stream reconnecting")
+		if bridge.WaitUntil(ctx, backoff) != nil {
+			return nil
+		}
+		backoff = time.Duration(float64(backoff) * e.config.Multiplier)
+		if backoff > e.config.MaxBackoff {
+			backoff = e.config.MaxBackoff
+		}
 	}
 }
-
 func (e *EventStream) connect(ctx context.Context, bus *events.Bus) error {
-	url := fmt.Sprintf("https://%s/eventstream/clip/v2", e.v2Client.Address())
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.v2Client.BaseURL()+"/eventstream/clip/v2", nil)
 	if err != nil {
 		return err
 	}
-
 	req.Header.Set("hue-application-key", e.v2Client.Token())
 	req.Header.Set("Accept", "text/event-stream")
-
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return fmt.Errorf("Hue event stream HTTP %d", resp.StatusCode)
 	}
-
-	log.Info().Msg("Connected to Hue event stream")
-
-	scanner := bufio.NewScanner(resp.Body)
-	var dataBuffer strings.Builder
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Handle intro message
-		if line == ": hi" {
-			log.Debug().Msg("Received event stream greeting")
+	if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		return fmt.Errorf("Hue event stream unexpected content type")
+	}
+	if e.OnConnect != nil {
+		if err = e.OnConnect(ctx); err != nil {
+			return fmt.Errorf("refresh Hue catalog on reconnect: %w", err)
+		}
+	}
+	e.mu.Lock()
+	e.status.Connected = true
+	e.status.LastError = ""
+	e.mu.Unlock()
+	defer func() { e.mu.Lock(); e.status.Connected = false; e.mu.Unlock() }()
+	for ev, err := range stream.Read(resp.Body, &stream.ReadConfig{MaxEventSize: 1 << 20}) {
+		if err != nil {
+			return err
+		}
+		if ev.Data == "" {
 			continue
 		}
-
-		// Empty line marks end of event
-		if line == "" {
-			if dataBuffer.Len() > 0 {
-				e.processEvent(dataBuffer.String(), bus)
-				dataBuffer.Reset()
-			}
-			continue
-		}
-
-		// Collect data lines
-		if strings.HasPrefix(line, "data: ") {
-			dataBuffer.WriteString(strings.TrimPrefix(line, "data: "))
-		}
+		e.mu.Lock()
+		e.status.LastEvent = time.Now().UTC()
+		e.mu.Unlock()
+		e.processEvent(ev.Data, bus)
 	}
-
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-
-	return nil
+	return io.EOF // A clean remote EOF still requires reconnect pacing.
+}
+func ownerID(data map[string]interface{}) string {
+	owner, _ := data["owner"].(map[string]interface{})
+	id, _ := owner["rid"].(string)
+	return id
 }
 
 func (e *EventStream) processEvent(data string, bus *events.Bus) {
@@ -182,6 +156,9 @@ func (e *EventStream) processEvent(data string, bus *events.Bus) {
 
 func (e *EventStream) handleEvent(event map[string]interface{}, bus *events.Bus) {
 	eventType, _ := event["type"].(string)
+	if eventType != "update" {
+		return
+	}
 	dataItems, _ := event["data"].([]interface{})
 
 	for _, item := range dataItems {
@@ -190,6 +167,8 @@ func (e *EventStream) handleEvent(event map[string]interface{}, bus *events.Bus)
 			continue
 		}
 
+		itemMap["container_id"] = event["id"]
+		itemMap["creationtime"] = event["creationtime"]
 		itemType, _ := itemMap["type"].(string)
 		itemID, _ := itemMap["id"].(string)
 
@@ -245,9 +224,10 @@ func (e *EventStream) handleButtonEvent(id string, data map[string]interface{}, 
 	bus.Publish(events.Event{
 		Type: events.EventTypeButton,
 		Data: map[string]interface{}{
-			"resource_id": id,
-			"action":      action,
-			"event_id":    eventID,
+			"resource_id":  id,
+			"action":       action,
+			"event_id":     eventID,
+			"container_id": data["container_id"],
 		},
 	})
 }
@@ -276,6 +256,12 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 	// Get updated timestamp for event ID
 	rotaryReport, _ := rotary["rotary_report"].(map[string]interface{})
 	updated, _ := rotaryReport["updated"].(string)
+	if updated == "" {
+		updated, _ = lastEvent["updated"].(string)
+	}
+	if updated == "" {
+		updated, _ = data["creationtime"].(string)
+	}
 	eventID := fmt.Sprintf("%s-%s", id, updated)
 
 	log.Debug().
@@ -289,12 +275,13 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 	bus.Publish(events.Event{
 		Type: events.EventTypeRotary,
 		Data: map[string]interface{}{
-			"resource_id": id,
-			"action":      action, // "start" or "repeat"
-			"direction":   direction,
-			"steps":       int(steps),
-			"duration":    int(duration),
-			"event_id":    eventID,
+			"resource_id":  id,
+			"action":       action, // "start" or "repeat"
+			"direction":    direction,
+			"steps":        int(steps),
+			"duration":     int(duration),
+			"event_id":     eventID,
+			"container_id": data["container_id"],
 		},
 	})
 }
@@ -311,6 +298,7 @@ func (e *EventStream) handleConnectivityEvent(id string, data map[string]interfa
 		Type: events.EventTypeConnectivity,
 		Data: map[string]interface{}{
 			"device_id": id,
+			"owner_id":  ownerID(data),
 			"status":    status,
 		},
 	})

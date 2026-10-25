@@ -2,275 +2,233 @@ package reconcile
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
-	"golang.org/x/time/rate"
 )
 
-// Orchestrator coordinates reconciliation across all resource types.
-// It's domain-agnostic - all resource-specific logic lives in providers.
+type RetryStatus struct {
+	Version  int64     `json:"version"`
+	Attempts int       `json:"attempts"`
+	Next     time.Time `json:"next_attempt"`
+	Error    string    `json:"error"`
+}
+type Status struct {
+	Running      bool                   `json:"running"`
+	Pending      int                    `json:"pending"`
+	Retrying     map[string]RetryStatus `json:"retrying"`
+	Acknowledged map[string]int64       `json:"acknowledged_versions"`
+}
+
+// Orchestrator retries failed persisted intent independently of periodic drift
+// enforcement. Retry delay is bounded (1s..60s); no worker sleeps during backoff.
 type Orchestrator struct {
-	providers map[Kind]ResourceProvider
-	limiter   *rate.Limiter
-
-	mu           sync.Mutex
-	lastVersions map[ResourceKey]int64    // tracks last reconciled version per resource
-	pending      map[ResourceKey]struct{} // manual triggers awaiting reconcile
-	trigger      chan struct{}
-
-	// Configuration
+	providers        map[Kind]ResourceProvider
+	mu               sync.Mutex
+	lastVersions     map[ResourceKey]int64
+	pending          map[ResourceKey]struct{}
+	retries          map[ResourceKey]RetryStatus
+	trigger          chan struct{}
 	periodicInterval time.Duration
 	debounceMs       int
+	running          bool
 }
 
-// NewOrchestrator creates a new reconciliation orchestrator.
-func NewOrchestrator(periodicInterval time.Duration, debounceMs int, rateLimitRPS float64) *Orchestrator {
-	// periodicInterval=0 means disabled (no default fallback)
-	if rateLimitRPS == 0 {
-		rateLimitRPS = 10.0
-	}
-
-	limiter := rate.NewLimiter(rate.Limit(rateLimitRPS), int(rateLimitRPS))
-
-	return &Orchestrator{
-		providers:        make(map[Kind]ResourceProvider),
-		limiter:          limiter,
-		lastVersions:     make(map[ResourceKey]int64),
-		pending:          make(map[ResourceKey]struct{}),
-		trigger:          make(chan struct{}, 1),
-		periodicInterval: periodicInterval,
-		debounceMs:       debounceMs,
-	}
+func NewOrchestrator(interval time.Duration, debounceMs int, _ float64) *Orchestrator {
+	return &Orchestrator{providers: map[Kind]ResourceProvider{}, lastVersions: map[ResourceKey]int64{}, pending: map[ResourceKey]struct{}{}, retries: map[ResourceKey]RetryStatus{}, trigger: make(chan struct{}, 1), periodicInterval: interval, debounceMs: debounceMs}
 }
-
-// Register adds a resource provider.
-func (o *Orchestrator) Register(provider ResourceProvider) {
-	o.providers[provider.Kind()] = provider
-}
-
-// Trigger signals that reconciliation should run.
+func (o *Orchestrator) Register(p ResourceProvider) { o.providers[p.Kind()] = p }
 func (o *Orchestrator) Trigger() {
 	select {
 	case o.trigger <- struct{}{}:
 	default:
-		// Already triggered
 	}
 }
-
-// TriggerResource marks a specific resource for reconciliation.
-func (o *Orchestrator) TriggerResource(key ResourceKey) {
+func (o *Orchestrator) TriggerResource(k ResourceKey) {
 	o.mu.Lock()
-	o.pending[key] = struct{}{}
+	o.pending[k] = struct{}{}
 	o.mu.Unlock()
 	o.Trigger()
 }
-
-// TriggerGroup is a convenience method for triggering group reconciliation.
-// Implements the Reconciler interface used by actions.
-func (o *Orchestrator) TriggerGroup(groupID string) {
-	o.TriggerResource(ResourceKey{Kind: KindGroup, ID: groupID})
-}
-
-// TriggerAll marks ALL resources with desired state for reconciliation.
-// This is used to enforce desired state against external changes.
+func (o *Orchestrator) TriggerGroup(id string) { o.TriggerResource(ResourceKey{KindGroup, id}) }
 func (o *Orchestrator) TriggerAll(ctx context.Context) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	for kind, provider := range o.providers {
-		// Clear any cached state so reconciler will re-apply
-		provider.ClearCaches()
-
-		ids, err := provider.ListAllIDs(ctx)
+	for kind, p := range o.providers {
+		ids, err := p.ListAllIDs(ctx)
 		if err != nil {
-			log.Error().Err(err).Str("kind", string(kind)).Msg("ListAllIDs failed")
+			log.Error().Err(err).Msg("Cannot list desired Hue resources")
 			continue
 		}
+		o.mu.Lock()
 		for _, id := range ids {
-			o.pending[ResourceKey{Kind: kind, ID: id}] = struct{}{}
+			o.pending[ResourceKey{kind, id}] = struct{}{}
 		}
-		log.Debug().Str("kind", string(kind)).Int("count", len(ids)).Msg("Marked all resources as pending")
+		o.mu.Unlock()
 	}
-
-	// Trigger reconciliation
-	select {
-	case o.trigger <- struct{}{}:
-	default:
-	}
+	o.Trigger()
 }
-
-// Run starts the reconciliation loop.
-func (o *Orchestrator) Run(ctx context.Context) error {
-	log.Info().
-		Dur("periodic_interval", o.periodicInterval).
-		Int("debounce_ms", o.debounceMs).
-		Msg("Orchestrator started")
-
-	// Set up periodic ticker (nil if disabled)
-	var ticker *time.Ticker
-	var tickerC <-chan time.Time
-	if o.periodicInterval > 0 {
-		ticker = time.NewTicker(o.periodicInterval)
-		tickerC = ticker.C
-		defer ticker.Stop()
+func (o *Orchestrator) Status() Status {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	s := Status{Running: o.running, Pending: len(o.pending), Retrying: map[string]RetryStatus{}, Acknowledged: map[string]int64{}}
+	for k, v := range o.retries {
+		s.Retrying[string(k.Kind)+":"+k.ID] = v
 	}
-
-	// Debounce timer (nil until first trigger)
-	var debounceTimer *time.Timer
-	var debounceC <-chan time.Time
-
+	for k, v := range o.lastVersions {
+		s.Acknowledged[string(k.Kind)+":"+k.ID] = v
+	}
+	return s
+}
+func (o *Orchestrator) Run(ctx context.Context) error {
+	o.mu.Lock()
+	o.running = true
+	o.mu.Unlock()
+	defer func() { o.mu.Lock(); o.running = false; o.mu.Unlock() }()
+	retryTicker := time.NewTicker(time.Second)
+	defer retryTicker.Stop()
+	var periodic *time.Ticker
+	var periodicC <-chan time.Time
+	if o.periodicInterval > 0 {
+		periodic = time.NewTicker(o.periodicInterval)
+		defer periodic.Stop()
+		periodicC = periodic.C
+	}
+	// Rebuild work from persisted desired state on each boot. Persisted manual
+	// fences in the bridge prevent stale intent from winning after restart.
+	o.reconcileAll(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info().Msg("Orchestrator stopping")
-			if debounceTimer != nil {
-				debounceTimer.Stop()
-			}
 			return nil
-
 		case <-o.trigger:
 			if o.debounceMs > 0 {
-				// Start or reset debounce timer
-				if debounceTimer == nil {
-					debounceTimer = time.NewTimer(time.Duration(o.debounceMs) * time.Millisecond)
-					debounceC = debounceTimer.C
-				} else {
-					// Reset timer (drain channel first if needed)
-					if !debounceTimer.Stop() {
-						select {
-						case <-debounceTimer.C:
-						default:
-						}
-					}
-					debounceTimer.Reset(time.Duration(o.debounceMs) * time.Millisecond)
+				timer := time.NewTimer(time.Duration(o.debounceMs) * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return nil
+				case <-timer.C:
 				}
-			} else {
-				// No debounce, run immediately
+			}
+			o.reconcileAll(ctx)
+		case <-retryTicker.C:
+			o.mu.Lock()
+			hasRetries := len(o.retries) > 0
+			o.mu.Unlock()
+			if hasRetries {
 				o.reconcileAll(ctx)
 			}
-
-		case <-debounceC:
-			// Debounce period elapsed, run reconciliation
-			o.reconcileAll(ctx)
-
-		case <-tickerC:
-			// Periodic reconciliation
+		case <-periodicC:
 			o.reconcileAll(ctx)
 		}
 	}
 }
-
 func (o *Orchestrator) reconcileAll(ctx context.Context) {
-	// 1. Snapshot and clear pending (under lock, once)
-	log.Debug().Msg("Reconciliation started")
 	o.mu.Lock()
-	pendingSnapshot := o.pending
-	o.pending = make(map[ResourceKey]struct{})
-	// log.Debug().Int("pending_count", len(pendingSnapshot)).Msg("snapshotted pending resources")
-
-	// Build lastVersions per kind for dirty queries
-	lastByKind := make(map[Kind]map[string]int64)
-	for key, ver := range o.lastVersions {
-		if lastByKind[key.Kind] == nil {
-			lastByKind[key.Kind] = make(map[string]int64)
-		}
-		lastByKind[key.Kind][key.ID] = ver
+	pending := make(map[ResourceKey]struct{}, len(o.pending))
+	for k := range o.pending {
+		pending[k] = struct{}{}
 	}
-	// log.Debug().Int("tracked_versions", len(o.lastVersions)).Msg("built lastVersions map")
+	last := map[Kind]map[string]int64{}
+	for k, v := range o.lastVersions {
+		if last[k.Kind] == nil {
+			last[k.Kind] = map[string]int64{}
+		}
+		last[k.Kind][k.ID] = v
+	}
 	o.mu.Unlock()
-
-	// 2. For each provider, get dirty + pending resources
-	for kind, provider := range o.providers {
-		// log.Debug().Str("kind", string(kind)).Msg("processing kind")
-
-		// Get dirty from store
-		dirty, err := provider.ListDirty(ctx, lastByKind[kind])
+	kinds := make([]string, 0, len(o.providers))
+	for k := range o.providers {
+		kinds = append(kinds, string(k))
+	}
+	sort.Strings(kinds)
+	for _, kindString := range kinds {
+		kind := Kind(kindString)
+		p := o.providers[kind]
+		dirty, err := p.ListDirty(ctx, last[kind])
 		if err != nil {
-			log.Error().Err(err).Str("kind", string(kind)).Msg("ListDirty failed")
+			log.Error().Err(err).Str("kind", kindString).Msg("Cannot list dirty Hue resources")
+			o.mu.Lock()
+			for k := range pending {
+				if k.Kind == kind {
+					o.failLocked(k, 0, err)
+				}
+			}
+			o.mu.Unlock()
 			continue
 		}
-		log.Debug().Str("kind", string(kind)).Int("dirty_count", len(dirty)).Msg("retrieved dirty resources")
-
-		// Track which IDs we already have
-		seen := make(map[string]bool)
+		seen := map[string]bool{}
 		for _, r := range dirty {
 			seen[r.Key().ID] = true
 		}
-
-		// Merge in pending for this kind
-		pendingForKind := 0
-		for key := range pendingSnapshot {
-			if key.Kind == kind && !seen[key.ID] {
-				r, err := provider.Get(ctx, key.ID)
+		for k := range pending {
+			if k.Kind == kind && !seen[k.ID] {
+				r, err := p.Get(ctx, k.ID)
 				if err != nil {
-					log.Error().Err(err).Str("id", key.ID).Msg("Get pending resource failed")
+					o.mu.Lock()
+					o.failLocked(k, 0, err)
+					o.mu.Unlock()
 					continue
 				}
 				dirty = append(dirty, r)
-				pendingForKind++
 			}
 		}
-		if pendingForKind > 0 {
-			log.Debug().Str("kind", string(kind)).Int("merged_pending", pendingForKind).Int("total", len(dirty)).Msg("merged pending resources")
-		}
-
-		// 3. Reconcile each resource
-		log.Debug().Str("kind", string(kind)).Int("total_resources", len(dirty)).Msg("starting reconciliation")
-		successCount := 0
+		sort.Slice(dirty, func(i, j int) bool { return dirty[i].Key().ID < dirty[j].Key().ID })
 		for _, r := range dirty {
-			log.Debug().Str("kind", string(kind)).Str("id", r.Key().ID).Int64("version", r.DesiredVersion()).Msg("reconciling resource")
-
-			if err := o.reconcileOne(ctx, r); err != nil {
-				log.Error().Err(err).
-					Str("kind", string(kind)).
-					Str("id", r.Key().ID).
-					Msg("Reconcile failed")
+			if ctx.Err() != nil {
+				return
+			}
+			k := r.Key()
+			o.mu.Lock()
+			retry, hasRetry := o.retries[k]
+			o.mu.Unlock()
+			if hasRetry && retry.Version == r.DesiredVersion() && time.Now().Before(retry.Next) {
 				continue
 			}
-
-			// Update last version on success
+			err := o.reconcileOne(ctx, r)
 			o.mu.Lock()
-			o.lastVersions[r.Key()] = r.DesiredVersion()
+			if err != nil {
+				o.pending[k] = struct{}{}
+				o.failLocked(k, r.DesiredVersion(), err)
+			} else {
+				o.lastVersions[k] = r.DesiredVersion()
+				delete(o.pending, k)
+				delete(o.retries, k)
+			}
 			o.mu.Unlock()
-
-			successCount++
-			log.Debug().Str("kind", string(kind)).Str("id", r.Key().ID).Int64("version", r.DesiredVersion()).Msg("resource reconciled successfully")
+			if err != nil {
+				log.Warn().Err(err).Str("kind", string(k.Kind)).Str("id", k.ID).Msg("Hue intent pending retry")
+			}
 		}
-
-		log.Debug().Str("kind", string(kind)).Int("success", successCount).Int("total", len(dirty)).Msg("completed reconciliation for kind")
 	}
-
-	log.Debug().Msg("reconcileAll completed")
 }
-
-func (o *Orchestrator) reconcileOne(ctx context.Context, r Resource) error {
-	for {
-		// Rate limit
-		if err := o.limiter.Wait(ctx); err != nil {
-			return err
-		}
-
-		// Load current state
-		if err := r.Load(ctx); err != nil {
-			log.Error().Err(err).Str("id", r.Key().ID).Msg("Load failed")
-			return err
-		}
-
-		// Check if reconciliation needed
-		if !r.NeedsReconcile() {
-			return nil
-		}
-
-		// Perform one reconciliation step
-		done, err := r.ReconcileStep(ctx)
-		if err != nil {
-			return err
-		}
-		if done {
-			return nil
-		}
-		// FSM needs another step, loop again
+func (o *Orchestrator) failLocked(k ResourceKey, version int64, err error) {
+	r := o.retries[k]
+	if r.Version != version {
+		r = RetryStatus{Version: version}
 	}
+	r.Attempts++
+	r.Error = err.Error()
+	shift := r.Attempts - 1
+	if shift > 6 {
+		shift = 6
+	}
+	delay := time.Second * time.Duration(1<<shift)
+	if delay > time.Minute {
+		delay = time.Minute
+	}
+	r.Next = time.Now().Add(delay)
+	o.retries[k] = r
+	o.pending[k] = struct{}{}
+}
+func (o *Orchestrator) reconcileOne(ctx context.Context, r Resource) error {
+	if err := r.Load(ctx); err != nil {
+		return err
+	}
+	if !r.NeedsReconcile() {
+		return nil
+	}
+	_, err := r.ReconcileStep(ctx)
+	return err
 }

@@ -5,6 +5,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	"github.com/dokzlo13/lightd/internal/hue/reconcile"
 	"github.com/dokzlo13/lightd/internal/storage"
 )
@@ -89,6 +90,7 @@ func (r *Resource) ReconcileStep(ctx context.Context) (done bool, err error) {
 
 // executeAction executes the determined action.
 func (r *Resource) executeAction(ctx context.Context, action Action) (done bool, err error) {
+	ctx = bridge.WithDesired(ctx, "light", r.lightID, r.desiredVersion)
 	switch action {
 	case ActionTurnOnWithState:
 		if err := r.applier.ApplyState(ctx, r.lightID, r.desired); err != nil {

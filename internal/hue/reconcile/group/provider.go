@@ -41,7 +41,13 @@ func (p *Provider) ListDirty(ctx context.Context, lastVersions map[string]int64)
 
 	resources := make([]reconcile.Resource, 0, len(ids))
 	for _, id := range ids {
-		resources = append(resources, NewResource(id, p.store, p.actual, p.applier))
+		r := NewResource(id, p.store, p.actual, p.applier)
+		_, version, err := p.store.Get(id)
+		if err != nil {
+			return nil, err
+		}
+		r.desiredVersion = version
+		resources = append(resources, r)
 	}
 
 	return resources, nil
@@ -49,7 +55,13 @@ func (p *Provider) ListDirty(ctx context.Context, lastVersions map[string]int64)
 
 // Get returns a specific resource by ID.
 func (p *Provider) Get(ctx context.Context, id string) (reconcile.Resource, error) {
-	return NewResource(id, p.store, p.actual, p.applier), nil
+	r := NewResource(id, p.store, p.actual, p.applier)
+	_, version, err := p.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	r.desiredVersion = version
+	return r, nil
 }
 
 // ListAllIDs returns all resource IDs that have desired state.

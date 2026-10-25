@@ -5,6 +5,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	"github.com/dokzlo13/lightd/internal/hue/reconcile"
 	"github.com/dokzlo13/lightd/internal/storage"
 )
@@ -89,40 +90,10 @@ func (r *Resource) ReconcileStep(ctx context.Context) (done bool, err error) {
 }
 
 // executeAction executes the determined action.
-func (r *Resource) executeAction(ctx context.Context, action Action) (done bool, err error) {
-	switch action {
-	case ActionTurnOnWithScene:
-		if err := r.applier.TurnOnWithScene(ctx, r.groupID, r.desired.SceneName); err != nil {
-			return false, err
-		}
-		return true, nil
-
-	case ActionTurnOnWithState:
-		if err := r.applier.ApplyState(ctx, r.groupID, r.desired); err != nil {
-			return false, err
-		}
-		return true, nil
-
-	case ActionTurnOff:
-		if err := r.applier.TurnOff(ctx, r.groupID); err != nil {
-			return false, err
-		}
-		return true, nil
-
-	case ActionApplyScene:
-		if err := r.applier.ApplyScene(ctx, r.groupID, r.desired.SceneName); err != nil {
-			return false, err
-		}
-		return true, nil
-
-	case ActionApplyState:
-		if err := r.applier.ApplyState(ctx, r.groupID, r.desired); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	return true, nil
+func (r *Resource) executeAction(ctx context.Context, action Action) (bool, error) {
+	ctx = bridge.WithDesired(ctx, "group", r.groupID, r.desiredVersion)
+	err := r.applier.ApplyDesired(ctx, r.groupID, r.desired)
+	return err == nil, err
 }
 
 // DesiredVersion returns the version of the desired state.
