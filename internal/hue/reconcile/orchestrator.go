@@ -2,6 +2,9 @@ package reconcile
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	"sort"
 	"sync"
 	"time"
@@ -10,34 +13,43 @@ import (
 )
 
 type RetryStatus struct {
-	Version  int64     `json:"version"`
-	Attempts int       `json:"attempts"`
-	Next     time.Time `json:"next_attempt"`
-	Error    string    `json:"error"`
+	FirstAttempt time.Time `json:"first_attempt,omitempty"`
+	Expired      bool      `json:"expired"`
+	Version      int64     `json:"version"`
+	Attempts     int       `json:"attempts"`
+	Next         time.Time `json:"next_attempt"`
+	Error        string    `json:"error"`
 }
 type Status struct {
-	Running      bool                   `json:"running"`
-	Pending      int                    `json:"pending"`
-	Retrying     map[string]RetryStatus `json:"retrying"`
-	Acknowledged map[string]int64       `json:"acknowledged_versions"`
+	PersistenceError string                 `json:"persistence_error,omitempty"`
+	Running          bool                   `json:"running"`
+	Pending          int                    `json:"pending"`
+	Retrying         map[string]RetryStatus `json:"retrying"`
+	Acknowledged     map[string]int64       `json:"acknowledged_versions"`
 }
 
 // Orchestrator retries failed persisted intent independently of periodic drift
-// enforcement. Retry delay is bounded (1s..60s); no worker sleeps during backoff.
+// enforcement. Retry delay is bounded (1s..30s); no worker sleeps during backoff.
 type Orchestrator struct {
-	providers        map[Kind]ResourceProvider
-	mu               sync.Mutex
-	lastVersions     map[ResourceKey]int64
-	pending          map[ResourceKey]struct{}
-	retries          map[ResourceKey]RetryStatus
-	trigger          chan struct{}
-	periodicInterval time.Duration
-	debounceMs       int
-	running          bool
+	authorityGenerations map[ResourceKey]int64
+	reassert             func(context.Context, string, string, int64) error
+	db                   *sql.DB
+	generations          map[ResourceKey]int64
+	persistenceError     string
+	maxRetryAge          time.Duration
+	providers            map[Kind]ResourceProvider
+	mu                   sync.Mutex
+	lastVersions         map[ResourceKey]int64
+	pending              map[ResourceKey]struct{}
+	retries              map[ResourceKey]RetryStatus
+	trigger              chan struct{}
+	periodicInterval     time.Duration
+	debounceMs           int
+	running              bool
 }
 
 func NewOrchestrator(interval time.Duration, debounceMs int, _ float64) *Orchestrator {
-	return &Orchestrator{providers: map[Kind]ResourceProvider{}, lastVersions: map[ResourceKey]int64{}, pending: map[ResourceKey]struct{}{}, retries: map[ResourceKey]RetryStatus{}, trigger: make(chan struct{}, 1), periodicInterval: interval, debounceMs: debounceMs}
+	return &Orchestrator{generations: map[ResourceKey]int64{}, authorityGenerations: map[ResourceKey]int64{}, maxRetryAge: 10 * time.Minute, providers: map[Kind]ResourceProvider{}, lastVersions: map[ResourceKey]int64{}, pending: map[ResourceKey]struct{}{}, retries: map[ResourceKey]RetryStatus{}, trigger: make(chan struct{}, 1), periodicInterval: interval, debounceMs: debounceMs}
 }
 func (o *Orchestrator) Register(p ResourceProvider) { o.providers[p.Kind()] = p }
 func (o *Orchestrator) Trigger() {
@@ -48,7 +60,7 @@ func (o *Orchestrator) Trigger() {
 }
 func (o *Orchestrator) TriggerResource(k ResourceKey) {
 	o.mu.Lock()
-	o.pending[k] = struct{}{}
+	o.forceLocked(k)
 	o.mu.Unlock()
 	o.Trigger()
 }
@@ -62,7 +74,7 @@ func (o *Orchestrator) TriggerAll(ctx context.Context) {
 		}
 		o.mu.Lock()
 		for _, id := range ids {
-			o.pending[ResourceKey{kind, id}] = struct{}{}
+			o.forceLocked(ResourceKey{kind, id})
 		}
 		o.mu.Unlock()
 	}
@@ -71,7 +83,7 @@ func (o *Orchestrator) TriggerAll(ctx context.Context) {
 func (o *Orchestrator) Status() Status {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	s := Status{Running: o.running, Pending: len(o.pending), Retrying: map[string]RetryStatus{}, Acknowledged: map[string]int64{}}
+	s := Status{PersistenceError: o.persistenceError, Running: o.running, Pending: len(o.pending), Retrying: map[string]RetryStatus{}, Acknowledged: map[string]int64{}}
 	for k, v := range o.retries {
 		s.Retrying[string(k.Kind)+":"+k.ID] = v
 	}
@@ -182,19 +194,76 @@ func (o *Orchestrator) reconcileAll(ctx context.Context) {
 			k := r.Key()
 			o.mu.Lock()
 			retry, hasRetry := o.retries[k]
+			generation := o.generations[k]
 			o.mu.Unlock()
-			if hasRetry && retry.Version == r.DesiredVersion() && time.Now().Before(retry.Next) {
+			if hasRetry && retry.Version == r.DesiredVersion() && (retry.Expired || time.Now().Before(retry.Next)) {
+				continue
+			}
+			if !hasRetry || retry.Version != r.DesiredVersion() {
+				retry = RetryStatus{Version: r.DesiredVersion(), FirstAttempt: time.Now()}
+			}
+			if !retry.FirstAttempt.IsZero() && time.Since(retry.FirstAttempt) >= o.maxRetryAge {
+				retry.Expired = true
+				retry.Error = "retry age exceeded; explicit force or newer desired state required"
+				o.mu.Lock()
+				o.retries[k] = retry
+				o.pending[k] = struct{}{}
+				_ = o.persistLocked(k, retry.Version, "expired", retry)
+				o.mu.Unlock()
+				continue
+			}
+			o.mu.Lock()
+			needReassert := o.generations[k] > o.authorityGenerations[k]
+			o.mu.Unlock()
+			if needReassert && o.reassert != nil {
+				if e := o.reassert(ctx, string(k.Kind), k.ID, r.DesiredVersion()); e != nil {
+					o.mu.Lock()
+					o.failLocked(k, r.DesiredVersion(), e)
+					o.mu.Unlock()
+					continue
+				}
+			}
+			o.mu.Lock()
+			if o.generations[k] != generation {
+				o.mu.Unlock()
+				continue
+			}
+			if needReassert {
+				o.authorityGenerations[k] = generation
+			}
+			persistErr := o.persistLocked(k, r.DesiredVersion(), "pending", retry)
+			o.mu.Unlock()
+			if persistErr != nil {
+				o.mu.Lock()
+				o.failLocked(k, r.DesiredVersion(), persistErr)
+				o.mu.Unlock()
 				continue
 			}
 			err := o.reconcileOne(ctx, r)
+			deliveryStatus := "acknowledged"
+			if errors.Is(err, bridge.ErrSuperseded) {
+				deliveryStatus = "superseded"
+				err = nil
+			}
 			o.mu.Lock()
+			// A force request accepted during this attempt is a new generation;
+			// never consume or overwrite its persisted pending state.
+			if o.generations[k] != generation {
+				o.mu.Unlock()
+				continue
+			}
 			if err != nil {
 				o.pending[k] = struct{}{}
 				o.failLocked(k, r.DesiredVersion(), err)
 			} else {
-				o.lastVersions[k] = r.DesiredVersion()
-				delete(o.pending, k)
-				delete(o.retries, k)
+				if persistErr = o.persistLocked(k, r.DesiredVersion(), deliveryStatus, retry); persistErr != nil {
+					err = persistErr
+					o.failLocked(k, r.DesiredVersion(), persistErr)
+				} else {
+					o.lastVersions[k] = r.DesiredVersion()
+					delete(o.pending, k)
+					delete(o.retries, k)
+				}
 			}
 			o.mu.Unlock()
 			if err != nil {
@@ -206,7 +275,10 @@ func (o *Orchestrator) reconcileAll(ctx context.Context) {
 func (o *Orchestrator) failLocked(k ResourceKey, version int64, err error) {
 	r := o.retries[k]
 	if r.Version != version {
-		r = RetryStatus{Version: version}
+		r = RetryStatus{Version: version, FirstAttempt: time.Now()}
+	}
+	if r.FirstAttempt.IsZero() {
+		r.FirstAttempt = time.Now()
 	}
 	r.Attempts++
 	r.Error = err.Error()
@@ -215,12 +287,13 @@ func (o *Orchestrator) failLocked(k ResourceKey, version int64, err error) {
 		shift = 6
 	}
 	delay := time.Second * time.Duration(1<<shift)
-	if delay > time.Minute {
-		delay = time.Minute
+	if delay > 30*time.Second {
+		delay = 30 * time.Second
 	}
 	r.Next = time.Now().Add(delay)
 	o.retries[k] = r
 	o.pending[k] = struct{}{}
+	_ = o.persistLocked(k, version, "pending", r)
 }
 func (o *Orchestrator) reconcileOne(ctx context.Context, r Resource) error {
 	if err := r.Load(ctx); err != nil {
@@ -231,4 +304,8 @@ func (o *Orchestrator) reconcileOne(ctx context.Context, r Resource) error {
 	}
 	_, err := r.ReconcileStep(ctx)
 	return err
+}
+
+func (o *Orchestrator) SetReassert(fn func(context.Context, string, string, int64) error) {
+	o.reassert = fn
 }

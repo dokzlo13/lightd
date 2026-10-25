@@ -98,6 +98,9 @@ func determineActionFromOn(desired Desired, actual Actual) Action {
 	}
 
 	// Second priority: color/brightness changes
+	if len(desired.Gradient) > 0 {
+		return ActionApplyState
+	}
 	if hasColorProperties(desired) {
 		if !stateMatches(desired, actual.State) {
 			return ActionApplyState
@@ -119,7 +122,7 @@ func wantsPowerOff(desired Desired) bool {
 
 // hasColorProperties returns true if any color/brightness property is set.
 func hasColorProperties(s State) bool {
-	return s.Brightness != nil || s.Effect != "" || s.Bri != nil || s.Hue != nil || s.Sat != nil ||
+	return len(s.Gradient) > 0 || s.Brightness != nil || s.Effect != "" || s.Bri != nil || s.Hue != nil || s.Sat != nil ||
 		len(s.Xy) >= 2 || s.Ct != nil
 }
 

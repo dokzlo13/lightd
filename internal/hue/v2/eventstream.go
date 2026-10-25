@@ -288,6 +288,7 @@ func (e *EventStream) handleRotaryEvent(id string, data map[string]interface{}, 
 
 func (e *EventStream) handleConnectivityEvent(id string, data map[string]interface{}, bus *events.Bus) {
 	status, _ := data["status"].(string)
+	e.v2Client.UpdateConnectivity(ownerID(data), status)
 
 	log.Debug().
 		Str("id", id).

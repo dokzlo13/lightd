@@ -13,7 +13,7 @@ func (p *ActualProvider) Get(ctx context.Context, id string) (Actual, error) {
 	if err != nil {
 		return Actual{}, err
 	}
-	return Actual{State: l.State, Reachable: l.Reachable}, nil
+	return Actual{State: l.State, Reachable: l.Reachable != nil && *l.Reachable}, nil
 }
 func (p *ActualProvider) GetLight(ctx context.Context, id string) (*bridge.Light, error) {
 	l, err := p.bridge.Light(ctx, id)

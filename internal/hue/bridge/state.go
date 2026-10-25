@@ -2,6 +2,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 
@@ -11,16 +12,17 @@ import (
 // State is a sparse command. Power is independent of appearance. Public values
 // are percentage brightness, CIE xy, mirek and millisecond duration.
 type State struct {
-	On         *bool     `json:"on,omitempty"`
-	Brightness *float64  `json:"brightness,omitempty"`
-	Xy         []float32 `json:"xy,omitempty"`
-	Ct         *uint16   `json:"ct,omitempty"`
-	Duration   *int      `json:"duration,omitempty"`
-	PowerMode  string    `json:"power_mode,omitempty"`
-	Effect     string    `json:"effect,omitempty"`
-	ColorMode  string    `json:"colormode,omitempty"`
-	// Historical in-process fields are retained for old FSM fixtures, not exposed
-	// by the new Lua API. The transport rejects these instead of silently changing units.
+	Gradient   json.RawMessage `json:"gradient,omitempty"`
+	On         *bool           `json:"on,omitempty"`
+	Brightness *float64        `json:"brightness,omitempty"`
+	Xy         []float32       `json:"xy,omitempty"`
+	Ct         *uint16         `json:"ct,omitempty"`
+	Duration   *int            `json:"duration,omitempty"`
+	PowerMode  string          `json:"power_mode,omitempty"`
+	Effect     string          `json:"effect,omitempty"`
+	ColorMode  string          `json:"colormode,omitempty"`
+	// Legacy payload fields are decoded only to detect unmigrated persisted state.
+	// Reject them explicitly rather than silently misinterpreting old units.
 	Bri            *uint8  `json:"bri,omitempty"`
 	Hue            *uint16 `json:"hue,omitempty"`
 	Sat            *uint8  `json:"sat,omitempty"`
@@ -32,7 +34,8 @@ type Light struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
 	State     State    `json:"state"`
-	Reachable bool     `json:"reachable"`
+	OwnerID   string   `json:"owner_id,omitempty"`
+	Reachable *bool    `json:"reachable"`
 	CTMin     int      `json:"ct_min,omitempty"`
 	CTMax     int      `json:"ct_max,omitempty"`
 	Effects   []string `json:"effects,omitempty"`
@@ -104,7 +107,7 @@ func (s State) Validate() error {
 }
 func (s State) Appearance() State { s.On = nil; s.PowerMode = "preserve"; return s }
 func (s State) HasAppearance() bool {
-	return s.Brightness != nil || len(s.Xy) == 2 || s.Ct != nil || s.Effect != ""
+	return s.Brightness != nil || len(s.Xy) == 2 || s.Ct != nil || s.Effect != "" || len(s.Gradient) > 0
 }
 
 // HSVToXY converts hue in degrees and saturation percent at full value using

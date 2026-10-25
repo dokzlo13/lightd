@@ -1,8 +1,8 @@
 package bridge
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,70 +29,6 @@ func desiredRequest(ctx context.Context) (DesiredRequest, bool) {
 	return v, ok
 }
 
-// fence persists supersession before any direct request is attempted. Even a
-// failed newer direct command must not later be undone by an older retry.
-func (c *Client) fence(ctx context.Context, ids []string) error {
-	if c.db == nil {
-		return nil
-	}
-	tx, err := c.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT kind,id,version FROM resource_state WHERE kind IN ('group','light')`)
-	if err != nil {
-		return err
-	}
-	var versions []DesiredRequest
-	for rows.Next() {
-		var d DesiredRequest
-		if err = rows.Scan(&d.Kind, &d.ID, &d.Version); err != nil {
-			rows.Close()
-			return err
-		}
-		versions = append(versions, d)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
-	for _, id := range ids {
-		for _, d := range versions {
-			if _, err = tx.ExecContext(ctx, `INSERT INTO hue_manual_fences_v1(light_id,kind,resource_id,version) VALUES(?,?,?,?) ON CONFLICT(light_id,kind,resource_id) DO UPDATE SET version=MAX(version,excluded.version)`, id, d.Kind, d.ID, d.Version); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
-}
-func (c *Client) allowed(ctx context.Context, id string) (bool, error) {
-	d, ok := desiredRequest(ctx)
-	if !ok || c.db == nil {
-		return true, nil
-	}
-	var version int64
-	err := c.db.QueryRowContext(ctx, `SELECT version FROM resource_state WHERE kind=? AND id=?`, d.Kind, d.ID).Scan(&version)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if version != d.Version {
-		return false, nil
-	}
-	var fence int64
-	err = c.db.QueryRowContext(ctx, `SELECT version FROM hue_manual_fences_v1 WHERE light_id=? AND kind=? AND resource_id=?`, id, d.Kind, d.ID).Scan(&fence)
-	if errors.Is(err, sql.ErrNoRows) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return d.Version > fence, nil
-}
 func (c *Client) ApplyLight(ctx context.Context, id string, s State) error {
 	if err := ValidateID(id); err != nil {
 		return err
@@ -154,38 +90,25 @@ func (c *Client) apply(ctx context.Context, plans map[string]State) error {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	c.commandMu.Lock()
-	defer c.commandMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if _, ok := desiredRequest(ctx); !ok {
-		if err := c.fence(ctx, ids); err != nil {
+	var tokens map[string]targetAuthority
+	if _, desired := desiredRequest(ctx); !desired {
+		var err error
+		tokens, err = c.admitDirect(ctx, ids)
+		if err != nil {
 			return fmt.Errorf("persist manual authority: %w", err)
 		}
 	}
 	var errs []error
+	superseded := 0
 	for _, id := range ids {
 		s := plans[id]
 		if s.PowerMode == "next_on" {
 			continue
 		}
-		allowed, err := c.allowed(ctx, id)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if !allowed {
-			continue
-		}
+		// Preparation and pacing do not hold the final-send/publication gate.
 		actual, err := c.Light(ctx, id)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("light %s: %w", id, err))
-			continue
-		}
-		// An appearance-only command never turns a lamp on, including a lamp that
-		// was switched off externally between this observation and the write.
-		if s.On == nil && (actual.State.On == nil || !*actual.State.On) {
 			continue
 		}
 		if s.Ct != nil {
@@ -207,29 +130,32 @@ func (c *Client) apply(ctx context.Context, plans map[string]State) error {
 			errs = append(errs, fmt.Errorf("light %s does not support effect %q", id, s.Effect))
 			continue
 		}
-		if !s.HasAppearance() && s.On == nil {
-			continue
-		}
-		if err := c.lightLimit.Wait(ctx); err != nil {
+		off := s.On == nil && (actual.State.On == nil || !*actual.State.On)
+		if err = c.lightLimit.Wait(ctx); err != nil {
 			return err
 		}
-		// Recheck after rate limiting: a newer persisted intent may have arrived.
-		allowed, err = c.allowed(ctx, id)
-		if err != nil {
-			return err
-		}
-		if !allowed {
+		err = c.targetSend(ctx, id, tokens, func() error {
+			if off || (!s.HasAppearance() && s.On == nil) {
+				return nil
+			}
+			return c.putLight(ctx, id, s)
+		})
+		if errors.Is(err, ErrSuperseded) {
+			superseded++
 			continue
 		}
-		err = c.putLight(ctx, id, s)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("light %s: %w", id, err))
 		}
 	}
 	err := errors.Join(errs...)
 	c.record(err)
+	if err == nil && len(ids) > 0 && superseded == len(ids) {
+		return ErrSuperseded
+	}
 	return err
 }
+
 func contains(values []string, s string) bool {
 	for _, v := range values {
 		if v == s {
@@ -272,11 +198,26 @@ func statePut(s State) openhue.LightPut {
 func (c *Client) putLight(ctx context.Context, id string, s State) error {
 	ctx, cancel := c.context(ctx)
 	defer cancel()
-	r, err := c.api.UpdateLightWithResponse(ctx, id, statePut(s))
+	body, err := json.Marshal(statePut(s))
 	if err != nil {
 		return err
 	}
-	return check(r.StatusCode(), r.Body)
+	if len(s.Gradient) > 0 {
+		var fields map[string]json.RawMessage
+		if err = json.Unmarshal(body, &fields); err != nil {
+			return err
+		}
+		fields["gradient"] = s.Gradient
+		body, err = json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+	}
+	r, err := c.api.UpdateLightWithBodyWithResponse(ctx, id, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	return checkWrite(r.StatusCode(), r.Body, id)
 }
 
 // Snapshot captures each member independently. Restore applies appearance only
@@ -329,9 +270,8 @@ func (c *Client) Signal(ctx context.Context, kind, id, signal string, duration i
 	} else if kind != "light" {
 		return fmt.Errorf("signal kind must be group or light")
 	}
-	c.commandMu.Lock()
-	defer c.commandMu.Unlock()
-	if err := c.fence(ctx, ids); err != nil {
+	tokens, err := c.admitDirect(ctx, ids)
+	if err != nil {
 		return err
 	}
 	var errs []error
@@ -353,12 +293,15 @@ func (c *Client) Signal(ctx context.Context, kind, id, signal string, duration i
 		if err = json.Unmarshal(b, &p); err != nil {
 			return err
 		}
-		callCtx, cancel := c.context(ctx)
-		r, err := c.api.UpdateLightWithResponse(callCtx, id, p)
-		cancel()
-		if err == nil {
-			err = check(r.StatusCode(), r.Body)
-		}
+		err = c.targetSend(ctx, id, tokens, func() error {
+			callCtx, cancel := c.context(ctx)
+			defer cancel()
+			r, err := c.api.UpdateLightWithResponse(callCtx, id, p)
+			if err != nil {
+				return err
+			}
+			return checkWrite(r.StatusCode(), r.Body, id)
+		})
 		if err != nil {
 			errs = append(errs, err)
 		}

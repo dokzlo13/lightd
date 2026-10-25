@@ -72,4 +72,3 @@ type ActionData struct {
 		} `json:"xy"`
 	} `json:"color,omitempty"`
 }
-

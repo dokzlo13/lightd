@@ -10,9 +10,10 @@ import (
 // StoreRegistry provides centralized access to all typed stores.
 // This replaces passing individual stores throughout the codebase.
 type StoreRegistry struct {
-	base       *storage.Store
-	groupStore *storage.TypedStore[group.Desired]
-	lightStore *storage.TypedStore[light.Desired]
+	clearAuthority func() error
+	base           *storage.Store
+	groupStore     *storage.TypedStore[group.Desired]
+	lightStore     *storage.TypedStore[light.Desired]
 }
 
 // NewStoreRegistry creates a new store registry with typed stores for each resource kind.
@@ -39,6 +40,13 @@ func (r *StoreRegistry) Clear() error {
 	if err := r.groupStore.Clear(); err != nil {
 		return err
 	}
-	return r.lightStore.Clear()
+	if err := r.lightStore.Clear(); err != nil {
+		return err
+	}
+	if r.clearAuthority != nil {
+		return r.clearAuthority()
+	}
+	return nil
 }
 
+func (r *StoreRegistry) SetClearAuthority(fn func() error) { r.clearAuthority = fn }

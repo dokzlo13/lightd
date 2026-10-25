@@ -113,6 +113,10 @@ func determineActionFromOn(desired Desired, actual Actual) Action {
 		return ActionTurnOnWithState
 	}
 
+	if desired.Brightness != nil || len(desired.Gradient) > 0 || desired.Effect != "" {
+		return ActionApplyState
+	}
+
 	// Third priority: color/brightness changes
 	if hasColorProperties(desired.State) {
 		if !stateMatches(desired.State, actual.State) {

@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,9 @@ type Status struct {
 // Client owns policy around the generated SDK: deadlines, sparse commands,
 // resource catalog, per-light serialization and persisted manual authority.
 type Client struct {
+	commandGate            chan struct{}
+	memoryAuthority        map[string]targetAuthority
+	connectivity           map[string]bool
 	api                    *openhue.ClientWithResponses
 	http                   *http.Client
 	base, address, token   string
@@ -47,9 +51,30 @@ func New(address, token string, timeout time.Duration) *Client {
 	transport.DialContext = (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = timeout
 	transport.ResponseHeaderTimeout = timeout
-	// Hue uses locally issued certificates. TLS verification is scoped to this
-	// bridge client and never changes the process-wide HTTP defaults.
-	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}
+	// Hue certificates identify the bridge rather than its numeric address.
+	// Validate its chain against Hue roots without mutating global defaults.
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM([]byte(HueBridgeRootCAs))
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true, VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+		if len(raw) == 0 {
+			return fmt.Errorf("Hue TLS peer sent no certificate")
+		}
+		leaf, err := x509.ParseCertificate(raw[0])
+		if err != nil {
+			return err
+		}
+		intermediate := x509.NewCertPool()
+		for _, b := range raw[1:] {
+			cert, err := x509.ParseCertificate(b)
+			if err != nil {
+				return err
+			}
+			intermediate.AddCert(cert)
+		}
+		_, err = leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediate, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+		return err
+	}}
+
 	c, _ := NewWithHTTP(address, token, &http.Client{Transport: transport, Timeout: timeout}, timeout)
 	return c
 }
@@ -68,7 +93,7 @@ func NewWithHTTP(address, token string, h *http.Client, timeout time.Duration) (
 	if h == nil {
 		return nil, fmt.Errorf("HTTP client is required")
 	}
-	c := &Client{http: h, base: base, address: u.Host, token: token, timeout: timeout, groups: map[string]Group{}, scenes: map[string]Scene{}, lightLimit: rate.NewLimiter(10, 1), groupLimit: rate.NewLimiter(1, 1)}
+	c := &Client{commandGate: make(chan struct{}, 1), memoryAuthority: map[string]targetAuthority{}, http: h, base: base, address: u.Host, token: token, timeout: timeout, groups: map[string]Group{}, scenes: map[string]Scene{}, lightLimit: rate.NewLimiter(10, 1), groupLimit: rate.NewLimiter(1, 1)}
 	c.api, err = openhue.NewClientWithResponses(base, openhue.WithHTTPClient(h), openhue.WithRequestEditorFn(func(ctx context.Context, r *http.Request) error {
 		r.Header.Set("hue-application-key", token)
 		return nil
@@ -81,6 +106,10 @@ func (c *Client) SetDB(db *sql.DB) error {
 		return nil
 	}
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS hue_manual_fences_v1 (light_id TEXT NOT NULL,kind TEXT NOT NULL,resource_id TEXT NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(light_id,kind,resource_id))`)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS hue_target_authority_v1(light_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,kind TEXT NOT NULL,resource_id TEXT NOT NULL,version INTEGER NOT NULL,acknowledged INTEGER NOT NULL DEFAULT 0)`)
 	return err
 }
 func (c *Client) Address() string          { return c.address }
@@ -185,7 +214,9 @@ func (c *Client) Lights(ctx context.Context) ([]Light, error) {
 		if l.Id == nil {
 			return nil, fmt.Errorf("light missing ID")
 		}
-		out = append(out, fromLight(l))
+		v := c.withConnectivity(fromLight(l))
+		v.State.Gradient = rawGradients(r.Body)[v.ID]
+		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
@@ -206,13 +237,18 @@ func (c *Client) Light(ctx context.Context, id string) (Light, error) {
 	if err != nil {
 		return Light{}, err
 	}
-	if len(items) != 1 || items[0].Id == nil {
+	if len(items) != 1 || items[0].Id == nil || *items[0].Id != id {
 		return Light{}, fmt.Errorf("light %s: expected one resource", id)
 	}
-	return fromLight(items[0]), nil
+	v := c.withConnectivity(fromLight(items[0]))
+	v.State.Gradient = rawGradients(r.Body)[v.ID]
+	return v, nil
 }
 func fromLight(l openhue.LightGet) Light {
-	out := Light{ID: *l.Id, Reachable: true}
+	out := Light{ID: *l.Id}
+	if l.Owner != nil && l.Owner.Rid != nil {
+		out.OwnerID = *l.Owner.Rid
+	}
 	if l.Metadata != nil && l.Metadata.Name != nil {
 		out.Name = *l.Metadata.Name
 	}
@@ -304,6 +340,26 @@ func (c *Client) Refresh(ctx context.Context) error {
 		c.record(err)
 		return err
 	}
+	connectR, err := c.api.GetResourcesWithResponse(ctx)
+	if err != nil {
+		c.record(err)
+		return err
+	}
+	connections, err := decodeData[struct {
+		Type   string                      `json:"type"`
+		Owner  *openhue.ResourceIdentifier `json:"owner"`
+		Status *string                     `json:"status"`
+	}](connectR.StatusCode(), connectR.Body)
+	if err != nil {
+		c.record(err)
+		return err
+	}
+	connectivity := map[string]bool{}
+	for _, conn := range connections {
+		if conn.Type == "zigbee_connectivity" && conn.Owner != nil && conn.Owner.Rid != nil && conn.Status != nil {
+			connectivity[*conn.Owner.Rid] = string(*conn.Status) == "connected"
+		}
+	}
 	byDevice := map[string][]string{}
 	for _, d := range devices {
 		if d.Id == nil || d.Services == nil {
@@ -393,8 +449,38 @@ func (c *Client) Refresh(ctx context.Context) error {
 		}
 		sc[v.ID] = v
 	}
+	var rawScenes struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Actions []struct {
+				Target struct {
+					RID string `json:"rid"`
+				} `json:"target"`
+				Action struct {
+					Gradient json.RawMessage `json:"gradient"`
+				} `json:"action"`
+			} `json:"actions"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(scenesR.Body, &rawScenes); err != nil {
+		return err
+	}
+	for _, rs := range rawScenes.Data {
+		scene, ok := sc[rs.ID]
+		if !ok {
+			continue
+		}
+		for _, a := range rs.Actions {
+			p, ok := scene.Members[a.Target.RID]
+			if ok && len(a.Action.Gradient) > 0 && string(a.Action.Gradient) != "null" {
+				p.Gradient = a.Action.Gradient
+				scene.Members[a.Target.RID] = p
+			}
+		}
+	}
 	c.mu.Lock()
 	c.groups = groups
+	c.connectivity = connectivity
 	c.scenes = sc
 	c.mu.Unlock()
 	c.record(nil)
@@ -493,3 +579,61 @@ func (c *Client) ResolveScene(groupID, scene string) (Scene, error) {
 
 // readBounded is shared by the SSE error path, never exposing credentials.
 func ReadBounded(r io.Reader) string { b, _ := io.ReadAll(io.LimitReader(r, 4096)); return string(b) }
+
+func rawGradients(body []byte) map[string]json.RawMessage {
+	var env struct {
+		Data []struct {
+			ID       string          `json:"id"`
+			Gradient json.RawMessage `json:"gradient"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(body, &env)
+	out := map[string]json.RawMessage{}
+	for _, l := range env.Data {
+		if len(l.Gradient) > 0 && string(l.Gradient) != "null" {
+			out[l.ID] = l.Gradient
+		}
+	}
+	return out
+}
+
+func (c *Client) withConnectivity(l Light) Light {
+	c.mu.RLock()
+	v, ok := c.connectivity[l.OwnerID]
+	c.mu.RUnlock()
+	if ok {
+		l.Reachable = &v
+	}
+	return l
+}
+func (c *Client) UpdateConnectivity(owner, status string) {
+	if owner == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connectivity == nil {
+		c.connectivity = map[string]bool{}
+	}
+	c.connectivity[owner] = status == "connected"
+}
+func (c *Client) ClearAuthority() error {
+	if c.db == nil {
+		return nil
+	}
+	_, err := c.db.Exec(`DELETE FROM hue_manual_fences_v1; DELETE FROM hue_target_authority_v1`)
+	return err
+}
+
+func checkWrite(status int, body []byte, id string) error {
+	resources, err := decodeData[openhue.ResourceIdentifier](status, body)
+	if err != nil {
+		return err
+	}
+	for _, r := range resources {
+		if r.Rid != nil && *r.Rid == id && r.Rtype != nil && string(*r.Rtype) == "light" {
+			return nil
+		}
+	}
+	return fmt.Errorf("Hue write response did not acknowledge the requested light")
+}

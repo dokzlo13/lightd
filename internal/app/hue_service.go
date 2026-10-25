@@ -35,10 +35,15 @@ func NewHueService(cfg *config.Config, db *sql.DB, store *storage.Store) (*HueSe
 		return nil, err
 	}
 	stores := hue.NewStoreRegistry(store)
+	stores.SetClearAuthority(c.ClearAuthority)
 	scenes := &hue.SceneIndex{Client: c}
 	gp := group.NewProvider(stores.Groups(), group.NewActualProvider(c), group.NewHueApplier(c))
 	lp := light.NewProvider(stores.Lights(), light.NewActualProvider(c), light.NewHueApplier(c))
 	o := reconcile.NewOrchestrator(cfg.Reconciler.GetPeriodicInterval(), cfg.Reconciler.GetDebounceMs(), cfg.Reconciler.GetRateLimitRPS())
+	if err := o.SetDB(db); err != nil {
+		return nil, err
+	}
+	o.SetReassert(c.ReassertDesired)
 	o.Register(gp)
 	o.Register(lp)
 	es := v2.NewEventStreamWithConfig(c, v2.EventStreamConfig{MinBackoff: cfg.Events.SSE.GetMinRetryBackoff(), MaxBackoff: cfg.Events.SSE.GetMaxRetryBackoff(), Multiplier: cfg.Events.SSE.GetRetryMultiplier(), MaxReconnects: cfg.Events.SSE.GetMaxReconnects()})
