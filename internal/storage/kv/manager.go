@@ -17,6 +17,7 @@ type Manager struct {
 	mu             sync.RWMutex
 	cleanupStop    chan struct{}
 	cleanupStopped chan struct{}
+	cleanupOnce    sync.Once
 }
 
 // NewManager creates a new KV manager.
@@ -56,24 +57,16 @@ func (m *Manager) Bucket(name string, persistent bool) Bucket {
 }
 
 // Exists returns true if a bucket with the given name exists.
-func (m *Manager) Exists(name string) bool {
+func (m *Manager) Exists(name string) bool { ok, _ := m.ExistsE(name); return ok }
+func (m *Manager) ExistsE(name string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
 	if _, ok := m.buckets[name]; ok {
-		return true
+		return true, nil
 	}
-
-	// For persistent buckets, check the database
 	var count int
-	err := m.db.QueryRow(`
-		SELECT COUNT(DISTINCT bucket) FROM kv_store WHERE bucket = ?
-	`, name).Scan(&count)
-	if err != nil {
-		return false
-	}
-
-	return count > 0
+	err := m.db.QueryRow(`SELECT COUNT(DISTINCT bucket) FROM kv_store WHERE bucket=?`, name).Scan(&count)
+	return count > 0, err
 }
 
 // Delete removes a bucket and all its data.
@@ -162,7 +155,7 @@ func (m *Manager) StartCleanup(ctx context.Context, interval time.Duration) {
 // StopCleanup stops the background cleanup goroutine.
 func (m *Manager) StopCleanup() {
 	if m.cleanupStop != nil {
-		close(m.cleanupStop)
+		m.cleanupOnce.Do(func() { close(m.cleanupStop) })
 		<-m.cleanupStopped
 		log.Debug().Msg("Stopped KV cleanup goroutine")
 	}

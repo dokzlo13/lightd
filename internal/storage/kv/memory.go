@@ -85,7 +85,9 @@ func (b *MemoryBucket) Get(key string) (any, error) {
 	if entry.isExpired() {
 		// Lazy deletion of expired entry
 		b.mu.Lock()
-		delete(b.entries, key)
+		if b.entries[key] == entry {
+			delete(b.entries, key)
+		}
 		b.mu.Unlock()
 		return nil, nil
 	}
@@ -106,7 +108,9 @@ func (b *MemoryBucket) Exists(key string) (bool, error) {
 	if entry.isExpired() {
 		// Lazy deletion of expired entry
 		b.mu.Lock()
-		delete(b.entries, key)
+		if b.entries[key] == entry {
+			delete(b.entries, key)
+		}
 		b.mu.Unlock()
 		return false, nil
 	}

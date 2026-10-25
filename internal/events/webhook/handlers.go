@@ -37,6 +37,11 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 			data[k] = v
 		}
 		data["path_params"] = match.PathParams
+		eventID, _ := data["event_id"].(string)
+		ok, err := i.ReceiveEvent(ctx, eventID, "webhook")
+		if err != nil || !ok {
+			return err
+		}
 		key := method + ":" + match.Handler.Path
 		mu.Lock()
 		defer mu.Unlock()
@@ -45,7 +50,11 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 			collector = createWebhookCollector(ctx, match.Handler, i, x)
 			collectors[key] = collector
 		}
-		return collector.AddEvent(data)
+		err = collector.AddEvent(data)
+		if err != nil {
+			_ = i.EndEvents([]string{eventID}, "rejected", err)
+		}
+		return err
 	})
 }
 func createWebhookCollector(ctx context.Context, h *Handler, i *actions.Invoker, x exec.Executor) middleware.Collector {
@@ -60,10 +69,13 @@ func createWebhookCollector(ctx context.Context, h *Handler, i *actions.Invoker,
 		req := &luactx.RequestData{Method: method, Path: path, Body: body, JSON: data, Headers: headers, PathParams: params}
 		workCtx := context.WithValue(ctx, luactx.RequestContextKey, req)
 		key := ""
+		eventIDs := []string{}
 		for _, ev := range batch {
-			key += fmt.Sprint(ev["event_id"]) + "/"
+			id := fmt.Sprint(ev["event_id"])
+			key += id + "/"
+			eventIDs = append(eventIDs, id)
 		}
-		return i.QueuePrepared(workCtx, x, h.ActionName, key, "webhook", h.Method+":"+h.Path, func(context.Context) (map[string]any, error) {
+		return i.QueuePrepared(actions.WithMetadata(workCtx, actions.Metadata{EventIDs: eventIDs}), x, h.ActionName, key, "webhook", h.Method+":"+h.Path, func(context.Context) (map[string]any, error) {
 			var args map[string]any
 			if h.CollectorFactory != nil && h.CollectorFactory.Reducer != nil {
 				var err error
@@ -87,7 +99,15 @@ func createWebhookCollector(ctx context.Context, h *Handler, i *actions.Invoker,
 		})
 	}
 	if h.CollectorFactory != nil {
-		return h.CollectorFactory.Create(flush)
+		c := h.CollectorFactory.Create(flush)
+		middleware.OnDiscard(c, func(batch []map[string]any) {
+			ids := []string{}
+			for _, e := range batch {
+				ids = append(ids, fmt.Sprint(e["event_id"]))
+			}
+			_ = i.EndEvents(ids, "cancelled_before_dispatch", fmt.Errorf("collector closed"))
+		})
+		return c
 	}
 	return middleware.NewImmediateCollector(flush)
 }

@@ -3,6 +3,7 @@ package modules
 import (
 	"github.com/rs/zerolog/log"
 	glua "github.com/yuin/gopher-lua"
+	"sync"
 
 	"github.com/dokzlo13/lightd/internal/events/webhook"
 	"github.com/dokzlo13/lightd/internal/lua/modules/collect"
@@ -10,6 +11,7 @@ import (
 
 // WebhookModule provides events.webhook Lua module for webhook handlers
 type WebhookModule struct {
+	mu       sync.RWMutex
 	enabled  bool
 	handlers []webhook.Handler
 }
@@ -43,7 +45,7 @@ func (m *WebhookModule) define(L *glua.LState) int {
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := RequireLuaMap(L, argsTable)
+	args := RequireEventArgs(L, argsTable)
 
 	// Extract collector factory from middleware field
 	var factory *collect.CollectorFactory
@@ -52,6 +54,7 @@ func (m *WebhookModule) define(L *glua.LState) int {
 		delete(args, "middleware")
 	}
 
+	m.mu.Lock()
 	m.handlers = append(m.handlers, webhook.Handler{
 		Method:           method,
 		Path:             path,
@@ -60,6 +63,7 @@ func (m *WebhookModule) define(L *glua.LState) int {
 		CollectorFactory: factory,
 	})
 
+	m.mu.Unlock()
 	log.Info().
 		Str("method", method).
 		Str("path", path).
@@ -71,7 +75,9 @@ func (m *WebhookModule) define(L *glua.LState) int {
 
 // GetHandlers returns all registered webhook handlers
 func (m *WebhookModule) GetHandlers() []webhook.Handler {
-	return m.handlers
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]webhook.Handler(nil), m.handlers...)
 }
 
 // HasMatch checks if there's a registered handler for the given method and path.
@@ -83,6 +89,8 @@ func (m *WebhookModule) HasMatch(method, path string) bool {
 // FindHandler finds a handler for a webhook event and extracts path parameters.
 // Supports path patterns like "/group/{id}/toggle" where {id} is a parameter.
 func (m *WebhookModule) FindHandler(method, path string) *webhook.MatchResult {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i := range m.handlers {
 		h := &m.handlers[i]
 		if h.Method != method {
@@ -92,7 +100,7 @@ func (m *WebhookModule) FindHandler(method, path string) *webhook.MatchResult {
 		params, ok := webhook.MatchPath(h.Path, path)
 		if ok {
 			return &webhook.MatchResult{
-				Handler:    h,
+				Handler:    func() *webhook.Handler { copy := *h; return &copy }(),
 				PathParams: params,
 			}
 		}

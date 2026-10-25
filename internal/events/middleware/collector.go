@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/json"
 	"errors"
 	"github.com/rs/zerolog/log"
 	"sync"
@@ -32,6 +33,8 @@ type bufferedCollector struct {
 	delay      time.Duration
 	first      time.Time
 	onFlush    FlushFunc
+	onDiscard  func([]map[string]any)
+	bytes      int
 }
 
 func newBuffered(mode string, n int, fn FlushFunc) *bufferedCollector {
@@ -65,6 +68,7 @@ func (c *bufferedCollector) flush() error {
 		return err
 	}
 	c.events = nil
+	c.bytes = 0
 	c.first = time.Time{}
 	return nil
 }
@@ -74,6 +78,13 @@ func (c *bufferedCollector) AddEvent(e map[string]any) error {
 	if c.closed {
 		return ErrCollectorClosed
 	}
+	encoded, err := json.Marshal(e)
+	if err != nil {
+		return err
+	}
+	if c.bytes+len(encoded) > 2<<20 {
+		return ErrCollectorFull
+	}
 	if len(c.events) >= MaxCollectedEvents {
 		return ErrCollectorFull
 	}
@@ -81,8 +92,10 @@ func (c *bufferedCollector) AddEvent(e map[string]any) error {
 		c.first = time.Now()
 	}
 	c.events = append(c.events, e)
+	c.bytes += len(encoded)
 	if c.mode == "count" && len(c.events) >= c.limit {
-		return c.flush()
+		_ = c.flush()
+		return nil
 	}
 	delay := c.delay
 	if c.mode == "quiet" {
@@ -113,7 +126,21 @@ func (c *bufferedCollector) Close() {
 		c.timer.Stop()
 	}
 	if len(c.events) > 0 {
+		if c.onDiscard != nil {
+			c.onDiscard(c.events)
+		}
 		log.Warn().Int("events", len(c.events)).Msg("Collector closed with pending events; batch cancelled")
 	}
 	c.events = nil
+}
+
+func (c *bufferedCollector) SetDiscard(fn func([]map[string]any)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onDiscard = fn
+}
+func OnDiscard(c Collector, fn func([]map[string]any)) {
+	if d, ok := c.(interface{ SetDiscard(func([]map[string]any)) }); ok {
+		d.SetDiscard(fn)
+	}
 }

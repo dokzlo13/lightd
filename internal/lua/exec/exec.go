@@ -94,6 +94,18 @@ func goToLuaValue(L *glua.LState, v interface{}) glua.LValue {
 			tbl.RawSetInt(i+1, goToLuaValue(L, item))
 		}
 		return tbl
+	case map[string]string:
+		tbl := L.NewTable()
+		for k, v := range val {
+			tbl.RawSetString(k, goToLuaValue(L, v))
+		}
+		return tbl
+	case []string:
+		tbl := L.NewTable()
+		for i, v := range val {
+			tbl.RawSetInt(i+1, goToLuaValue(L, v))
+		}
+		return tbl
 	case map[string]interface{}:
 		tbl := L.NewTable()
 		for k, v := range val {

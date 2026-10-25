@@ -54,6 +54,10 @@ func (m *KVModule) bucket(L *lua.LState) int {
 	}
 
 	bucket := m.manager.Bucket(name, persistent)
+	if bucket.IsPersistent() != persistent {
+		L.RaiseError("bucket %q already exists with different persistence", name)
+		return 0
+	}
 
 	// Create userdata with bucket
 	ud := L.NewUserData()
@@ -69,7 +73,12 @@ func (m *KVModule) exists(L *lua.LState) int {
 	L.CheckTable(1) // self
 	name := L.CheckString(2)
 
-	L.Push(lua.LBool(m.manager.Exists(name)))
+	exists, err := m.manager.ExistsE(name)
+	if err != nil {
+		L.RaiseError("KV exists: %s", err)
+		return 0
+	}
+	L.Push(lua.LBool(exists))
 	return 1
 }
 

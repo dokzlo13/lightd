@@ -20,6 +20,7 @@ type Metadata struct {
 	PlannedAt     time.Time
 	PolicyVersion string
 	Generation    int64
+	EventIDs      []string
 }
 type metadataKey struct{}
 type invocationKey struct{}
@@ -52,7 +53,10 @@ func (i *Invoker) receipt(ctx context.Context, name, key, source, def string) (s
 		source = "manual"
 	}
 	m, _ := ctx.Value(metadataKey{}).(Metadata)
-	in := storage.Invocation{ID: uuid.NewString(), Action: name, Key: key, Source: source, Definition: def, ParentID: InvocationID(ctx), PlannedAt: m.PlannedAt, PolicyVersion: m.PolicyVersion, Generation: m.Generation}
+	in := storage.Invocation{ID: uuid.NewString(), Action: name, Key: key, Source: source, Definition: def, ParentID: InvocationID(ctx), PlannedAt: m.PlannedAt, PolicyVersion: m.PolicyVersion, Generation: m.Generation, EventIDs: m.EventIDs}
+	if in.ParentID != "" {
+		in.EventIDs = nil
+	}
 	ok, err := i.ledger.Receive(ctx, in)
 	return in, ok, err
 }
@@ -96,11 +100,12 @@ func (i *Invoker) finish(in storage.Invocation, status string, err error, actx *
 	return i.ledger.FinishInvocation(ctx, in, status, err, actx.commit)
 }
 func (i *Invoker) execute(ctx context.Context, in storage.Invocation, prepare func(context.Context) (map[string]any, error)) (err error) {
+	completed := false
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("action panicked: %v", p)
 		}
-		if err != nil {
+		if err != nil && !completed {
 			err = errors.Join(err, i.finish(in, "failed", err, nil))
 		}
 	}()
@@ -133,6 +138,19 @@ func (i *Invoker) execute(ctx context.Context, in storage.Invocation, prepare fu
 	if err = i.finish(in, "completed", nil, actx); err != nil {
 		return fmt.Errorf("commit action outcome: %w", err)
 	}
+	completed = true
 	actx.committed()
 	return nil
+}
+
+func (i *Invoker) ReceiveEvent(ctx context.Context, id, source string) (bool, error) {
+	return i.ledger.ReceiveEvent(ctx, id, source)
+}
+func (i *Invoker) EndEvents(ids []string, status string, err error) error {
+	return i.ledger.EndEvents(ids, status, err)
+}
+
+// WithParent propagates correlation without inheriting the parent's execution deadline.
+func WithParent(ctx context.Context, parentID string) context.Context {
+	return context.WithValue(ctx, invocationKey{}, invocationContext{ID: parentID})
 }

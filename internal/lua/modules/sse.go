@@ -80,7 +80,7 @@ func (m *SSEModule) button(L *glua.LState) int {
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := RequireLuaMap(L, argsTable)
+	args := RequireEventArgs(L, argsTable)
 
 	// Extract collector factory from middleware field
 	var factory *collect.CollectorFactory
@@ -152,7 +152,7 @@ func (m *SSEModule) connectivity(L *glua.LState) int {
 	actionName := L.CheckString(3)
 	argsTable := L.OptTable(4, L.NewTable())
 
-	args := RequireLuaMap(L, argsTable)
+	args := RequireEventArgs(L, argsTable)
 
 	// Extract collector factory from middleware field
 	var factory *collect.CollectorFactory
@@ -224,7 +224,7 @@ func (m *SSEModule) rotary(L *glua.LState) int {
 	actionName := L.CheckString(2)
 	argsTable := L.OptTable(3, L.NewTable())
 
-	args := RequireLuaMap(L, argsTable)
+	args := RequireEventArgs(L, argsTable)
 
 	// Extract collector factory from middleware field
 	var factory *collect.CollectorFactory
@@ -291,7 +291,7 @@ func (m *SSEModule) lightChange(L *glua.LState) int {
 	actionName := L.CheckString(2)
 	argsTable := L.OptTable(3, L.NewTable())
 
-	args := RequireLuaMap(L, argsTable)
+	args := RequireEventArgs(L, argsTable)
 
 	// Extract resource_type filter (default "*" = all)
 	resourceTypePattern := "*"

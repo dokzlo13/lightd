@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rs/zerolog/log"
 	"time"
 )
 
@@ -22,6 +23,7 @@ type Invocation struct {
 	PlannedAt     time.Time `json:"planned_at,omitempty"`
 	PolicyVersion string    `json:"policy_version,omitempty"`
 	Generation    int64     `json:"generation,omitempty"`
+	EventIDs      []string  `json:"event_ids,omitempty"`
 }
 
 func initInvocations(db *sql.DB) error {
@@ -31,7 +33,9 @@ func initInvocations(db *sql.DB) error {
  status TEXT NOT NULL, received_at INTEGER NOT NULL, started_at INTEGER, finished_at INTEGER, error TEXT NOT NULL DEFAULT '');
  CREATE UNIQUE INDEX IF NOT EXISTS idx_invocation_claim ON invocations(dedupe_key) WHERE dedupe_key != '' AND status != 'rejected';
  CREATE INDEX IF NOT EXISTS idx_invocation_received ON invocations(received_at);
- CREATE TABLE IF NOT EXISTS scheduler_cursors(id TEXT PRIMARY KEY,planned_at INTEGER NOT NULL);`)
+ CREATE TABLE IF NOT EXISTS scheduler_cursors(id TEXT PRIMARY KEY,planned_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS ingress_receipts(id TEXT PRIMARY KEY,source TEXT NOT NULL,status TEXT NOT NULL,received_at INTEGER NOT NULL,invocation_id TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '');
+ CREATE INDEX IF NOT EXISTS idx_ingress_received ON ingress_receipts(received_at);`)
 	return err
 }
 
@@ -49,7 +53,8 @@ func (l *Ledger) HasCompletedE(key string) (bool, error) {
 
 // Receive commits the receipt before admitting work. false means a prior claim
 // already exists, including a completed claim from the previous schema.
-func (l *Ledger) Receive(ctx context.Context, in Invocation) (bool, error) {
+func (l *Ledger) Receive(ctx context.Context, in Invocation) (accepted bool, err error) {
+	defer func() { l.report(err) }()
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -73,13 +78,19 @@ func (l *Ledger) Receive(ctx context.Context, in Invocation) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err = appendInvocationTx(tx, in, "action_received", ""); err != nil {
+	if err = l.appendInvocationTx(tx, in, "action_received", ""); err != nil {
 		return false, err
+	}
+	for _, id := range in.EventIDs {
+		if _, err = tx.ExecContext(ctx, `UPDATE ingress_receipts SET status='queued',invocation_id=? WHERE id=?`, in.ID, id); err != nil {
+			return false, err
+		}
 	}
 	return true, tx.Commit()
 }
 
-func (l *Ledger) StartInvocation(ctx context.Context, in Invocation) error {
+func (l *Ledger) StartInvocation(ctx context.Context, in Invocation) (err error) {
+	defer func() { l.report(err) }()
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -93,7 +104,7 @@ func (l *Ledger) StartInvocation(ctx context.Context, in Invocation) error {
 	if n != 1 {
 		return fmt.Errorf("invocation %s is not accepted", in.ID)
 	}
-	if err = appendInvocationTx(tx, in, "action_started", ""); err != nil {
+	if err = l.appendInvocationTx(tx, in, "action_started", ""); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -102,7 +113,8 @@ func (l *Ledger) StartInvocation(ctx context.Context, in Invocation) error {
 // FinishInvocation makes desired writes and the successful outcome one commit.
 // Failed/rejected outcomes never execute commit. Use a fresh bounded context to
 // record cancellation, because the action context may already be cancelled.
-func (l *Ledger) FinishInvocation(ctx context.Context, in Invocation, status string, actionErr error, commit func(*sql.Tx) error) error {
+func (l *Ledger) FinishInvocation(ctx context.Context, in Invocation, status string, actionErr error, commit func(*sql.Tx) error) (err error) {
+	defer func() { l.report(err) }()
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -121,13 +133,25 @@ func (l *Ledger) FinishInvocation(ctx context.Context, in Invocation, status str
 	if err != nil {
 		return err
 	}
-	if err = appendInvocationTx(tx, in, "action_"+status, message); err != nil {
+	ingressStatus := status
+	if status == "rejected" {
+		ingressStatus = "received"
+	}
+	for _, id := range in.EventIDs {
+		if _, err = tx.ExecContext(ctx, `UPDATE ingress_receipts SET status=?,error=? WHERE id=?`, ingressStatus, message, id); err != nil {
+			return err
+		}
+	}
+	if err = l.appendInvocationTx(tx, in, "action_"+status, message); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
-func appendInvocationTx(tx *sql.Tx, in Invocation, event, message string) error {
-	payload := map[string]any{"invocation_id": in.ID, "action": in.Action, "parent_id": in.ParentID, "planned_at": in.PlannedAt, "policy_version": in.PolicyVersion, "generation": in.Generation}
+func (l *Ledger) appendInvocationTx(tx *sql.Tx, in Invocation, event, message string) error {
+	if !l.history() {
+		return nil
+	}
+	payload := map[string]any{"invocation_id": in.ID, "action": in.Action, "parent_id": in.ParentID, "planned_at": in.PlannedAt, "policy_version": in.PolicyVersion, "generation": in.Generation, "event_ids": in.EventIDs}
 	if message != "" {
 		payload["error"] = message
 	}
@@ -142,14 +166,18 @@ func appendInvocationTx(tx *sql.Tx, in Invocation, event, message string) error 
 // RecoverInterrupted closes receipts left by a previous process; it never replays
 // effects whose completion cannot be established.
 func (l *Ledger) RecoverInterrupted() error {
-	rows, err := l.db.Query(`SELECT metadata FROM invocations WHERE status IN ('accepted','running')`)
+	rows, err := l.db.Query(`SELECT metadata,status FROM invocations WHERE status IN ('accepted','running')`)
 	if err != nil {
 		return err
 	}
-	var pending []Invocation
+	type interrupted struct {
+		in     Invocation
+		status string
+	}
+	var pending []interrupted
 	for rows.Next() {
-		var b string
-		if err = rows.Scan(&b); err != nil {
+		var b, status string
+		if err = rows.Scan(&b, &status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -158,26 +186,37 @@ func (l *Ledger) RecoverInterrupted() error {
 			rows.Close()
 			return err
 		}
-		pending = append(pending, in)
+		pending = append(pending, interrupted{in, status})
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
 		return err
 	}
-	for _, in := range pending {
-		if err = l.FinishInvocation(context.Background(), in, "interrupted", errors.New("previous process stopped before terminal outcome"), nil); err != nil {
+	for _, item := range pending {
+		status := "interrupted_before_start"
+		if item.status == "running" {
+			status = "interrupted_outcome_unknown"
+		}
+		if err = l.FinishInvocation(context.Background(), item.in, status, errors.New("previous process stopped before terminal outcome"), nil); err != nil {
 			return err
 		}
 	}
-	return nil
+	_, err = l.db.Exec(`UPDATE ingress_receipts SET status='interrupted_before_dispatch',error='process stopped before collector dispatched' WHERE status='received'`)
+	return err
 }
 
 func (l *Ledger) RunRetention(ctx context.Context, retention, interval time.Duration) {
 	if retention <= 0 || interval <= 0 {
 		return
 	}
-	clean := func() { _, _ = l.DeleteOlderThan(retention) }
+	clean := func() {
+		_, err := l.DeleteOlderThan(retention)
+		l.report(err)
+		if err != nil {
+			log.Error().Err(err).Msg("Ledger retention failed")
+		}
+	}
 	clean()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -269,4 +308,39 @@ func (s *TypedStore[T]) PatchTx(tx *sql.Tx, id string, patch map[string]json.Raw
 		return err
 	}
 	return s.store.SetTx(tx, s.kind, id, b)
+}
+
+// ReceiveEvent records input before collector admission. Replays are deduplicated
+// independently of whether the reducer includes input identity in its result.
+func (l *Ledger) ReceiveEvent(ctx context.Context, id, source string) (accepted bool, err error) {
+	defer func() { l.report(err) }()
+	result, err := l.db.ExecContext(ctx, `INSERT INTO ingress_receipts(id,source,status,received_at) VALUES(?,?,'received',?) ON CONFLICT(id) DO UPDATE SET status='received',received_at=excluded.received_at,error='' WHERE ingress_receipts.status='rejected'`, id, source, time.Now().UnixNano())
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+func (l *Ledger) EndEvents(ids []string, status string, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	message := ""
+	if cause != nil {
+		message = cause.Error()
+	}
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		l.report(err)
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err = tx.ExecContext(ctx, `UPDATE ingress_receipts SET status=?,error=? WHERE id=? AND status IN ('received','rejected')`, status, message, id); err != nil {
+			l.report(err)
+			return err
+		}
+	}
+	err = tx.Commit()
+	l.report(err)
+	return err
 }

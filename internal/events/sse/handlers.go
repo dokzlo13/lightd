@@ -57,19 +57,29 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 		mutable.SetOnHandlersChanged(cache.Clear)
 	}
 	context.AfterFunc(ctx, cache.Clear)
-	admit := func(kind events.EventType, key, action string, static map[string]any, factory *collect.CollectorFactory, e events.Event) error {
+	admit := func(kind events.EventType, key, action string, static map[string]any, factory *collect.CollectorFactory, e events.Event, selectedGeneration uint64) error {
 		data := copyEventData(e.Data)
-		if _, ok := data["event_id"].(string); !ok {
+		if eid, ok := data["event_id"].(string); !ok || eid == "" {
 			data["event_id"] = uuid.NewString()
 		}
-		return cache.add(string(kind)+":"+key, data, func(generation uint64) middleware.Collector {
+		eventID := fmt.Sprint(data["event_id"]) + ":" + key
+		data["event_id"] = eventID
+		ok, err := i.ReceiveEvent(ctx, eventID, string(kind))
+		if err != nil || !ok {
+			return err
+		}
+		err = cache.add(string(kind)+":"+key, data, func(generation uint64) middleware.Collector {
+			generation = selectedGeneration
 			flush := func(batch []map[string]any) error {
 				ids := ""
+				eventIDs := make([]string, 0, len(batch))
 				for _, ev := range batch {
-					ids += fmt.Sprint(ev["event_id"]) + "/"
+					id := fmt.Sprint(ev["event_id"])
+					ids += id + "/"
+					eventIDs = append(eventIDs, id)
 				}
 				dedupe := fmt.Sprintf("%s:%s:%x", kind, key, sha256.Sum256([]byte(ids)))
-				return i.QueuePrepared(ctx, x, action, dedupe, string(kind), key, func(workCtx context.Context) (map[string]any, error) {
+				return i.QueuePrepared(actions.WithMetadata(ctx, actions.Metadata{EventIDs: eventIDs}), x, action, dedupe, string(kind), key, func(workCtx context.Context) (map[string]any, error) {
 					if generation != cache.generation.Load() {
 						return nil, fmt.Errorf("handler binding superseded")
 					}
@@ -95,43 +105,59 @@ func RegisterHandlers(ctx context.Context, r HandlerRegistry, bus *events.Bus, i
 				})
 			}
 			if factory != nil {
-				return factory.Create(flush)
+				c := factory.Create(flush)
+				middleware.OnDiscard(c, func(batch []map[string]any) {
+					ids := []string{}
+					for _, e := range batch {
+						ids = append(ids, fmt.Sprint(e["event_id"]))
+					}
+					_ = i.EndEvents(ids, "cancelled_before_dispatch", fmt.Errorf("collector closed or binding superseded"))
+				})
+				return c
 			}
 			return middleware.NewImmediateCollector(flush)
 		})
+		if err != nil {
+			_ = i.EndEvents([]string{eventID}, "rejected", err)
+		}
+		return err
 	}
 	bus.SubscribeAck(events.EventTypeButton, func(e events.Event) error {
+		selectedGeneration := cache.generation.Load()
 		id, _ := e.Data["resource_id"].(string)
 		action, _ := e.Data["action"].(string)
 		h := r.FindButtonHandler(id, action)
 		if h == nil {
 			return nil
 		}
-		return admit(e.Type, id+":"+action, h.ActionName, h.ActionArgs, h.CollectorFactory, e)
+		return admit(e.Type, id+":"+action, h.ActionName, h.ActionArgs, h.CollectorFactory, e, selectedGeneration)
 	})
 	bus.SubscribeAck(events.EventTypeConnectivity, func(e events.Event) error {
+		selectedGeneration := cache.generation.Load()
 		id, _ := e.Data["device_id"].(string)
 		status, _ := e.Data["status"].(string)
 		h := r.FindConnectivityHandler(id, status)
 		if h == nil {
 			return nil
 		}
-		return admit(e.Type, id+":"+status, h.ActionName, h.ActionArgs, h.CollectorFactory, e)
+		return admit(e.Type, id+":"+status, h.ActionName, h.ActionArgs, h.CollectorFactory, e, selectedGeneration)
 	})
 	bus.SubscribeAck(events.EventTypeRotary, func(e events.Event) error {
+		selectedGeneration := cache.generation.Load()
 		id, _ := e.Data["resource_id"].(string)
 		h := r.FindRotaryHandler(id)
 		if h == nil {
 			return nil
 		}
-		return admit(e.Type, id, h.ActionName, h.ActionArgs, h.CollectorFactory, e)
+		return admit(e.Type, id, h.ActionName, h.ActionArgs, h.CollectorFactory, e, selectedGeneration)
 	})
 	bus.SubscribeAck(events.EventTypeLightChange, func(e events.Event) error {
+		selectedGeneration := cache.generation.Load()
 		id, _ := e.Data["resource_id"].(string)
 		typ, _ := e.Data["resource_type"].(string)
 		for _, h := range r.FindLightChangeHandlers(id, typ) {
 			key := h.ActionName + ":" + h.ResourceID.String() + ":" + h.ResourceType.String()
-			if err := admit(e.Type, key, h.ActionName, h.ActionArgs, h.CollectorFactory, e); err != nil {
+			if err := admit(e.Type, key, h.ActionName, h.ActionArgs, h.CollectorFactory, e, selectedGeneration); err != nil {
 				return err
 			}
 		}

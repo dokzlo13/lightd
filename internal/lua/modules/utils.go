@@ -344,22 +344,6 @@ func (m *UtilsModule) deepCopy(L *lua.LState) int {
 	return 1
 }
 
-func (m *UtilsModule) deepCopyTable(L *lua.LState, tbl *lua.LTable) *lua.LTable {
-	result := L.NewTable()
-
-	tbl.ForEach(func(k, v lua.LValue) {
-		var newValue lua.LValue
-		if innerTbl, ok := v.(*lua.LTable); ok {
-			newValue = m.deepCopyTable(L, innerTbl)
-		} else {
-			newValue = v
-		}
-		result.RawSet(k, newValue)
-	})
-
-	return result
-}
-
 // merge(t1, t2) -> table
 // Merges t2 into t1 (shallow), returns new table
 // Values from t2 override t1

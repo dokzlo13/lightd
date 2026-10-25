@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	lua "github.com/yuin/gopher-lua"
 	"sort"
 
@@ -16,8 +17,8 @@ import (
 //
 // Chainable builder API:
 //
-//	ctx.desired:group("1"):on():set_scene("Relax")
-//	ctx.desired:light("5"):on():set_bri(254)
+//	ctx.desired:group("UUID"):on():set_scene("Relax")
+//	ctx.desired:light("UUID"):on():set_brightness(100)
 //	ctx:reconcile()  -- flushes pending and triggers reconciler
 type DesiredModule struct {
 	groupStore *storage.TypedStore[group.Desired]
@@ -26,6 +27,8 @@ type DesiredModule struct {
 	// Pending builders (keyed by ID)
 	pendingGroups map[string]*GroupDesiredBuilder
 	pendingLights map[string]*LightDesiredBuilder
+	groupBuilders map[string]*GroupDesiredBuilder
+	lightBuilders map[string]*LightDesiredBuilder
 	closed        bool
 	actualGroup   *group.ActualProvider
 	actualLight   *light.ActualProvider
@@ -41,6 +44,8 @@ func NewDesiredModule(
 		lightStore:    lightStore,
 		pendingGroups: make(map[string]*GroupDesiredBuilder),
 		pendingLights: make(map[string]*LightDesiredBuilder),
+		groupBuilders: make(map[string]*GroupDesiredBuilder),
+		lightBuilders: make(map[string]*LightDesiredBuilder),
 	}
 }
 
@@ -158,6 +163,10 @@ func (m *DesiredModule) getGroupBuilder() lua.LGFunction {
 	return func(L *lua.LState) int {
 		L.CheckTable(1) // self
 		groupID := L.CheckString(2)
+		if err := bridge.ValidateID(groupID); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
 
 		pushGroupBuilder(L, groupID, m)
 		return 1
@@ -169,6 +178,10 @@ func (m *DesiredModule) getLightBuilder() lua.LGFunction {
 	return func(L *lua.LState) int {
 		L.CheckTable(1) // self
 		lightID := L.CheckString(2)
+		if err := bridge.ValidateID(lightID); err != nil {
+			L.RaiseError("%s", err)
+			return 0
+		}
 
 		pushLightBuilder(L, lightID, m)
 		return 1

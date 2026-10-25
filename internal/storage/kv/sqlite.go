@@ -81,9 +81,9 @@ func (b *SQLiteBucket) Get(key string) (any, error) {
 	}
 
 	// Check expiry
-	if expiresAt.Valid && time.Now().UTC().Unix() > expiresAt.Int64 {
+	if expiresAt.Valid && time.Now().UTC().Unix() >= expiresAt.Int64 {
 		// Expired - delete and return nil
-		_, _ = b.db.Exec(`DELETE FROM kv_store WHERE bucket = ? AND key = ?`, b.name, key)
+		_, _ = b.db.Exec(`DELETE FROM kv_store WHERE bucket = ? AND key = ? AND expires_at <= ?`, b.name, key, time.Now().Unix())
 		return nil, nil
 	}
 
@@ -113,9 +113,9 @@ func (b *SQLiteBucket) Exists(key string) (bool, error) {
 	}
 
 	// Check expiry
-	if expiresAt.Valid && time.Now().UTC().Unix() > expiresAt.Int64 {
+	if expiresAt.Valid && time.Now().UTC().Unix() >= expiresAt.Int64 {
 		// Expired - delete and return false
-		_, _ = b.db.Exec(`DELETE FROM kv_store WHERE bucket = ? AND key = ?`, b.name, key)
+		_, _ = b.db.Exec(`DELETE FROM kv_store WHERE bucket = ? AND key = ? AND expires_at <= ?`, b.name, key, time.Now().Unix())
 		return false, nil
 	}
 

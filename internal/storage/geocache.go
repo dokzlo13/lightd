@@ -58,6 +58,6 @@ func (c *GeoCache) Put(query string, loc *CachedLocation) error {
 		return err
 	}
 
-	log.Info().Str("query", query).Float64("lat", loc.Latitude).Float64("lon", loc.Longitude).Msg("Geocache stored")
+	log.Debug().Str("query", query).Float64("lat", loc.Latitude).Float64("lon", loc.Longitude).Msg("Geocache stored")
 	return nil
 }

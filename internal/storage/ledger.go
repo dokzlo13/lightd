@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -29,12 +30,15 @@ type Entry struct {
 
 // Ledger provides append-only event logging with deduplication
 type Ledger struct {
-	db *sql.DB
+	db             *sql.DB
+	mu             sync.RWMutex
+	healthErr      string
+	historyEnabled bool
 }
 
 // NewLedger creates a new Ledger using the provided database connection
 func NewLedger(db *sql.DB) *Ledger {
-	return &Ledger{db: db}
+	return &Ledger{db: db, historyEnabled: true}
 }
 
 // Append adds a new event to the ledger
@@ -46,6 +50,9 @@ func (l *Ledger) Append(eventType EventType, idempotencyKey string, payload map[
 // For action_completed events, uses INSERT OR IGNORE to ensure "first writer wins"
 // and prevent duplicate completions (enforced by unique partial index)
 func (l *Ledger) AppendWithSource(eventType EventType, idempotencyKey, source, defID string, payload map[string]any) error {
+	if !l.history() {
+		return nil
+	}
 	var payloadJSON []byte
 	var err error
 
@@ -124,7 +131,10 @@ func (l *Ledger) GetByTimeRange(start, end time.Time, limit int) ([]*Entry, erro
 // DeleteOlderThan removes entries older than the specified duration (retention policy)
 func (l *Ledger) DeleteOlderThan(retention time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-retention).Unix()
-	if _, err := l.db.Exec(`DELETE FROM invocations WHERE received_at < ? AND status NOT IN ('accepted','running')`, time.Now().Add(-retention).UnixNano()); err != nil {
+	if _, err := l.db.Exec(`DELETE FROM ingress_receipts WHERE received_at < ? AND status NOT IN ('received','queued','interrupted_outcome_unknown')`, time.Now().Add(-max(retention, 7*24*time.Hour)).UnixNano()); err != nil {
+		return 0, err
+	}
+	if _, err := l.db.Exec(`DELETE FROM invocations WHERE received_at < ? AND status NOT IN ('accepted','running','interrupted_outcome_unknown')`, time.Now().Add(-max(retention, 7*24*time.Hour)).UnixNano()); err != nil {
 		return 0, err
 	}
 	result, err := l.db.Exec(`
@@ -173,4 +183,21 @@ func (l *Ledger) scanEntries(rows *sql.Rows) ([]*Entry, error) {
 	}
 
 	return entries, rows.Err()
+}
+
+func (l *Ledger) SetHistoryEnabled(enabled bool) {
+	l.mu.Lock()
+	l.historyEnabled = enabled
+	l.mu.Unlock()
+}
+func (l *Ledger) history() bool       { l.mu.RLock(); defer l.mu.RUnlock(); return l.historyEnabled }
+func (l *Ledger) HealthError() string { l.mu.RLock(); defer l.mu.RUnlock(); return l.healthErr }
+func (l *Ledger) report(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil {
+		l.healthErr = ""
+	} else {
+		l.healthErr = err.Error()
+	}
 }

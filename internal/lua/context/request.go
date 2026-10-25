@@ -129,6 +129,18 @@ func goToLuaValue(L *lua.LState, v interface{}) lua.LValue {
 		return lua.LNumber(val)
 	case int64:
 		return lua.LNumber(val)
+	case map[string]string:
+		tbl := L.NewTable()
+		for k, v := range val {
+			tbl.RawSetString(k, goToLuaValue(L, v))
+		}
+		return tbl
+	case []string:
+		tbl := L.NewTable()
+		for i, v := range val {
+			tbl.RawSetInt(i+1, goToLuaValue(L, v))
+		}
+		return tbl
 	case map[string]interface{}:
 		return mapToLuaTable(L, val)
 	case []interface{}:

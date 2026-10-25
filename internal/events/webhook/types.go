@@ -53,4 +53,3 @@ func MatchPath(pattern, path string) (map[string]string, bool) {
 
 	return params, true
 }
-

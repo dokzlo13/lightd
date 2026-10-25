@@ -1,6 +1,7 @@
 package context
 
 import (
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	lua "github.com/yuin/gopher-lua"
 	"math"
 
@@ -29,16 +30,15 @@ var lightBuilderMethods = map[string]lua.LGFunction{
 	"on":             lightBuilderOn,
 	"off":            lightBuilderOff,
 	"toggle":         lightBuilderToggle,
+	"set_hsv":        lightBuilderSetHSV,
 	"set_brightness": lightBuilderSetBrightness,
 	"set_transition": lightBuilderSetTransition,
 	"preserve_power": lightBuilderPreservePower,
 	"next_on":        lightBuilderNextOn,
 	"clear_scene":    lightBuilderClearScene,
-	"set_bri":        lightBuilderSetBri,
-	"set_color":      lightBuilderSetColorXY,
-	"set_ct":         lightBuilderSetCt,
-	"set_hue":        lightBuilderSetHue,
-	"set_sat":        lightBuilderSetSat,
+
+	"set_color": lightBuilderSetColorXY,
+	"set_ct":    lightBuilderSetCt,
 }
 
 // pushLightBuilder creates a new LightDesiredBuilder userdata and pushes it onto the stack.
@@ -48,7 +48,7 @@ func pushLightBuilder(L *lua.LState, lightID string, module *DesiredModule) {
 		return
 	}
 	ud := L.NewUserData()
-	if existing, ok := module.pendingLights[lightID]; ok {
+	if existing, ok := module.lightBuilders[lightID]; ok {
 		ud.Value = existing
 	} else {
 		ud.Value = &LightDesiredBuilder{
@@ -58,6 +58,7 @@ func pushLightBuilder(L *lua.LState, lightID string, module *DesiredModule) {
 			module:  module,
 		}
 	}
+	module.lightBuilders[lightID] = ud.Value.(*LightDesiredBuilder)
 	L.SetMetatable(ud, L.GetTypeMetatable(lightBuilderTypeName))
 	L.Push(ud)
 }
@@ -248,8 +249,8 @@ func lightBuilderSetBrightness(L *lua.LState) int {
 func lightBuilderSetTransition(L *lua.LState) int {
 	b, ud := checkLightBuilder(L)
 	v := L.CheckInt(2)
-	if v < 0 || v > 86400000 {
-		L.ArgError(2, "transition must be 0..86400000 ms")
+	if v < 0 || v > 3600000 {
+		L.ArgError(2, "transition must be 0..3600000 ms")
 		return 0
 	}
 	b.extra["duration"] = v
@@ -280,6 +281,23 @@ func lightBuilderNextOn(L *lua.LState) int {
 func lightBuilderClearScene(L *lua.LState) int {
 	b, ud := checkLightBuilder(L)
 	b.clear = append(b.clear, "scene_name")
+	b.module.markLightPending(b)
+	L.Push(ud)
+	return 1
+}
+
+func lightBuilderSetHSV(L *lua.LState) int {
+	b, ud := checkLightBuilder(L)
+	xy, err := bridge.HSVToXY(float64(L.CheckNumber(2)), float64(L.CheckNumber(3)))
+	if err != nil {
+		L.RaiseError("HSV: %s", err)
+		return 0
+	}
+	b.state.Ct = nil
+	b.state.Hue = nil
+	b.state.Sat = nil
+	b.state.Xy = []float32{float32(xy[0]), float32(xy[1])}
+	b.clear = append(b.clear, "scene_name", "ct", "hue", "sat")
 	b.module.markLightPending(b)
 	L.Push(ud)
 	return 1

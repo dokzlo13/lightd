@@ -1,6 +1,7 @@
 package context
 
 import (
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	lua "github.com/yuin/gopher-lua"
 	"math"
 
@@ -29,17 +30,16 @@ var groupBuilderMethods = map[string]lua.LGFunction{
 	"on":             groupBuilderOn,
 	"off":            groupBuilderOff,
 	"toggle":         groupBuilderToggle,
+	"set_hsv":        groupBuilderSetHSV,
 	"set_brightness": groupBuilderSetBrightness,
 	"set_transition": groupBuilderSetTransition,
 	"preserve_power": groupBuilderPreservePower,
 	"next_on":        groupBuilderNextOn,
 	"clear_scene":    groupBuilderClearScene,
-	"set_bri":        groupBuilderSetBri,
-	"set_scene":      groupBuilderSetScene,
-	"set_color":      groupBuilderSetColorXY,
-	"set_ct":         groupBuilderSetCt,
-	"set_hue":        groupBuilderSetHue,
-	"set_sat":        groupBuilderSetSat,
+
+	"set_scene": groupBuilderSetScene,
+	"set_color": groupBuilderSetColorXY,
+	"set_ct":    groupBuilderSetCt,
 }
 
 // pushGroupBuilder creates a new GroupDesiredBuilder userdata and pushes it onto the stack.
@@ -49,7 +49,7 @@ func pushGroupBuilder(L *lua.LState, groupID string, module *DesiredModule) {
 		return
 	}
 	ud := L.NewUserData()
-	if existing, ok := module.pendingGroups[groupID]; ok {
+	if existing, ok := module.groupBuilders[groupID]; ok {
 		ud.Value = existing
 	} else {
 		ud.Value = &GroupDesiredBuilder{
@@ -59,6 +59,7 @@ func pushGroupBuilder(L *lua.LState, groupID string, module *DesiredModule) {
 			module:  module,
 		}
 	}
+	module.groupBuilders[groupID] = ud.Value.(*GroupDesiredBuilder)
 	L.SetMetatable(ud, L.GetTypeMetatable(groupBuilderTypeName))
 	L.Push(ud)
 }
@@ -275,8 +276,8 @@ func groupBuilderSetBrightness(L *lua.LState) int {
 func groupBuilderSetTransition(L *lua.LState) int {
 	b, ud := checkGroupBuilder(L)
 	v := L.CheckInt(2)
-	if v < 0 || v > 86400000 {
-		L.ArgError(2, "transition must be 0..86400000 ms")
+	if v < 0 || v > 3600000 {
+		L.ArgError(2, "transition must be 0..3600000 ms")
 		return 0
 	}
 	b.extra["duration"] = v
@@ -307,6 +308,24 @@ func groupBuilderNextOn(L *lua.LState) int {
 func groupBuilderClearScene(L *lua.LState) int {
 	b, ud := checkGroupBuilder(L)
 	b.clear = append(b.clear, "scene_name")
+	b.state.SceneName = ""
+	b.module.markGroupPending(b)
+	L.Push(ud)
+	return 1
+}
+
+func groupBuilderSetHSV(L *lua.LState) int {
+	b, ud := checkGroupBuilder(L)
+	xy, err := bridge.HSVToXY(float64(L.CheckNumber(2)), float64(L.CheckNumber(3)))
+	if err != nil {
+		L.RaiseError("HSV: %s", err)
+		return 0
+	}
+	b.state.Ct = nil
+	b.state.Hue = nil
+	b.state.Sat = nil
+	b.state.Xy = []float32{float32(xy[0]), float32(xy[1])}
+	b.clear = append(b.clear, "scene_name", "ct", "hue", "sat")
 	b.state.SceneName = ""
 	b.module.markGroupPending(b)
 	L.Push(ud)

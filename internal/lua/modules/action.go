@@ -3,9 +3,9 @@ package modules
 import (
 	"context"
 	"fmt"
-	"github.com/amimof/huego"
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/hue"
+	"github.com/dokzlo13/lightd/internal/hue/bridge"
 	"github.com/dokzlo13/lightd/internal/hue/reconcile"
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/group"
 	"github.com/dokzlo13/lightd/internal/hue/reconcile/light"
@@ -20,12 +20,12 @@ type ActionModule struct {
 	orchestrator *reconcile.Orchestrator
 }
 
-func NewActionModule(registry *actions.Registry, bridge *huego.Bridge, stores *hue.StoreRegistry, orchestrator *reconcile.Orchestrator) *ActionModule {
+func NewActionModule(registry *actions.Registry, bridgeClient *bridge.Client, stores *hue.StoreRegistry, orchestrator *reconcile.Orchestrator) *ActionModule {
 	m := &ActionModule{registry: registry, orchestrator: orchestrator}
-	actual := group.NewActualProvider(bridge)
+	actual := group.NewActualProvider(bridgeClient)
 	m.newFrame = func() (*luactx.Builder, *luactx.DesiredModule) {
 		desired := luactx.NewDesiredModule(stores.Groups(), stores.Lights())
-		desired.SetActualProviders(actual, light.NewActualProvider(bridge))
+		desired.SetActualProviders(actual, light.NewActualProvider(bridgeClient))
 		b := luactx.NewBuilder().Register(luactx.NewActualModule(actual)).Register(desired).Register(luactx.NewReconcilerModule(orchestrator, desired)).Register(luactx.NewRequestModule())
 		return b, desired
 	}

@@ -42,6 +42,18 @@ func GoToLuaValue(L *lua.LState, v interface{}) lua.LValue {
 			tbl.RawSetInt(i+1, GoToLuaValue(L, item))
 		}
 		return tbl
+	case map[string]string:
+		tbl := L.NewTable()
+		for k, v := range val {
+			tbl.RawSetString(k, GoToLuaValue(L, v))
+		}
+		return tbl
+	case []string:
+		tbl := L.NewTable()
+		for i, v := range val {
+			tbl.RawSetInt(i+1, GoToLuaValue(L, v))
+		}
+		return tbl
 	case map[string]interface{}:
 		tbl := L.NewTable()
 		for k, v := range val {
@@ -85,4 +97,15 @@ func RequireLuaMap(L *lua.LState, t *lua.LTable) map[string]any {
 		return nil
 	}
 	return m
+}
+
+// Middleware is a runtime capability, not serializable action arguments.
+func RequireEventArgs(L *lua.LState, t *lua.LTable) map[string]any {
+	copy := L.NewTable()
+	t.ForEach(func(k, v lua.LValue) {
+		if k != lua.LString("middleware") {
+			copy.RawSet(k, v)
+		}
+	})
+	return RequireLuaMap(L, copy)
 }
