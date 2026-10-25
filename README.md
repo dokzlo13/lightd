@@ -47,7 +47,7 @@ Create a private `.env` containing `HUE_BRIDGE` and `HUE_TOKEN`, and a `lightd.l
 ```yaml
 services:
   lightd:
-    image: ghcr.io/dokzlo13/lightd:0.3.0
+    image: ghcr.io/dokzlo13/lightd:0.3.1
     restart: unless-stopped
     env_file: .env
     environment:

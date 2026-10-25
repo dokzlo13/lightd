@@ -1,6 +1,8 @@
-# v0.3.0
+# v0.3.1
 
 A forward-only maintenance release for reliable Hue automation and seasonal policies.
+
+The v0.3.0 tag was withheld from release publication by the Windows packaging gate. This tag adds explicit UTF-8 handling for cross-platform dependency notices; the automation implementation is unchanged.
 
 - Adopt OpenHue's native V2 REST client and upstream SSE framing. Use UUIDs, percentage brightness and millisecond transitions; add per-member snapshots and explicit power-preserving scene application.
 - Fix sparse false/zero fields, error envelopes, cancellation, scene refresh and reconnect behavior. Native color, effects and signals remain capability-aware; V1 `colorloop` and exact partial-HS/readback behavior are not emulated.

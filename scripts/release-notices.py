@@ -6,7 +6,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument('output',type=pathlib.Path)
 args=parser.parse_args()
 args.output.mkdir(parents=True,exist_ok=True)
-raw=subprocess.check_output(['go','list','-deps','-json','./cmd/lightd'],text=True)
+raw=subprocess.check_output(['go','list','-deps','-json','./cmd/lightd'],text=True,encoding='utf-8')
 decoder=json.JSONDecoder(); modules={}
 while raw.strip():
     obj,n=decoder.raw_decode(raw.lstrip());raw=raw.lstrip()[n:]
@@ -22,10 +22,10 @@ for name,mod in sorted(modules.items()):
     if name=='github.com/mattn/go-sqlite3':
         source=directory/'sqlite3-binding.c'
         if source.exists():
-            found=re.search(r'^#define SQLITE_VERSION\s+"([^"]+)"',source.read_text(),re.M)
+            found=re.search(r'^#define SQLITE_VERSION\s+"([^"]+)"',source.read_text(encoding='utf-8'),re.M)
             if found:entry['bundled_sqlite_version']=found.group(1)
     inventory.append(entry)
-goroot=pathlib.Path(subprocess.check_output(['go','env','GOROOT'],text=True).strip())
+goroot=pathlib.Path(subprocess.check_output(['go','env','GOROOT'],text=True,encoding='utf-8').strip())
 shutil.copyfile(goroot/'LICENSE',args.output/'GO-LICENSE')
-(args.output/'dependencies.json').write_text(json.dumps(inventory,indent=2)+'\n')
+(args.output/'dependencies.json').write_text(json.dumps(inventory,indent=2)+'\n',encoding='utf-8')
 print('Collected licenses for',len(inventory),'compiled dependency modules and Go')
