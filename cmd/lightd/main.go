@@ -7,12 +7,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/dokzlo13/lightd/internal/app"
 	"github.com/dokzlo13/lightd/internal/buildinfo"
 	"github.com/dokzlo13/lightd/internal/config"
+	"github.com/dokzlo13/lightd/internal/geo"
+	"github.com/dokzlo13/lightd/internal/scheduler"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
@@ -32,6 +36,12 @@ func run(args []string, out io.Writer) error {
 	flags.StringVar(&configPath, "c", "config.yaml", "Configuration file")
 	version := flags.Bool("version", false, "Print build identity without loading configuration")
 	check := flags.Bool("check-config", false, "Validate configuration and Lua syntax without executing the script")
+	policyPath := flags.String("preview-policy", "", "Preview a pure policy file without network or database access")
+	date := flags.String("date", "", "Local policy date YYYY-MM-DD")
+	zone := flags.String("timezone", "UTC", "IANA timezone for preview")
+	latitude := flags.Float64("latitude", math.NaN(), "Preview latitude (explicit, no geocoding)")
+	longitude := flags.Float64("longitude", math.NaN(), "Preview longitude (explicit, no geocoding)")
+	jsonOutput := flags.Bool("json", false, "Machine-readable policy preview")
 	reset := flags.Bool("reset-state", false, "Clear desired state before starting")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -44,6 +54,9 @@ func run(args []string, out io.Writer) error {
 	}
 	if *version {
 		return json.NewEncoder(out).Encode(buildinfo.Info())
+	}
+	if *policyPath != "" {
+		return previewPolicy(out, *policyPath, *date, *zone, *latitude, *longitude, *jsonOutput)
 	}
 	cfg, err := config.Load(configPath)
 	if err != nil {
@@ -112,5 +125,40 @@ func setupLogging(level string, useJSON, colors bool) {
 	zerolog.SetGlobalLevel(parsed)
 }
 
-// Context is referenced here so CLI preview can share the bounded pure-loader path.
-var _ = context.Background
+func previewPolicy(out io.Writer, path, date, zone string, lat, lon float64, asJSON bool) error {
+	if math.IsNaN(lat) || math.IsInf(lat, 0) || lat < -90 || lat > 90 || math.IsNaN(lon) || math.IsInf(lon, 0) || lon < -180 || lon > 180 {
+		return errors.New("preview requires finite --latitude and --longitude within geographic bounds")
+	}
+	if date == "" {
+		return errors.New("preview requires --date YYYY-MM-DD")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	spec, err := scheduler.LoadPolicyFile(ctx, path)
+	if err != nil {
+		return err
+	}
+	calc := geo.NewCalculator(&geo.Location{Name: "preview", Latitude: lat, Longitude: lon, Timezone: zone})
+	policy, err := scheduler.CompilePolicy(spec, calc, zone)
+	if err != nil {
+		return err
+	}
+	preview, err := policy.Preview(date)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		e := json.NewEncoder(out)
+		e.SetIndent("", "  ")
+		return e.Encode(preview)
+	}
+	fmt.Fprintf(out, "Policy %s (%s), %s [%s]\n", preview.ID, preview.Version, preview.Date, preview.Timezone)
+	for _, phase := range preview.Phases {
+		when := "skipped"
+		if phase.Time != nil {
+			when = phase.Time.Format(time.RFC3339)
+		}
+		fmt.Fprintf(out, "%-22s %-25s %s %s\n", phase.ID, when, phase.Action, strings.Join(phase.Reasons, ", "))
+	}
+	return nil
+}

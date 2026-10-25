@@ -6,6 +6,7 @@ import (
 	"github.com/rs/zerolog/log"
 	lua "github.com/yuin/gopher-lua"
 
+	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/scheduler"
 )
 
@@ -159,7 +160,7 @@ func (m *SchedModule) runClosest(L *lua.LState) int {
 		strategy = scheduler.Strategy(s.String())
 	}
 
-	if err := m.scheduler.RunClosest(tags, strategy); err != nil {
+	if err := m.scheduler.RunClosestWithParent(tags, strategy, scheduleParent(L)); err != nil {
 		L.Push(lua.LFalse)
 		L.Push(lua.LString(err.Error()))
 		return 2
@@ -197,7 +198,7 @@ func (m *SchedModule) list(L *lua.LState) int {
 func (m *SchedModule) run(L *lua.LState) int {
 	id := L.CheckString(1)
 
-	if err := m.scheduler.RunByID(id); err != nil {
+	if err := m.scheduler.RunByIDWithParent(id, scheduleParent(L)); err != nil {
 		L.Push(lua.LFalse)
 		L.Push(lua.LString(err.Error()))
 		return 2
@@ -239,7 +240,7 @@ func (m *SchedModule) getClosest(L *lua.LState) int {
 		L.SetField(tbl, "id", lua.LString(info.ID))
 		L.SetField(tbl, "action", lua.LString(info.ActionName))
 		L.SetField(tbl, "tag", lua.LString(info.Tag))
-		L.SetField(tbl, "time", lua.LString(info.Time.Format("15:04:05")))
+		L.SetField(tbl, "time", lua.LString(info.Time.In(m.scheduler.Timezone()).Format("15:04:05")))
 		L.Push(tbl)
 	}
 	return 1
@@ -324,4 +325,11 @@ func (m *SchedModule) preview(L *lua.LState) int {
 	L.Push(result)
 	L.Push(lua.LNil)
 	return 2
+}
+
+func scheduleParent(L *lua.LState) string {
+	if ctx := L.Context(); ctx != nil {
+		return actions.InvocationID(ctx)
+	}
+	return ""
 }

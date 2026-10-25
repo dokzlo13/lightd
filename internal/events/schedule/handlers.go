@@ -25,7 +25,8 @@ func RegisterHandler(ctx context.Context, bus *events.Bus, invoker *actions.Invo
 		if name == "" || !invoker.HasAction(name) {
 			return fmt.Errorf("schedule %q references unknown action %q", id, name)
 		}
-		workCtx := actions.WithMetadata(ctx, actions.Metadata{PlannedAt: at, PolicyVersion: version, Generation: generation})
+		parent, _ := event.Data["parent_invocation_id"].(string)
+		workCtx := actions.WithMetadata(actions.WithParent(ctx, parent), actions.Metadata{PlannedAt: at, PolicyVersion: version, Generation: generation})
 		return invoker.QueuePrepared(workCtx, luaExec, name, key, source, id, func(context.Context) (map[string]any, error) {
 			if valid != nil && !valid() {
 				return nil, fmt.Errorf("schedule %q superseded before execution", id)

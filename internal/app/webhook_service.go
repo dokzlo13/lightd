@@ -3,8 +3,6 @@ package app
 import (
 	"context"
 
-	"github.com/rs/zerolog/log"
-
 	"github.com/dokzlo13/lightd/internal/config"
 	"github.com/dokzlo13/lightd/internal/events"
 	"github.com/dokzlo13/lightd/internal/webhook"
@@ -31,21 +29,11 @@ func (s *WebhookService) SetPathMatcher(matcher webhook.PathMatcher) {
 	s.server.SetPathMatcher(matcher)
 }
 
-// Start begins the webhook server if enabled.
-func (s *WebhookService) Start(ctx context.Context) {
+// Start binds before returning so startup cannot succeed with a broken listener.
+func (s *WebhookService) Start(ctx context.Context) error {
 	if !s.cfg.Events.Webhook.Enabled {
-		log.Info().Msg("Webhook server disabled")
-		return
+		return nil
 	}
-
-	log.Info().
-		Str("host", s.cfg.Events.Webhook.GetHost()).
-		Int("port", s.cfg.Events.Webhook.GetPort()).
-		Msg("Webhook server enabled")
-
-	go func() {
-		if err := s.server.Run(ctx, s.cfg.GetShutdownTimeout()); err != nil {
-			log.Error().Err(err).Msg("Webhook server error")
-		}
-	}()
+	return s.server.Start(ctx, s.cfg.GetShutdownTimeout())
 }
+func (s *WebhookService) Close(ctx context.Context) error { return s.server.Close(ctx) }

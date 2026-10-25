@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -21,7 +22,7 @@ func TestSyntaxCheckDoesNotExecuteScript(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "effect")
 	script := filepath.Join(dir, "main.lua")
-	if err := os.WriteFile(script, []byte("local f=io.open("+"\""+marker+"\""+",'w'); f:write('bad'); f:close()"), 0600); err != nil {
+	if err := os.WriteFile(script, []byte("local f=io.open("+strconv.Quote(marker)+",'w'); f:write('bad'); f:close()"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := checkLuaSyntax(script); err != nil {

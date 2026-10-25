@@ -2,6 +2,11 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/dokzlo13/lightd/internal/actions"
 	"github.com/dokzlo13/lightd/internal/config"
@@ -17,7 +22,13 @@ import (
 // Services is a container for all application services.
 // It manages service initialization order and dependencies.
 type Services struct {
-	cfg *config.Config
+	cfg        *config.Config
+	cancel     context.CancelFunc
+	ready      atomic.Bool
+	stopOnce   sync.Once
+	stopErr    error
+	background sync.WaitGroup
+	cleanups   []func()
 
 	// Core infrastructure
 	DB     *storage.DB
@@ -55,6 +66,11 @@ func NewServices(cfg *config.Config) (*Services, error) {
 
 	// Initialize ledger
 	s.Ledger = storage.NewLedger(database.DB)
+	s.Ledger.SetHistoryEnabled(cfg.Ledger.IsEnabled())
+	if err := s.Ledger.RecoverInterrupted(); err != nil {
+		s.Close()
+		return nil, err
+	}
 
 	// Initialize generic state store
 	s.Store = storage.NewStore(database.DB)
@@ -64,7 +80,10 @@ func NewServices(cfg *config.Config) (*Services, error) {
 	geoCfg := schedCfg.Geo
 	if schedCfg.IsEnabled() && geoCfg.IsEnabled() {
 		// Resolve location at boot (geocoding happens once here)
-		geoCache := storage.NewGeoCache(database.DB)
+		var geoCache *storage.GeoCache
+		if geoCfg.IsCacheEnabled() {
+			geoCache = storage.NewGeoCache(database.DB)
+		}
 		geocoder := geo.NewGeocoder(geoCfg.GetHTTPTimeout(), geoCache)
 
 		loc, err := geo.ResolveOnBoot(
@@ -122,7 +141,7 @@ func NewServices(cfg *config.Config) (*Services, error) {
 		Registry:     s.Registry,
 		Invoker:      s.Invoker,
 		Scheduler:    s.Scheduler.Scheduler,
-		Bridge:       s.Hue.Client.V1(),
+		Bridge:       s.Hue.Client.Bridge(),
 		SceneIndex:   s.Hue.SceneIndex,
 		Stores:       s.Hue.Stores,
 		Orchestrator: s.Hue.Orchestrator,
@@ -136,8 +155,11 @@ func NewServices(cfg *config.Config) (*Services, error) {
 		return nil, err
 	}
 
+	s.Lua.Runtime.SetActionTimeout(cfg.GetActionTimeout())
+
 	// Initialize health service
 	s.Health = NewHealthService(cfg)
+	s.Health.SetStatusProvider(s.Status)
 
 	// Initialize webhook service
 	s.Webhook = NewWebhookService(cfg, s.Hue.Bus)
@@ -148,6 +170,10 @@ func NewServices(cfg *config.Config) (*Services, error) {
 // Start starts all services in the correct order.
 // The onFatalError callback is called when a fatal error occurs (e.g., max reconnects exceeded).
 func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
+	ctx, s.cancel = context.WithCancel(ctx)
+	if err := s.Health.Start(ctx); err != nil {
+		return err
+	}
 	// Connect to Hue bridge
 	if err := s.Hue.Start(ctx); err != nil {
 		return err
@@ -158,16 +184,22 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 		return err
 	}
 
+	if s.Scheduler.Scheduler != nil {
+		if err := s.Scheduler.Scheduler.ValidateActions(s.Invoker.HasAction); err != nil {
+			return err
+		}
+	}
+
 	// Register event handlers from modules (after Lua script is loaded)
 	// SSE handlers (button, rotary, connectivity from Hue event stream)
 	if s.cfg.Events.SSE.IsEnabled() {
 		sseModule := s.Lua.GetSSEModule()
-		sse.RegisterHandlers(ctx, sseModule, s.Hue.Bus, s.Invoker, s.Lua)
+		s.cleanups = append(s.cleanups, sse.RegisterHandlers(ctx, sseModule, s.Hue.Bus, s.Invoker, s.Lua))
 	}
 	// Webhook handlers (HTTP webhook events)
 	if s.cfg.Events.Webhook.Enabled {
 		webhookModule := s.Lua.GetWebhookModule()
-		webhook.RegisterHandlers(ctx, webhookModule, s.Hue.Bus, s.Invoker, s.Lua)
+		s.cleanups = append(s.cleanups, webhook.RegisterHandlers(ctx, webhookModule, s.Hue.Bus, s.Invoker, s.Lua))
 		// Set path matcher for HTTP request validation
 		s.Webhook.SetPathMatcher(webhookModule)
 	}
@@ -179,39 +211,150 @@ func (s *Services) Start(ctx context.Context, onFatalError func(error)) error {
 	// Start all background services
 	s.Lua.Start(ctx)
 	s.Hue.StartBackground(ctx, onFatalError)
-	s.Scheduler.Start(ctx)
-	s.Health.Start(ctx)
-	s.Webhook.Start(ctx)
+	if err := s.Scheduler.Start(ctx); err != nil {
+		return err
+	}
+	if err := s.Webhook.Start(ctx); err != nil {
+		return err
+	}
 
 	// Start KV cleanup goroutine
 	s.KV.StartCleanup(ctx, s.cfg.KV.GetCleanupInterval())
-
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		s.Ledger.RunRetention(ctx, s.cfg.Ledger.GetRetentionPeriod(), s.cfg.Ledger.GetRetentionInterval())
+	}()
+	s.ready.Store(true)
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.Scheduler.Err(); err != nil {
+					if onFatalError != nil {
+						onFatalError(fmt.Errorf("scheduler: %w", err))
+					}
+					return
+				}
+				if !s.Lua.Status().Ready {
+					if onFatalError != nil {
+						onFatalError(errors.New("Lua worker stopped unexpectedly"))
+					}
+					return
+				}
+			}
+		}
+	}()
 	return nil
 }
 
-// ClearState clears all resource state.
-func (s *Services) ClearState() error {
-	return s.Store.Clear("")
-}
-
-// Stop gracefully stops all services.
-func (s *Services) Stop() error {
-	s.Close()
-	return nil
-}
-
-// Close releases all resources.
-func (s *Services) Close() {
-	if s.KV != nil {
-		s.KV.StopCleanup()
+// Status exposes admission health separately from bridge dependency degradation.
+func (s *Services) Status(ctx context.Context) (bool, any) {
+	detail := map[string]any{}
+	ready := s.ready.Load()
+	if s.DB == nil {
+		ready = false
+	} else if err := s.DB.PingContext(ctx); err != nil {
+		ready = false
+		detail["database_error"] = err.Error()
+	}
+	if s.Ledger != nil {
+		if err := s.Ledger.HealthError(); err != "" {
+			ready = false
+			detail["storage_error"] = err
+		}
 	}
 	if s.Lua != nil {
-		s.Lua.Close()
+		status := s.Lua.Status()
+		detail["lua"] = status
+		ready = ready && status.Ready
 	}
 	if s.Hue != nil {
-		s.Hue.Close()
+		detail["bridge"] = s.Hue.Client.Status()
+		detail["sse"] = s.Hue.EventStream.Status()
+		reconciliation := s.Hue.Orchestrator.Status()
+		detail["reconciliation"] = reconciliation
+		if reconciliation.PersistenceError != "" {
+			ready = false
+		}
+		detail["rejected_events"] = s.Hue.Bus.Rejected()
 	}
-	if s.DB != nil {
-		s.DB.Close()
+	if s.Scheduler != nil {
+		if err := s.Scheduler.Err(); err != nil {
+			ready = false
+			detail["scheduler_error"] = err.Error()
+		}
 	}
+	return ready, detail
 }
+
+func (s *Services) ClearState() error {
+	if err := s.Store.Clear(""); err != nil {
+		return err
+	}
+	if s.Hue != nil {
+		if err := s.Hue.Client.ClearAuthority(); err != nil {
+			return err
+		}
+		return s.Hue.Orchestrator.ClearDelivery()
+	}
+	return nil
+}
+
+// Stop joins every owner before releasing SQLite and the VM. If a worker cannot
+// join within the total budget, leave its resources intact and return a fatal error.
+func (s *Services) Stop() error {
+	s.stopOnce.Do(func() {
+		s.ready.Store(false)
+		if s.cancel != nil {
+			s.cancel()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.GetShutdownTimeout())
+		defer cancel()
+		var errs []error
+		if s.Webhook != nil {
+			errs = append(errs, s.Webhook.Close(ctx))
+		}
+		if s.Scheduler != nil {
+			errs = append(errs, s.Scheduler.Stop(ctx))
+		}
+		if s.Hue != nil {
+			errs = append(errs, s.Hue.Stop(ctx))
+			s.Hue.Bus.Close(ctx)
+		}
+		for _, cleanup := range s.cleanups {
+			cleanup()
+		}
+		if s.Lua != nil {
+			errs = append(errs, s.Lua.Stop(ctx))
+		}
+		if s.KV != nil {
+			s.KV.StopCleanup()
+		}
+		done := make(chan struct{})
+		go func() { s.background.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			errs = append(errs, ctx.Err())
+		}
+		if s.Health != nil {
+			errs = append(errs, s.Health.Close(ctx))
+		}
+		if ctx.Err() != nil {
+			errs = append(errs, ctx.Err())
+		}
+		s.stopErr = errors.Join(errs...)
+		if s.stopErr == nil && s.DB != nil {
+			s.stopErr = s.DB.Close()
+		}
+	})
+	return s.stopErr
+}
+func (s *Services) Close() { _ = s.Stop() }

@@ -439,7 +439,11 @@ func (s *Scheduler) nextOccurrence(after time.Time) (*Occurrence, Schedule) {
 	}
 	return best, source
 }
-func (s *Scheduler) emit(item scheduledOccurrence, source string, dedupe bool) error {
+func (s *Scheduler) emit(item scheduledOccurrence, source string, dedupe bool, parents ...string) error {
+	parent := ""
+	if len(parents) > 0 {
+		parent = parents[0]
+	}
 	if s.bus == nil {
 		return fmt.Errorf("scheduler event bus unavailable")
 	}
@@ -451,7 +455,7 @@ func (s *Scheduler) emit(item scheduledOccurrence, source string, dedupe bool) e
 	if ps, ok := item.sched.(*policySchedule); ok {
 		version = ps.policy.spec.Version
 	}
-	return s.bus.Publish(events.Event{Type: events.EventTypeSchedule, Data: map[string]any{"schedule_id": item.sched.ID(), "occurrence_id": key, "action_name": item.sched.ActionName(), "action_args": item.sched.ActionArgs(), "run_at": item.occ.Time, "source": source, "generation": item.generation, "policy_version": version, "generation_valid": func() bool { return s.valid(item.sched.ID(), item.generation) }}})
+	return s.bus.Publish(events.Event{Type: events.EventTypeSchedule, Data: map[string]any{"parent_invocation_id": parent, "schedule_id": item.sched.ID(), "occurrence_id": key, "action_name": item.sched.ActionName(), "action_args": item.sched.ActionArgs(), "run_at": item.occ.Time, "source": source, "generation": item.generation, "policy_version": version, "generation_valid": func() bool { return s.valid(item.sched.ID(), item.generation) }}})
 }
 func validStrategy(strategy Strategy) bool {
 	return strategy == StrategyNext || strategy == StrategyPrev
@@ -484,11 +488,14 @@ func (s *Scheduler) closest(tags []string, strategy Strategy) (scheduledOccurren
 	return best, nil
 }
 func (s *Scheduler) RunClosest(tags []string, strategy Strategy) error {
+	return s.RunClosestWithParent(tags, strategy, "")
+}
+func (s *Scheduler) RunClosestWithParent(tags []string, strategy Strategy, parent string) error {
 	item, err := s.closest(tags, strategy)
 	if err != nil {
 		return err
 	}
-	return s.emit(item, "run_closest", false)
+	return s.emit(item, "run_closest", false, parent)
 }
 
 type ScheduleInfo struct {
@@ -533,7 +540,8 @@ func (s *Scheduler) GetSchedulesByTag(tag string) []ScheduleInfo {
 	}
 	return result
 }
-func (s *Scheduler) RunByID(id string) error {
+func (s *Scheduler) RunByID(id string) error { return s.RunByIDWithParent(id, "") }
+func (s *Scheduler) RunByIDWithParent(id, parent string) error {
 	s.mu.RLock()
 	schedule, ok := s.schedules[id]
 	gen := s.generations[id]
@@ -541,7 +549,7 @@ func (s *Scheduler) RunByID(id string) error {
 	if !ok {
 		return fmt.Errorf("schedule %q not found", id)
 	}
-	return s.emit(scheduledOccurrence{&Occurrence{ScheduleID: id, Time: s.now()}, schedule, gen}, "run_by_id", false)
+	return s.emit(scheduledOccurrence{&Occurrence{ScheduleID: id, Time: s.now()}, schedule, gen}, "run_by_id", false, parent)
 }
 func (s *Scheduler) Disable(id string) error {
 	s.mu.Lock()
